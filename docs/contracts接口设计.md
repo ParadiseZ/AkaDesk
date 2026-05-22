@@ -433,6 +433,19 @@ V1 正式要求：
   - 不可回退
 - 会话中的分辨率修改，指修改目标显示器分辨率
 - 分辨率修改允许按“重配编码器”或“重建采集+编码链路”处理
+- `DisplaySettingIntent` 应显式包含 `requested_display_mode`
+- `DisplaySettingIntent` 应显式包含 `history_display_mode`
+- `history_display_mode` 必须在第一次显示器设置修改前记录
+- 断开时必须恢复 `history_display_mode`
+- 恢复内容至少包括：分辨率、缩放倍率、`fps/refresh_rate`
+
+建议语义：
+
+- 请求成功：
+  - 当前显示器模式使用 `requested_display_mode`
+- 请求失败：
+  - 当前显示器模式保持 `history_display_mode`
+  - 同时返回支持模式列表和失败原因
 
 ## 11. `input/` 接口设计
 
