@@ -9,8 +9,10 @@
 /**/.idea/assetWizardSettings.xml
 /**/.DS_Store
 /**/build
+/**/target
 /**/captures
 /**/.externalNativeBuild
 /**/.cxx
 /**/local.properties
 .playwright-mcp
+proto/*.pb

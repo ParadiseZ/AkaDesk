@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package akadesk.v1;
+
+import "common.proto";
+import "device.proto";
+import "session.proto";
+
+enum IpcMessageKind {
+  IPC_MESSAGE_KIND_UNSPECIFIED = 0;
+  IPC_MESSAGE_KIND_REQUEST = 1;
+  IPC_MESSAGE_KIND_RESPONSE = 2;
+  IPC_MESSAGE_KIND_EVENT = 3;
+}
+
+message IpcEnvelope {
+  string request_id = 1;
+  IpcMessageKind kind = 2;
+  string type = 3;
+  bytes payload = 4;
+  int64 timestamp_ms = 5;
+}
+
+message RuntimeStatusSnapshot {
+  RuntimeState state = 1;
+  SessionSnapshot active_session = 2;
+  ErrorInfo last_error = 3;
+  int64 updated_at_ms = 4;
+}
+
+message InputCapabilitySnapshot {
+  bool supports_pointer = 1;
+  bool supports_scroll = 2;
+  bool supports_keyboard = 3;
+}
+
+message CapabilitySnapshot {
+  CapabilityFlags capability_flags = 1;
+  repeated DisplayInfo displays = 2;
+  repeated AudioDeviceInfo audio_devices = 3;
+  InputCapabilitySnapshot input = 4;
+  int64 updated_at_ms = 5;
+}
+
+message GetRuntimeStatusRequest {}
+
+message RuntimeStatusResponse {
+  RuntimeStatusSnapshot status = 1;
+  ErrorInfo error = 2;
+}
+
+message RuntimeStatusChanged {
+  RuntimeStatusSnapshot status = 1;
+}
+
+message GetCapabilitySnapshotRequest {}
+
+message CapabilitySnapshotResponse {
+  CapabilitySnapshot snapshot = 1;
+  ErrorInfo error = 2;
+}
+
+message CapabilitySnapshotChanged {
+  CapabilitySnapshot snapshot = 1;
+}
+
+message StopSessionRequest {
+  string session_id = 1;
+}
+
+message StopSessionResponse {
+  string session_id = 1;
+  SessionState state = 2;
+  ErrorInfo error = 3;
+}
+
+message DiagnosticEvent {
+  string code = 1;
+  string level = 2;
+  string message = 3;
+  int64 timestamp_ms = 4;
+}
+
+message GetDiagnosticsRequest {}
+
+message DiagnosticsResponse {
+  repeated DiagnosticEvent events = 1;
+  ErrorInfo error = 2;
+}

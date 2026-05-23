@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package akadesk.v1;
+
+enum PointerButton {
+  POINTER_BUTTON_UNSPECIFIED = 0;
+  POINTER_BUTTON_LEFT = 1;
+  POINTER_BUTTON_RIGHT = 2;
+  POINTER_BUTTON_MIDDLE = 3;
+}
+
+enum KeyAction {
+  KEY_ACTION_UNSPECIFIED = 0;
+  KEY_ACTION_DOWN = 1;
+  KEY_ACTION_UP = 2;
+}
+
+message PointerEvent {
+  uint64 seq = 1;
+  float normalized_x = 2;
+  float normalized_y = 3;
+  PointerButton button = 4;
+  bool pressed = 5;
+  int64 timestamp_ms = 6;
+}
+
+message ScrollEvent {
+  uint64 seq = 1;
+  float delta_x = 2;
+  float delta_y = 3;
+  int64 timestamp_ms = 4;
+}
+
+message KeyEvent {
+  uint64 seq = 1;
+  uint32 key_code = 2;
+  KeyAction action = 3;
+  bool alt = 4;
+  bool ctrl = 5;
+  bool shift = 6;
+  bool meta = 7;
+  int64 timestamp_ms = 8;
+}
+
+message InputEvent {
+  string session_id = 1;
+
+  oneof payload {
+    PointerEvent pointer = 2;
+    ScrollEvent scroll = 3;
+    KeyEvent key = 4;
+  }
+}

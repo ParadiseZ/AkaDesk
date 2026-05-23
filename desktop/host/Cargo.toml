@@ -1,0 +1,9 @@
+[workspace]
+members = [
+  "contracts",
+  "ipc",
+  "runtime",
+  "windows",
+  "linux",
+]
+resolver = "2"

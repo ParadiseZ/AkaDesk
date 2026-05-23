@@ -1,0 +1,113 @@
+syntax = "proto3";
+
+package akadesk.v1;
+
+import "common.proto";
+import "device.proto";
+import "media.proto";
+import "session.proto";
+
+enum PairingChallengeType {
+  PAIRING_CHALLENGE_TYPE_UNSPECIFIED = 0;
+  PAIRING_CHALLENGE_TYPE_ONE_TIME_CODE = 1;
+  PAIRING_CHALLENGE_TYPE_LOCAL_CONFIRM = 2;
+}
+
+message DiscoveryProbe {
+  string request_id = 1;
+  VersionInfo version = 2;
+}
+
+message DiscoveryAnnounce {
+  DevicePresence presence = 1;
+}
+
+message PairingRequest {
+  string request_id = 1;
+  string controller_device_id = 2;
+  string controller_display_name = 3;
+  VersionInfo version = 4;
+}
+
+message PairingChallenge {
+  string request_id = 1;
+  string challenge_id = 2;
+  PairingChallengeType challenge_type = 3;
+  string verification_code = 4;
+}
+
+message PairingConfirm {
+  string request_id = 1;
+  string challenge_id = 2;
+  string verification_code = 3;
+}
+
+message PairingResult {
+  string request_id = 1;
+  bool accepted = 2;
+  string pair_token = 3;
+  ErrorInfo error = 4;
+}
+
+message ControlHello {
+  string request_id = 1;
+  string controller_device_id = 2;
+  string pair_token = 3;
+  VersionInfo version = 4;
+  repeated string supported_features = 5;
+}
+
+message ControlHelloAck {
+  string request_id = 1;
+  bool accepted = 2;
+  DeviceIdentity identity = 3;
+  CapabilityFlags capability_flags = 4;
+  ErrorInfo error = 5;
+}
+
+message GetDeviceSnapshot {
+  string request_id = 1;
+}
+
+message DeviceSnapshotResponse {
+  string request_id = 1;
+  DeviceSnapshot snapshot = 2;
+  ErrorInfo error = 3;
+}
+
+message HeartbeatPing {
+  string request_id = 1;
+  int64 timestamp_ms = 2;
+}
+
+message HeartbeatPong {
+  string request_id = 1;
+  int64 timestamp_ms = 2;
+}
+
+message StartSessionRequest {
+  SessionIntent intent = 1;
+}
+
+message StartSessionAccepted {
+  string session_id = 1;
+  SessionState state = 2;
+}
+
+message StartSessionRejected {
+  string session_id = 1;
+  ErrorInfo error = 2;
+}
+
+message SessionChangedEvent {
+  SessionSnapshot snapshot = 1;
+}
+
+message MediaPreferenceOffer {
+  VideoPreference video = 1;
+  AudioPreference audio = 2;
+}
+
+message MediaNegotiationResult {
+  SessionNegotiationResult result = 1;
+}

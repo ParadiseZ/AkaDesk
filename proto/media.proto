@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package akadesk.v1;
+
+enum VideoCodec {
+  VIDEO_CODEC_UNSPECIFIED = 0;
+  VIDEO_CODEC_H264 = 1;
+  VIDEO_CODEC_HEVC = 2;
+  VIDEO_CODEC_VP8 = 3;
+  VIDEO_CODEC_VP9 = 4;
+  VIDEO_CODEC_AV1 = 5;
+}
+
+enum AudioCodec {
+  AUDIO_CODEC_UNSPECIFIED = 0;
+  AUDIO_CODEC_OPUS = 1;
+}
+
+enum CodecImplementation {
+  CODEC_IMPLEMENTATION_UNSPECIFIED = 0;
+  CODEC_IMPLEMENTATION_HARDWARE = 1;
+  CODEC_IMPLEMENTATION_SOFTWARE = 2;
+}
+
+message VideoPreference {
+  VideoCodec codec = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  uint32 fps = 4;
+  uint32 bitrate_kbps = 5;
+  bool allow_same_codec_software_fallback = 6;
+}
+
+message AudioPreference {
+  AudioCodec codec = 1;
+  uint32 sample_rate = 2;
+  uint32 channels = 3;
+  uint32 bitrate_kbps = 4;
+  bool mute_controlled_local_playback = 5;
+}
+
+message VideoSessionSpec {
+  VideoCodec codec = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  uint32 fps = 4;
+  uint32 bitrate_kbps = 5;
+  CodecImplementation host_encoder = 6;
+  CodecImplementation controller_decoder = 7;
+}
+
+message AudioSessionSpec {
+  AudioCodec codec = 1;
+  uint32 sample_rate = 2;
+  uint32 channels = 3;
+  uint32 bitrate_kbps = 4;
+}

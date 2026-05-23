@@ -1,0 +1,10 @@
+[package]
+name = "host-ipc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+host-contracts = { path = "../contracts" }
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package akadesk.v1;
+
+import "common.proto";
+
+message DeviceIdentity {
+  string device_id = 1;
+  string display_name = 2;
+  PlatformKind platform = 3;
+  string hostname = 4;
+  string app_version = 5;
+}
+
+message DevicePresence {
+  DeviceIdentity identity = 1;
+  string lan_address = 2;
+  uint32 control_port = 3;
+  bool paired = 4;
+  bool reachable = 5;
+  int64 last_seen_ms = 6;
+}
+
+message DisplayInfo {
+  string display_id = 1;
+  string name = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 refresh_rate = 5;
+  uint32 scale_percent = 6;
+  bool primary = 7;
+  bool hdr = 8;
+}
+
+message AudioDeviceInfo {
+  string audio_device_id = 1;
+  string name = 2;
+  bool input = 3;
+  bool output = 4;
+  bool default_device = 5;
+}
+
+message DeviceSnapshot {
+  DeviceIdentity identity = 1;
+  CapabilityFlags capability_flags = 2;
+  repeated DisplayInfo displays = 3;
+  repeated AudioDeviceInfo audio_devices = 4;
+}
