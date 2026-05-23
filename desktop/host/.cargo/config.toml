@@ -1,0 +1,26 @@
+[env]
+FFMPEG_DIR = { value = "D:/Project/AkaDesk/third_party/ffmpe-win64-gpl-shared", force = true }
+FFMPEG_INCLUDE_DIR = { value = "D:/Project/AkaDesk/third_party/ffmpe-win64-gpl-shared/include", force = true }
+FFMPEG_LIB_DIR = { value = "D:/Project/AkaDesk/third_party/ffmpe-win64-gpl-shared/lib", force = true }
+LIBCLANG_PATH = { value = "D:/Program Files/LLVM/bin", force = true }
+
+
+[build]
+rustc-wrapper = "D:\\Database\\Rust\\cargo\\bin\\sccache.exe"
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+
+# 开发模式优化配置
+[profile.dev]
+incremental = true        # 保留增量编译
+opt-level = 0             # 开发态优先编译速度
+lto = false               # 关闭 LTO，避免 dev 链接过慢
+codegen-units = 256       # 提高并行拆分，缩短 dev 编译时间
+debug = 1                 # 保留基础调试信息，减轻链接负担
+strip = "none"            # 开发态保留符号
+panic = "abort"           # panic 处理
+#codegen-backend = "cranelift"       # 已禁用：与 FFI 包（如 aws-lc-rs）不兼容
+
+[profile.dev.package."*"]
+opt-level = 1
+

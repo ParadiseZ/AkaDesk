@@ -6,5 +6,8 @@ edition = "2021"
 [dependencies]
 host-contracts = { path = "../contracts" }
 
+[target.'cfg(windows)'.dependencies]
+ffmpeg-sys-next = { version = "8.0.1", default-features = false, features = ["avcodec"] }
+
 [lib]
 path = "src/lib.rs"

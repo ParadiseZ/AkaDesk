@@ -23,14 +23,18 @@ impl HostSupervisor {
     pub fn start(&mut self) -> io::Result<HostBootstrapResult> {
         self.ipc_name = format!("akadesk.m2.{}", std::process::id());
         let host_runtime_bin = resolve_host_runtime_bin()?;
+        let ffmpeg_bin_dir = resolve_local_ffmpeg_bin_dir()?;
 
-        let child = Command::new(host_runtime_bin)
+        let mut command = Command::new(host_runtime_bin);
+        command
             .arg("--ipc-name")
             .arg(&self.ipc_name)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+            .stderr(Stdio::inherit());
+        prepend_path_env(&mut command, &ffmpeg_bin_dir);
+
+        let child = command.spawn()?;
         self.child = Some(child);
 
         let mut client = IpcClient::connect_with_retry(&self.ipc_name, Duration::from_secs(5))?;
@@ -112,4 +116,45 @@ fn host_runtime_executable_name() -> OsString {
         name.push(".exe");
     }
     name
+}
+
+fn resolve_local_ffmpeg_bin_dir() -> io::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("AKADESK_FFMPEG_BIN") {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("AKADESK_FFMPEG_BIN does not exist: {}", candidate.display()),
+        ));
+    }
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let candidate = manifest_dir
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing desktop directory"))?
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing workspace root"))?
+        .join("third_party")
+        .join("ffmpe-win64-gpl-shared")
+        .join("bin");
+
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("local ffmpeg bin directory not found: {}", candidate.display()),
+    ))
+}
+
+fn prepend_path_env(command: &mut Command, extra_dir: &Path) {
+    let mut value = OsString::from(extra_dir.as_os_str());
+    if let Some(existing) = std::env::var_os("PATH") {
+        value.push(if cfg!(windows) { ";" } else { ":" });
+        value.push(existing);
+    }
+    command.env("PATH", value);
 }

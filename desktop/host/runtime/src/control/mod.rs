@@ -295,14 +295,15 @@ fn lock_err<T>(_: std::sync::PoisonError<T>) -> io::Error {
 }
 
 pub fn default_capability_flags() -> CapabilityFlags {
+    let video_support = crate::video::detect_runtime_video_support();
     CapabilityFlags {
         supports_audio: false,
         supports_input: true,
         supports_display_control: false,
-        supports_hardware_encode: false,
+        supports_hardware_encode: video_support.has_h264_hardware_encoder,
         supports_hardware_decode: false,
-        supports_software_encode: true,
-        supports_software_decode: true,
+        supports_software_encode: video_support.has_h264_software_encoder,
+        supports_software_decode: video_support.has_h264_decoder,
     }
 }
 

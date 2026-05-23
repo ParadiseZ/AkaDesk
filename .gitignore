@@ -17,3 +17,7 @@
 .playwright-mcp
 proto/*.pb
 /**/java_generated/**
+android/.kotlin
+third_party/ffmpe-win64-gpl-shared/
+third_party/vcpkg/
+third_party/vcpkg-probe/
