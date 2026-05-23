@@ -263,6 +263,8 @@ Windows V1 采集策略建议固定为：
 - 枚举系统音频设备
 - 查询音频采集能力
 - 启动和停止系统音频采集
+- 记录连接建立时的音频输出设置
+- 在会话结束后恢复音频输出设置
 - 输出 PCM 音频块或音频流句柄
 
 `audio/` 不负责：
@@ -279,6 +281,7 @@ Windows V1 采集策略建议固定为：
 - `list_audio_devices() -> Vec<AudioDeviceSnapshot>`
 - `get_default_output_device() -> Option<AudioDeviceId>`
 - `get_audio_capabilities(device_id) -> AudioCapabilitySnapshot`
+- `capture_audio_output_setting() -> AudioOutputSettingSnapshot`
 
 ### `AudioCapturePort`
 
@@ -287,6 +290,7 @@ Windows V1 采集策略建议固定为：
 - `prepare_audio_capture(request: AudioPrepareRequest) -> AudioPrepareResult`
 - `start_audio_capture(request: AudioStartRequest) -> AudioCaptureHandle`
 - `stop_audio_capture(handle: AudioCaptureHandle) -> Result<()>`
+- `restore_audio_output_setting(snapshot: AudioOutputSettingSnapshot) -> Result<()>`
 
 ## 8.3 关键共享模型
 
@@ -298,12 +302,17 @@ Windows V1 采集策略建议固定为：
 - `AudioPrepareResult`
 - `AudioStartRequest`
 - `AudioCaptureHandle`
+- `AudioOutputSettingSnapshot`
 - `PcmAudioChunk`
 
 关键约束：
 
 - `audio` 输出 PCM
 - `runtime/audio` 负责编排后续编码和发送
+- V1 当前策略固定为“同一输出设备 loopback capture + 本地静音”
+- `history_audio_output_setting` 必须在第一次接管本地音频输出设置前记录
+- 断开时必须恢复 `history_audio_output_setting`
+- 恢复内容至少包括：默认输出设备、本地静音状态、需要恢复的音量相关设置
 
 ## 9. `encode/` 接口设计
 
