@@ -65,9 +65,7 @@ pub trait CaptureControlPort {
         &self,
         request: CapturePrepareRequest,
     ) -> HostResult<CapturePrepareResult>;
-    async fn start_capture(
-        &self,
-        request: CaptureStartRequest,
-    ) -> HostResult<CaptureSessionHandle>;
+    async fn start_capture(&self, request: CaptureStartRequest)
+        -> HostResult<CaptureSessionHandle>;
     async fn stop_capture(&self, handle: &CaptureSessionHandle) -> HostResult<()>;
 }

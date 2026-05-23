@@ -146,7 +146,10 @@ fn resolve_local_ffmpeg_bin_dir() -> io::Result<PathBuf> {
 
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        format!("local ffmpeg bin directory not found: {}", candidate.display()),
+        format!(
+            "local ffmpeg bin directory not found: {}",
+            candidate.display()
+        ),
     ))
 }
 

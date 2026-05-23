@@ -1,7 +1,7 @@
+use host_ipc::server::{serve_forever, ServerState};
 use host_runtime::control::spawn_control_server;
 use host_runtime::discovery::publish_presence;
 use host_runtime::service::RuntimeService;
-use host_ipc::server::{serve_forever, ServerState};
 use std::env;
 use std::io;
 

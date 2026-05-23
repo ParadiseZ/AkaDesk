@@ -1,12 +1,14 @@
 use crate::generated::v1::{
-    CapabilityFlags, ControlEnvelope, ControlHello, ControlHelloAck,
-    ControlMessageKind, DeviceIdentity, DevicePresence, DeviceSnapshot, DeviceSnapshotResponse,
-    ErrorInfo, GetDeviceSnapshot, HeartbeatPing, HeartbeatPong, PairingChallenge,
-    PairingChallengeType, PairingConfirm, PairingRequest, PairingResult, PlatformKind,
+    CapabilityFlags, ControlEnvelope, ControlHello, ControlHelloAck, ControlMessageKind,
+    DeviceIdentity, DevicePresence, DeviceSnapshot, DeviceSnapshotResponse, ErrorInfo,
+    GetDeviceSnapshot, HeartbeatPing, HeartbeatPong, PairingChallenge, PairingChallengeType,
+    PairingConfirm, PairingRequest, PairingResult, PlatformKind, SessionChangedEvent,
+    StartSessionAccepted, StartSessionRejected, StartSessionRequest,
 };
 use crate::pairing::{
     generate_pair_token, generate_verification_code, now_ms, PendingChallenge, SharedPairingStore,
 };
+use crate::session::SharedSessionRegistry;
 use prost::Message as ProstMessage;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -22,9 +24,12 @@ pub struct ControlPlaneState {
     pub advertised_presence: DevicePresence,
     pub capability_flags: CapabilityFlags,
     pub pairing_store: SharedPairingStore,
+    pub sessions: SharedSessionRegistry,
 }
 
-pub fn spawn_control_server(state: ControlPlaneState) -> io::Result<thread::JoinHandle<io::Result<()>>> {
+pub fn spawn_control_server(
+    state: ControlPlaneState,
+) -> io::Result<thread::JoinHandle<io::Result<()>>> {
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], state.advertised_presence.control_port as u16));
     let listener = TcpListener::bind(bind_addr)?;
     let shared_state = Arc::new(state);
@@ -44,7 +49,8 @@ pub fn spawn_control_server(state: ControlPlaneState) -> io::Result<thread::Join
 }
 
 fn handle_connection(stream: TcpStream, state: Arc<ControlPlaneState>) -> io::Result<()> {
-    let mut websocket = accept(stream).map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    let mut websocket =
+        accept(stream).map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
     let mut session = ConnectionSession::default();
     loop {
         let frame = websocket.read().map_err(ws_err)?;
@@ -114,7 +120,9 @@ fn handle_envelope(
             };
             eprintln!(
                 "pairing challenge for {} ({}) => {}",
-                challenge.controller_display_name, challenge.controller_device_id, challenge.verification_code
+                challenge.controller_display_name,
+                challenge.controller_device_id,
+                challenge.verification_code
             );
             session.pending_challenge = Some(challenge.clone());
             let message = PairingChallenge {
@@ -138,7 +146,10 @@ fn handle_envelope(
                     request_id: confirm.request_id,
                     accepted: false,
                     pair_token: String::new(),
-                    error: Some(simple_error("PAIRING_CHALLENGE_MISSING", "No pairing challenge is active.")),
+                    error: Some(simple_error(
+                        "PAIRING_CHALLENGE_MISSING",
+                        "No pairing challenge is active.",
+                    )),
                 };
                 return send_payload(
                     websocket,
@@ -156,7 +167,10 @@ fn handle_envelope(
                     request_id: confirm.request_id,
                     accepted: false,
                     pair_token: String::new(),
-                    error: Some(simple_error("PAIRING_CODE_INVALID", "The verification code is invalid.")),
+                    error: Some(simple_error(
+                        "PAIRING_CODE_INVALID",
+                        "The verification code is invalid.",
+                    )),
                 };
                 return send_payload(
                     websocket,
@@ -177,7 +191,8 @@ fn handle_envelope(
                     &challenge.controller_display_name,
                     &pair_token,
                 )?;
-            session.authenticated_controller_device_id = Some(challenge.controller_device_id.clone());
+            session.authenticated_controller_device_id =
+                Some(challenge.controller_device_id.clone());
             session.pending_challenge = None;
 
             let result = PairingResult {
@@ -243,6 +258,96 @@ fn handle_envelope(
                 pong,
             )
         }
+        "StartSessionRequest" => {
+            if session.authenticated_controller_device_id.is_none() {
+                return send_start_session_rejected(
+                    websocket,
+                    &envelope.request_id,
+                    String::new(),
+                    pairing_required_error(),
+                );
+            }
+
+            let request = StartSessionRequest::decode(&envelope.payload[..]).map_err(decode_err)?;
+            let Some(mut intent) = request.intent else {
+                return send_start_session_rejected(
+                    websocket,
+                    &envelope.request_id,
+                    String::new(),
+                    simple_error(
+                        "MEDIA_SESSION_INTENT_MISSING",
+                        "StartSessionRequest must include a SessionIntent payload.",
+                    ),
+                );
+            };
+
+            let authenticated_controller = session
+                .authenticated_controller_device_id
+                .as_ref()
+                .expect("checked authenticated controller")
+                .clone();
+            if intent.controller_device_id.trim().is_empty() {
+                intent.controller_device_id = authenticated_controller.clone();
+            }
+            if intent.controller_device_id != authenticated_controller {
+                return send_start_session_rejected(
+                    websocket,
+                    &envelope.request_id,
+                    intent.session_id,
+                    simple_error(
+                        "AUTH_CONTROLLER_ID_MISMATCH",
+                        "Session intent controller_device_id does not match the authenticated control channel.",
+                    ),
+                );
+            }
+            if intent.controlled_device_id.trim().is_empty() {
+                intent.controlled_device_id = state.host_identity.device_id.clone();
+            }
+
+            let prepared = match crate::video::prepare_h264_session(&intent) {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    return send_start_session_rejected(
+                        websocket,
+                        &envelope.request_id,
+                        intent.session_id,
+                        simple_error("MEDIA_H264_PREPARE_FAILED", &err),
+                    )
+                }
+            };
+
+            let snapshot = state
+                .sessions
+                .lock()
+                .map_err(session_lock_err)?
+                .activate_preparing(
+                    intent.session_id,
+                    intent.controller_device_id,
+                    intent.controlled_device_id,
+                    intent.target_display_id,
+                    prepared.spec,
+                );
+
+            send_payload(
+                websocket,
+                &envelope.request_id,
+                ControlMessageKind::Response,
+                "StartSessionAccepted",
+                StartSessionAccepted {
+                    session_id: snapshot.session_id.clone(),
+                    state: snapshot.state,
+                },
+            )?;
+            send_payload(
+                websocket,
+                &envelope.request_id,
+                ControlMessageKind::Event,
+                "SessionChangedEvent",
+                SessionChangedEvent {
+                    snapshot: Some(snapshot),
+                },
+            )
+        }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unsupported control message type: {other}"),
@@ -270,7 +375,28 @@ fn send_payload<T: ProstMessage>(
 }
 
 fn pairing_required_error() -> ErrorInfo {
-    simple_error("AUTH_PAIRING_REQUIRED", "Pairing is required before this controller can connect.")
+    simple_error(
+        "AUTH_PAIRING_REQUIRED",
+        "Pairing is required before this controller can connect.",
+    )
+}
+
+fn send_start_session_rejected(
+    websocket: &mut WebSocket<TcpStream>,
+    request_id: &str,
+    session_id: String,
+    error: ErrorInfo,
+) -> io::Result<()> {
+    send_payload(
+        websocket,
+        request_id,
+        ControlMessageKind::Response,
+        "StartSessionRejected",
+        StartSessionRejected {
+            session_id,
+            error: Some(error),
+        },
+    )
 }
 
 fn simple_error(code: &str, message: &str) -> ErrorInfo {
@@ -294,6 +420,10 @@ fn lock_err<T>(_: std::sync::PoisonError<T>) -> io::Error {
     io::Error::new(io::ErrorKind::Other, "pairing store lock poisoned")
 }
 
+fn session_lock_err<T>(_: std::sync::PoisonError<T>) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, "session registry lock poisoned")
+}
+
 pub fn default_capability_flags() -> CapabilityFlags {
     let video_support = crate::video::detect_runtime_video_support();
     CapabilityFlags {
@@ -307,7 +437,12 @@ pub fn default_capability_flags() -> CapabilityFlags {
     }
 }
 
-pub fn default_host_identity(device_id: String, display_name: String, hostname: String, app_version: String) -> DeviceIdentity {
+pub fn default_host_identity(
+    device_id: String,
+    display_name: String,
+    hostname: String,
+    app_version: String,
+) -> DeviceIdentity {
     DeviceIdentity {
         device_id,
         display_name,

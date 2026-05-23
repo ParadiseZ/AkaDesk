@@ -8,7 +8,19 @@ pub const AKADESK_SERVICE_TYPE: &str = "_akadesk._tcp.local.";
 
 pub fn publish_presence(presence: &DevicePresence) -> io::Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new().map_err(to_io_error)?;
-    let service_name = format!("{}-{}", presence.identity.as_ref().map(|it| it.display_name.clone()).unwrap_or_else(|| "AkaDesk".to_string()), presence.identity.as_ref().map(|it| it.device_id.clone()).unwrap_or_else(|| "device".to_string()));
+    let service_name = format!(
+        "{}-{}",
+        presence
+            .identity
+            .as_ref()
+            .map(|it| it.display_name.clone())
+            .unwrap_or_else(|| "AkaDesk".to_string()),
+        presence
+            .identity
+            .as_ref()
+            .map(|it| it.device_id.clone())
+            .unwrap_or_else(|| "device".to_string())
+    );
     let host_name = format!(
         "{}.local.",
         presence
@@ -19,15 +31,58 @@ pub fn publish_presence(presence: &DevicePresence) -> io::Result<ServiceDaemon> 
     );
     let ip = detect_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let properties = HashMap::from([
-        ("device_id".to_string(), presence.identity.as_ref().map(|it| it.device_id.clone()).unwrap_or_default()),
-        ("display_name".to_string(), presence.identity.as_ref().map(|it| it.display_name.clone()).unwrap_or_default()),
-        ("platform".to_string(), platform_label(presence.identity.as_ref().map(|it| it.platform).unwrap_or(PlatformKind::Unspecified as i32))),
-        ("hostname".to_string(), presence.identity.as_ref().map(|it| it.hostname.clone()).unwrap_or_default()),
-        ("app_version".to_string(), presence.identity.as_ref().map(|it| it.app_version.clone()).unwrap_or_default()),
-        ("control_port".to_string(), presence.control_port.to_string()),
+        (
+            "device_id".to_string(),
+            presence
+                .identity
+                .as_ref()
+                .map(|it| it.device_id.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "display_name".to_string(),
+            presence
+                .identity
+                .as_ref()
+                .map(|it| it.display_name.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "platform".to_string(),
+            platform_label(
+                presence
+                    .identity
+                    .as_ref()
+                    .map(|it| it.platform)
+                    .unwrap_or(PlatformKind::Unspecified as i32),
+            ),
+        ),
+        (
+            "hostname".to_string(),
+            presence
+                .identity
+                .as_ref()
+                .map(|it| it.hostname.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "app_version".to_string(),
+            presence
+                .identity
+                .as_ref()
+                .map(|it| it.app_version.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "control_port".to_string(),
+            presence.control_port.to_string(),
+        ),
         ("paired".to_string(), presence.paired.to_string()),
         ("reachable".to_string(), presence.reachable.to_string()),
-        ("last_seen_ms".to_string(), presence.last_seen_ms.to_string()),
+        (
+            "last_seen_ms".to_string(),
+            presence.last_seen_ms.to_string(),
+        ),
     ]);
     let service = ServiceInfo::new(
         AKADESK_SERVICE_TYPE,

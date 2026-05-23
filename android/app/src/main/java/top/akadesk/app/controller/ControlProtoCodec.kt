@@ -11,6 +11,13 @@ import akadesk.v1.PairingConfirm
 import akadesk.v1.PairingRequest
 import akadesk.v1.PairingResult
 import akadesk.v1.PlatformKind
+import akadesk.v1.SessionChangedEvent
+import akadesk.v1.SessionIntent
+import akadesk.v1.StartSessionAccepted
+import akadesk.v1.StartSessionRejected
+import akadesk.v1.StartSessionRequest
+import akadesk.v1.VideoCodec
+import akadesk.v1.VideoPreference
 import akadesk.v1.VersionInfo
 import com.google.protobuf.ByteString
 import com.google.protobuf.MessageLite
@@ -65,6 +72,31 @@ object ControlProtoCodec {
         return buildEnvelope(requestId, ControlMessageKind.CONTROL_MESSAGE_KIND_REQUEST, "GetDeviceSnapshot", payload)
     }
 
+    fun buildStartSessionRequest(
+        requestId: String,
+        controllerDeviceId: String,
+        controlledDeviceId: String,
+    ): ControlEnvelope {
+        val payload = StartSessionRequest.newBuilder()
+            .setIntent(
+                SessionIntent.newBuilder()
+                    .setControllerDeviceId(controllerDeviceId)
+                    .setControlledDeviceId(controlledDeviceId)
+                    .setEnableInput(true)
+                    .setVideo(
+                        VideoPreference.newBuilder()
+                            .setCodec(VideoCodec.VIDEO_CODEC_H264)
+                            .setWidth(1280)
+                            .setHeight(720)
+                            .setFps(30)
+                            .setBitrateKbps(4000)
+                            .setAllowSameCodecSoftwareFallback(true)
+                    )
+            )
+            .build()
+        return buildEnvelope(requestId, ControlMessageKind.CONTROL_MESSAGE_KIND_REQUEST, "StartSessionRequest", payload)
+    }
+
     fun decodeEnvelope(bytes: ByteArray): ControlEnvelope = ControlEnvelope.parseFrom(bytes)
 
     fun decodeControlHelloAck(envelope: ControlEnvelope): ControlHelloAck =
@@ -78,6 +110,15 @@ object ControlProtoCodec {
 
     fun decodeDeviceSnapshotResponse(envelope: ControlEnvelope): DeviceSnapshotResponse =
         DeviceSnapshotResponse.parseFrom(envelope.payload)
+
+    fun decodeStartSessionAccepted(envelope: ControlEnvelope): StartSessionAccepted =
+        StartSessionAccepted.parseFrom(envelope.payload)
+
+    fun decodeStartSessionRejected(envelope: ControlEnvelope): StartSessionRejected =
+        StartSessionRejected.parseFrom(envelope.payload)
+
+    fun decodeSessionChangedEvent(envelope: ControlEnvelope): SessionChangedEvent =
+        SessionChangedEvent.parseFrom(envelope.payload)
 
     private fun defaultVersion(): VersionInfo =
         VersionInfo.newBuilder()

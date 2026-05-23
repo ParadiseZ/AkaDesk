@@ -21,6 +21,8 @@ class HostControlSession(
         fun onPairingChallenge(host: ControlledHostSummary, challengeId: String)
         fun onPairingSucceeded(host: ControlledHostSummary, pairToken: String)
         fun onDeviceSnapshotLoaded(host: ControlledHostSummary)
+        fun onSessionAccepted(host: ControlledHostSummary, sessionId: String)
+        fun onSessionChanged(host: ControlledHostSummary, sessionId: String, summary: String)
         fun onFailure(host: ControlledHostSummary, message: String)
     }
 
@@ -81,6 +83,16 @@ class HostControlSession(
         client.dispatcher.executorService.shutdown()
     }
 
+    fun requestH264Preview() {
+        socket?.send(
+            ByteString.of(
+                *ControlProtoCodec
+                    .buildStartSessionRequest(nextRequestId(), controllerDeviceId, host.deviceId)
+                    .toByteArray()
+            )
+        )
+    }
+
     private fun handleEnvelope(envelope: ControlEnvelope) {
         when (envelope.type) {
             "ControlHelloAck" -> {
@@ -121,6 +133,47 @@ class HostControlSession(
                     val message = if (response.hasError()) response.error.message else "Snapshot unavailable"
                     listener.onFailure(host, message)
                 }
+            }
+            "StartSessionAccepted" -> {
+                val accepted = ControlProtoCodec.decodeStartSessionAccepted(envelope)
+                listener.onSessionAccepted(host, accepted.sessionId)
+            }
+            "StartSessionRejected" -> {
+                val rejected = ControlProtoCodec.decodeStartSessionRejected(envelope)
+                val message = if (rejected.hasError()) rejected.error.message else "Session rejected"
+                listener.onFailure(host, message)
+            }
+            "SessionChangedEvent" -> {
+                val changed = ControlProtoCodec.decodeSessionChangedEvent(envelope)
+                if (!changed.hasSnapshot()) {
+                    listener.onFailure(host, "SessionChangedEvent missing snapshot")
+                    return
+                }
+                val snapshot = changed.snapshot
+                val summary = buildString {
+                    append("state=")
+                    append(snapshot.state.name.removePrefix("SESSION_STATE_"))
+                    if (snapshot.hasVideo()) {
+                        val video = snapshot.video
+                        append(" • codec=")
+                        append(video.codec.name.removePrefix("VIDEO_CODEC_"))
+                        append(" • ")
+                        append(video.width)
+                        append("x")
+                        append(video.height)
+                        append("@")
+                        append(video.fps)
+                        append("fps")
+                        append(" • ")
+                        append(video.bitrateKbps)
+                        append("kbps")
+                        append(" • host=")
+                        append(video.hostEncoder.name.removePrefix("CODEC_IMPLEMENTATION_"))
+                        append(" • controller=")
+                        append(video.controllerDecoder.name.removePrefix("CODEC_IMPLEMENTATION_"))
+                    }
+                }
+                listener.onSessionChanged(host, snapshot.sessionId, summary)
             }
         }
     }

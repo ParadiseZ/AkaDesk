@@ -22,6 +22,8 @@ class ControllerCoordinator(context: Context) {
     var pairingCode by mutableStateOf("")
     var pairingTarget by mutableStateOf<ControlledHostSummary?>(null)
     var authenticatedTarget by mutableStateOf<ControlledHostSummary?>(null)
+    var activeSessionId by mutableStateOf<String?>(null)
+    var negotiatedVideoSummary by mutableStateOf<String?>(null)
 
     fun startDiscovery() {
         if (discoveryClient == null) {
@@ -99,6 +101,21 @@ class ControllerCoordinator(context: Context) {
                     }
                 }
 
+                override fun onSessionAccepted(host: ControlledHostSummary, sessionId: String) {
+                    mainHandler.post {
+                        activeSessionId = sessionId
+                        statusMessage = "Host accepted session prepare request for ${host.displayName}."
+                    }
+                }
+
+                override fun onSessionChanged(host: ControlledHostSummary, sessionId: String, summary: String) {
+                    mainHandler.post {
+                        activeSessionId = sessionId
+                        negotiatedVideoSummary = summary
+                        statusMessage = "Negotiated H.264 session with ${host.displayName}."
+                    }
+                }
+
                 override fun onFailure(host: ControlledHostSummary, message: String) {
                     mainHandler.post {
                         upsertHost(host.copy(authState = HostAuthState.Failed))
@@ -123,6 +140,17 @@ class ControllerCoordinator(context: Context) {
         }
         statusMessage = "Submitting verification code..."
         controlSession?.confirmPairing(pairingCode)
+    }
+
+    fun preparePreviewSession() {
+        val target = authenticatedTarget
+        if (target == null) {
+            statusMessage = "Authenticate with a host before preparing a video session."
+            return
+        }
+        negotiatedVideoSummary = null
+        statusMessage = "Preparing H.264 preview session on ${target.displayName}..."
+        controlSession?.requestH264Preview()
     }
 
     private fun upsertHost(host: ControlledHostSummary) {

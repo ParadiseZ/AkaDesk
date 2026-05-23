@@ -5,9 +5,7 @@ use crate::types::{
     RuntimeStatusResponse, CAPABILITY_SNAPSHOT_CHANGED, CAPABILITY_SNAPSHOT_RESPONSE,
     GET_CAPABILITY_SNAPSHOT, GET_RUNTIME_STATUS, RUNTIME_STATUS_CHANGED, RUNTIME_STATUS_RESPONSE,
 };
-use interprocess::local_socket::{
-    prelude::*, GenericFilePath, GenericNamespaced, Stream,
-};
+use interprocess::local_socket::{prelude::*, GenericFilePath, GenericNamespaced, Stream};
 use prost::Message;
 use std::io;
 use std::path::PathBuf;
@@ -56,7 +54,10 @@ impl IpcClient {
         if envelope.message_type != RUNTIME_STATUS_CHANGED {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("expected {RUNTIME_STATUS_CHANGED}, got {}", envelope.message_type),
+                format!(
+                    "expected {RUNTIME_STATUS_CHANGED}, got {}",
+                    envelope.message_type
+                ),
             ));
         }
         RuntimeStatusChanged::decode(&envelope.payload[..])

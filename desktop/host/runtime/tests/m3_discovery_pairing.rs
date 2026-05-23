@@ -5,9 +5,11 @@ use host_runtime::discovery::{publish_presence, AKADESK_SERVICE_TYPE};
 use host_runtime::generated::v1::{
     ControlEnvelope, ControlHello, ControlHelloAck, ControlMessageKind, DevicePresence,
     DeviceSnapshotResponse, GetDeviceSnapshot, PairingChallenge, PairingConfirm, PairingRequest,
-    PairingResult, PlatformKind, VersionInfo,
+    PairingResult, PlatformKind, SessionChangedEvent, SessionIntent, StartSessionAccepted,
+    StartSessionRequest, VersionInfo, VideoCodec, VideoPreference,
 };
 use host_runtime::pairing::{now_ms, PairingStore};
+use host_runtime::session::SessionRegistry;
 use mdns_sd::{Receiver, ServiceDaemon, ServiceEvent};
 use prost::Message;
 use std::fs;
@@ -21,7 +23,8 @@ use tungstenite::{connect, Message as WsMessage};
 fn discovery_publish_pairing_and_reauth_work_together() {
     let port = allocate_port();
     let state = test_control_state(port);
-    let _control_server = spawn_control_server(state.clone()).expect("failed to start control server");
+    let _control_server =
+        spawn_control_server(state.clone()).expect("failed to start control server");
     let _mdns = publish_presence(&state.advertised_presence).expect("failed to publish mdns");
     thread::sleep(Duration::from_millis(500));
 
@@ -32,7 +35,10 @@ fn discovery_publish_pairing_and_reauth_work_together() {
 
     let resolved = wait_for_resolved_service(receiver, "host-test-device");
     assert_eq!(resolved.get_port(), port);
-    assert_eq!(resolved.get_property_val_str("device_id"), Some("host-test-device"));
+    assert_eq!(
+        resolved.get_property_val_str("device_id"),
+        Some("host-test-device")
+    );
 
     let mut socket = connect_ws(port);
 
@@ -115,8 +121,48 @@ fn discovery_publish_pairing_and_reauth_work_together() {
         "GetDeviceSnapshot",
         snapshot_request,
     );
-    let snapshot_response: DeviceSnapshotResponse = recv_typed(&mut reconnect_socket, "DeviceSnapshotResponse");
+    let snapshot_response: DeviceSnapshotResponse =
+        recv_typed(&mut reconnect_socket, "DeviceSnapshotResponse");
     assert!(snapshot_response.snapshot.is_some());
+
+    #[cfg(windows)]
+    {
+        let start_session = StartSessionRequest {
+            intent: Some(SessionIntent {
+                session_id: String::new(),
+                controller_device_id: "android-controller-1".to_string(),
+                controlled_device_id: "host-test-device".to_string(),
+                target_display_id: String::new(),
+                enable_input: true,
+                video: Some(VideoPreference {
+                    codec: VideoCodec::H264 as i32,
+                    width: 1280,
+                    height: 720,
+                    fps: 30,
+                    bitrate_kbps: 4_000,
+                    allow_same_codec_software_fallback: true,
+                }),
+                audio: None,
+            }),
+        };
+        send_envelope(
+            &mut reconnect_socket,
+            "start-session-1",
+            ControlMessageKind::Request,
+            "StartSessionRequest",
+            start_session,
+        );
+        let accepted: StartSessionAccepted =
+            recv_typed(&mut reconnect_socket, "StartSessionAccepted");
+        assert!(!accepted.session_id.is_empty());
+        let changed: SessionChangedEvent = recv_typed(&mut reconnect_socket, "SessionChangedEvent");
+        let snapshot = changed.snapshot.expect("missing session snapshot");
+        assert_eq!(snapshot.session_id, accepted.session_id);
+        let video = snapshot.video.expect("missing video spec");
+        assert_eq!(video.codec, VideoCodec::H264 as i32);
+        assert_eq!(video.width, 1280);
+        assert_eq!(video.height, 720);
+    }
 }
 
 fn test_control_state(port: u16) -> ControlPlaneState {
@@ -141,6 +187,7 @@ fn test_control_state(port: u16) -> ControlPlaneState {
         },
         capability_flags: default_capability_flags(),
         pairing_store: Arc::new(Mutex::new(pairing_store)),
+        sessions: Arc::new(Mutex::new(SessionRegistry::default())),
     }
 }
 
@@ -150,7 +197,8 @@ fn wait_for_resolved_service(
 ) -> mdns_sd::ServiceInfo {
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(15) {
-        if let Ok(ServiceEvent::ServiceResolved(info)) = receiver.recv_timeout(Duration::from_secs(1))
+        if let Ok(ServiceEvent::ServiceResolved(info)) =
+            receiver.recv_timeout(Duration::from_secs(1))
         {
             if info.get_property_val_str("device_id") == Some(expected_device_id) {
                 return info;
@@ -167,8 +215,11 @@ fn allocate_port() -> u16 {
     port
 }
 
-fn connect_ws(port: u16) -> tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>> {
-    let (socket, _) = connect(format!("ws://127.0.0.1:{port}/")).expect("failed to connect websocket");
+fn connect_ws(
+    port: u16,
+) -> tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>> {
+    let (socket, _) =
+        connect(format!("ws://127.0.0.1:{port}/")).expect("failed to connect websocket");
     socket
 }
 

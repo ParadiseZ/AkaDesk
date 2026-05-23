@@ -134,7 +134,9 @@ pub type SharedPairingStore = Arc<Mutex<PairingStore>>;
 
 pub fn load_runtime_base_dir() -> PathBuf {
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(local_app_data).join("AkaDesk").join("host-runtime");
+        return PathBuf::from(local_app_data)
+            .join("AkaDesk")
+            .join("host-runtime");
     }
     std::env::temp_dir().join("AkaDesk").join("host-runtime")
 }

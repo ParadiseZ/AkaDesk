@@ -61,10 +61,21 @@ fun ControllerHomeScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("AkaDesk M3 Controller")
+        Text("AkaDesk M4 Controller")
         Text(coordinator.statusMessage)
         Button(onClick = coordinator::startDiscovery) {
             Text("Scan via mDNS")
+        }
+        if (coordinator.authenticatedTarget != null) {
+            Button(onClick = coordinator::preparePreviewSession) {
+                Text("Prepare H.264 preview")
+            }
+        }
+        coordinator.activeSessionId?.let { sessionId ->
+            Text("Session: $sessionId")
+        }
+        coordinator.negotiatedVideoSummary?.let { summary ->
+            Text("Video: $summary")
         }
         LazyColumn(
             modifier = Modifier.weight(1f),

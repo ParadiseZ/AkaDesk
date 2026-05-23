@@ -1,19 +1,21 @@
-use crate::session::SessionRegistry;
-use crate::state::RuntimeStatus;
-use crate::control::{default_capability_flags, default_host_identity, ControlPlaneState, DEFAULT_CONTROL_PORT};
-use host_ipc::types::{
-    CapabilitySnapshot, InputCapabilitySnapshot, RuntimeStatusChanged, RuntimeStatusSnapshot,
-    CapabilitySnapshotChanged,
+use crate::control::{
+    default_capability_flags, default_host_identity, ControlPlaneState, DEFAULT_CONTROL_PORT,
 };
 use crate::generated::v1::DevicePresence;
 use crate::pairing::{load_runtime_base_dir, HostIdentity, PairingStore, SharedPairingStore};
+use crate::session::{SessionRegistry, SharedSessionRegistry};
+use crate::state::RuntimeStatus;
+use host_ipc::types::{
+    CapabilitySnapshot, CapabilitySnapshotChanged, InputCapabilitySnapshot, RuntimeStatusChanged,
+    RuntimeStatusSnapshot,
+};
 use std::io;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub struct RuntimeService {
     status: RuntimeStatus,
-    sessions: SessionRegistry,
+    sessions: SharedSessionRegistry,
     control_state: ControlPlaneState,
 }
 
@@ -23,6 +25,7 @@ impl RuntimeService {
         let host_identity = HostIdentity::load_or_create(&base_dir)?;
         let pairing_store: SharedPairingStore =
             Arc::new(Mutex::new(PairingStore::load(&base_dir)?));
+        let sessions: SharedSessionRegistry = Arc::new(Mutex::new(SessionRegistry::default()));
         let device_identity = default_host_identity(
             host_identity.device_id.clone(),
             host_identity.display_name.clone(),
@@ -41,10 +44,11 @@ impl RuntimeService {
             },
             capability_flags: default_capability_flags(),
             pairing_store,
+            sessions: Arc::clone(&sessions),
         };
         Ok(Self {
             status: RuntimeStatus::default(),
-            sessions: SessionRegistry::default(),
+            sessions,
             control_state,
         })
     }
@@ -53,7 +57,7 @@ impl RuntimeService {
         &self.status
     }
 
-    pub fn sessions(&self) -> &SessionRegistry {
+    pub fn sessions(&self) -> &SharedSessionRegistry {
         &self.sessions
     }
 
@@ -62,15 +66,30 @@ impl RuntimeService {
     }
 
     pub fn ipc_runtime_status_changed(&self) -> RuntimeStatusChanged {
-        RuntimeStatusChanged {
-            status: Some(RuntimeStatusSnapshot {
-                state_label: self.status.state_label.to_string(),
-                active_session_id: self
-                    .status
+        let (active_session_id, updated_at_ms) = match self.sessions.lock() {
+            Ok(sessions) => (
+                sessions
+                    .active_session_id()
+                    .map(|session_id| session_id.0.clone()),
+                sessions
+                    .active
+                    .as_ref()
+                    .map(|session| session.updated_at_ms)
+                    .unwrap_or(self.status.updated_at_ms),
+            ),
+            Err(_) => (
+                self.status
                     .active_session_id
                     .as_ref()
                     .map(|session_id| session_id.0.clone()),
-                updated_at_ms: self.status.updated_at_ms,
+                self.status.updated_at_ms,
+            ),
+        };
+        RuntimeStatusChanged {
+            status: Some(RuntimeStatusSnapshot {
+                state_label: self.status.state_label.to_string(),
+                active_session_id,
+                updated_at_ms,
             }),
         }
     }
@@ -80,7 +99,10 @@ impl RuntimeService {
             snapshot: Some(CapabilitySnapshot {
                 supports_audio: self.control_state.capability_flags.supports_audio,
                 supports_input: self.control_state.capability_flags.supports_input,
-                supports_display_control: self.control_state.capability_flags.supports_display_control,
+                supports_display_control: self
+                    .control_state
+                    .capability_flags
+                    .supports_display_control,
                 input: Some(InputCapabilitySnapshot {
                     supports_pointer: true,
                     supports_scroll: true,
