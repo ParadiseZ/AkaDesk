@@ -18,7 +18,7 @@
 
 本文档固定放在：
 
-- `docs/contracts接口设计.md`
+- `docs/07-contracts接口设计.md`
 
 代码落位：
 
@@ -579,7 +579,7 @@ V1 正式要求：
 
 这份 `contracts` 抽象接口设计文档固定放在：
 
-- `docs/contracts接口设计.md`
+- `docs/07-contracts接口设计.md`
 
 它定的是：
 
