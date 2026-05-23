@@ -1,20 +1,26 @@
 use crate::types::IpcEnvelope;
+use prost::Message;
+use std::io::{self, Read, Write};
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ProtoCodec;
+fn prost_err(err: prost::DecodeError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, err.to_string())
+}
 
-impl ProtoCodec {
-    pub fn encode(&self, envelope: &IpcEnvelope) -> Vec<u8> {
-        envelope.payload.clone()
-    }
+pub fn write_envelope<W: Write>(writer: &mut W, envelope: &IpcEnvelope) -> io::Result<()> {
+    let bytes = envelope.encode_to_vec();
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "IPC message too large"))?;
+    writer.write_all(&len.to_le_bytes())?;
+    writer.write_all(&bytes)?;
+    writer.flush()?;
+    Ok(())
+}
 
-    pub fn decode(&self, payload: Vec<u8>) -> IpcEnvelope {
-        IpcEnvelope {
-            request_id: String::new(),
-            kind: crate::types::IpcMessageKind::Event,
-            message_type: String::new(),
-            payload,
-            timestamp_ms: 0,
-        }
-    }
+pub fn read_envelope<R: Read>(reader: &mut R) -> io::Result<IpcEnvelope> {
+    let mut len_bytes = [0u8; 4];
+    reader.read_exact(&mut len_bytes)?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload)?;
+    IpcEnvelope::decode(&payload[..]).map_err(prost_err)
 }

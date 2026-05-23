@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-host-contracts = { path = "../contracts" }
+interprocess = "2"
+prost = "0.13"
 
 [lib]
 path = "src/lib.rs"
