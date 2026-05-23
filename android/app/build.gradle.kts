@@ -38,6 +38,12 @@ android {
         compose = true
     }
     buildToolsVersion = "37.0.0"
+
+    sourceSets {
+        getByName("main") {
+            java.setSrcDirs(listOf("src/main/java", "src/main/java_generated"))
+        }
+    }
 }
 
 dependencies {
@@ -50,6 +56,8 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.okhttp)
+    implementation(libs.protobuf.javalite)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)

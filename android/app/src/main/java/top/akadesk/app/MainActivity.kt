@@ -4,22 +4,29 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Icon
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteScaffold
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.tooling.preview.Preview
-import androidx.compose.ui.tooling.preview.PreviewScreenSizes
+import androidx.compose.ui.unit.dp
+import top.akadesk.app.controller.ControlledHostSummary
+import top.akadesk.app.controller.ControllerCoordinator
 import top.akadesk.app.ui.theme.AkaDeskTheme
 
 class MainActivity : ComponentActivity() {
@@ -28,64 +35,106 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             AkaDeskTheme {
-                AkaDeskApp()
+                val coordinator = remember { ControllerCoordinator(this) }
+                DisposableEffect(Unit) {
+                    onDispose { coordinator.stopDiscovery() }
+                }
+                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+                    ControllerHomeScreen(
+                        coordinator = coordinator,
+                        modifier = Modifier.padding(innerPadding),
+                    )
+                }
             }
         }
     }
 }
 
-@PreviewScreenSizes
 @Composable
-fun AkaDeskApp() {
-    var currentDestination by rememberSaveable { mutableStateOf(AppDestinations.HOME) }
-
-    NavigationSuiteScaffold(
-        navigationSuiteItems = {
-            AppDestinations.entries.forEach {
-                item(
-                    icon = {
-                        Icon(
-                            painterResource(it.icon),
-                            contentDescription = it.label
-                        )
-                    },
-                    label = { Text(it.label) },
-                    selected = it == currentDestination,
-                    onClick = { currentDestination = it }
-                )
-            }
-        }
-    ) {
-        Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-            Greeting(
-                name = "Android",
-                modifier = Modifier.padding(innerPadding)
-            )
-        }
-    }
-}
-
-enum class AppDestinations(
-    val label: String,
-    val icon: Int,
+fun ControllerHomeScreen(
+    coordinator: ControllerCoordinator,
+    modifier: Modifier = Modifier,
 ) {
-    HOME("Home", R.drawable.ic_home),
-    FAVORITES("Favorites", R.drawable.ic_favorite),
-    PROFILE("Profile", R.drawable.ic_account_box),
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("AkaDesk M3 Controller")
+        Text(coordinator.statusMessage)
+        Button(onClick = coordinator::startDiscovery) {
+            Text("Scan via mDNS")
+        }
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            contentPadding = PaddingValues(vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            items(coordinator.hosts, key = { it.deviceId.ifBlank { it.serviceName } }) { host ->
+                HostCard(host = host, onConnect = { coordinator.connect(host) })
+            }
+        }
+        if (coordinator.pairingTarget != null) {
+            OutlinedTextField(
+                value = coordinator.pairingCode,
+                onValueChange = { coordinator.pairingCode = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Host verification code") },
+            )
+            Button(onClick = coordinator::startPairing) {
+                Text("Request pairing challenge")
+            }
+            Button(onClick = coordinator::submitPairingCode) {
+                Text("Submit code and reconnect")
+            }
+        }
+    }
 }
 
 @Composable
-fun Greeting(name: String, modifier: Modifier = Modifier) {
-    Text(
-        text = "Hello $name!",
-        modifier = modifier
-    )
+fun HostCard(
+    host: ControlledHostSummary,
+    onConnect: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(host.displayName)
+            Text("${host.hostAddress}:${host.controlPort} • ${host.platform.ifBlank { "unknown" }}")
+            Text("Auth: ${host.authState.name}")
+            Text("Advertised paired: ${host.pairedAdvertised} • reachable: ${host.reachable}")
+            Button(onClick = onConnect, modifier = Modifier.align(Alignment.End)) {
+                Text("Connect")
+            }
+        }
+    }
 }
 
 @Preview(showBackground = true)
 @Composable
-fun GreetingPreview() {
+fun ControllerPreview() {
     AkaDeskTheme {
-        Greeting("Android")
+        HostCard(
+            host = ControlledHostSummary(
+                serviceName = "AkaDesk Preview",
+                deviceId = "preview",
+                displayName = "Preview Host",
+                platform = "windows",
+                hostname = "preview-host",
+                appVersion = "0.1.0",
+                hostAddress = "192.168.0.8",
+                controlPort = 46661,
+                pairedAdvertised = false,
+                reachable = true,
+                lastSeenMs = 0L,
+            ),
+            onConnect = {},
+        )
     }
 }

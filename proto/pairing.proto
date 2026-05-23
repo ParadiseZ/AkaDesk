@@ -2,6 +2,9 @@ syntax = "proto3";
 
 package akadesk.v1;
 
+option java_multiple_files = true;
+option java_package = "akadesk.v1";
+
 import "common.proto";
 import "device.proto";
 import "media.proto";
@@ -11,6 +14,21 @@ enum PairingChallengeType {
   PAIRING_CHALLENGE_TYPE_UNSPECIFIED = 0;
   PAIRING_CHALLENGE_TYPE_ONE_TIME_CODE = 1;
   PAIRING_CHALLENGE_TYPE_LOCAL_CONFIRM = 2;
+}
+
+enum ControlMessageKind {
+  CONTROL_MESSAGE_KIND_UNSPECIFIED = 0;
+  CONTROL_MESSAGE_KIND_REQUEST = 1;
+  CONTROL_MESSAGE_KIND_RESPONSE = 2;
+  CONTROL_MESSAGE_KIND_EVENT = 3;
+}
+
+message ControlEnvelope {
+  string request_id = 1;
+  ControlMessageKind kind = 2;
+  string type = 3;
+  bytes payload = 4;
+  int64 timestamp_ms = 5;
 }
 
 message DiscoveryProbe {

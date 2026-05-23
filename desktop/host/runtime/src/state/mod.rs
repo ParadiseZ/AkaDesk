@@ -11,7 +11,7 @@ pub struct RuntimeStatus {
 impl Default for RuntimeStatus {
     fn default() -> Self {
         Self {
-            state_label: "READY_FOR_M2",
+            state_label: "READY_FOR_M3",
             health: HealthStatus::Healthy,
             active_session_id: None,
             updated_at_ms: 0,

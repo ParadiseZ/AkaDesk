@@ -16,3 +16,4 @@
 /**/local.properties
 .playwright-mcp
 proto/*.pb
+/**/java_generated/**

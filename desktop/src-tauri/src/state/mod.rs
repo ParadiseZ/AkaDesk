@@ -8,7 +8,7 @@ pub struct AppHostState {
 impl AppHostState {
     pub fn ready(runtime_status_label: impl Into<String>, supports_input: bool) -> Self {
         Self {
-            label: "READY_FOR_M2".to_string(),
+            label: "READY_FOR_M3".to_string(),
             runtime_status_label: runtime_status_label.into(),
             supports_input,
         }
