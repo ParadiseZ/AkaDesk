@@ -128,7 +128,7 @@ impl AppState {
         let snapshot = HostSettingsSnapshot {
             allow_remote_assistance: next.allow_remote_assistance,
             verification_mode: next.verification_mode,
-            connection_method: next.connection_method,
+            connection_method: next.connection_method.as_wire_value().to_string(),
             notify_on_incoming_request: next.notify_on_incoming_request,
             auto_accept_trusted_controller: next.auto_accept_trusted_controller,
             updated_at_ms: now_ms(),
@@ -467,10 +467,39 @@ impl From<HostIdentitySnapshot> for HostIdentityView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum ConnectionMethodView {
+    #[serde(rename = "ACCESS_CODE")]
+    AccessCode,
+    #[serde(rename = "TRUST_ONLY")]
+    TrustOnly,
+    #[serde(rename = "ACCESS_CODE_AND_CONSENT")]
+    AccessCodeAndConsent,
+}
+
+impl ConnectionMethodView {
+    fn as_wire_value(&self) -> &'static str {
+        match self {
+            Self::AccessCode => "ACCESS_CODE",
+            Self::TrustOnly => "TRUST_ONLY",
+            Self::AccessCodeAndConsent => "ACCESS_CODE_AND_CONSENT",
+        }
+    }
+
+    fn from_wire_value(value: impl AsRef<str>) -> Self {
+        match value.as_ref() {
+            "TRUST_ONLY" => Self::TrustOnly,
+            "ACCESS_CODE_AND_CONSENT" => Self::AccessCodeAndConsent,
+            _ => Self::AccessCode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HostSettingsInput {
     pub allow_remote_assistance: bool,
     pub verification_mode: String,
-    pub connection_method: String,
+    pub connection_method: ConnectionMethodView,
     pub notify_on_incoming_request: bool,
     pub auto_accept_trusted_controller: bool,
     pub temporary_verification_code: String,
@@ -483,7 +512,7 @@ pub struct HostSettingsInput {
 pub struct HostSettingsView {
     pub allow_remote_assistance: bool,
     pub verification_mode: String,
-    pub connection_method: String,
+    pub connection_method: ConnectionMethodView,
     pub notify_on_incoming_request: bool,
     pub auto_accept_trusted_controller: bool,
     pub temporary_verification_code: String,
@@ -497,7 +526,7 @@ impl From<HostSettingsSnapshot> for HostSettingsView {
         Self {
             allow_remote_assistance: value.allow_remote_assistance,
             verification_mode: value.verification_mode,
-            connection_method: value.connection_method,
+            connection_method: ConnectionMethodView::from_wire_value(value.connection_method),
             notify_on_incoming_request: value.notify_on_incoming_request,
             auto_accept_trusted_controller: value.auto_accept_trusted_controller,
             temporary_verification_code: value.temporary_verification_code,

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 import { Copy, EllipsisVertical, Laptop, Monitor, RefreshCcw, Smartphone, Tablet } from "lucide-vue-next";
 import type { AcceptableValue } from "reka-ui";
 import { Button } from "@/components/ui/button";
@@ -42,6 +42,11 @@ interface RemoteDirectoryRecord {
 }
 
 const store = useShellStore();
+const verificationOptions = [
+  { value: "TEMPORARY_CODE", label: "临时" },
+  { value: "CUSTOM_CODE", label: "自定义" },
+  { value: "BOTH_CODES", label: "使用两种" },
+] as const;
 
 const directoryLists = reactive<Record<Exclude<DirectoryTab, "discover">, RemoteDirectoryRecord[]>>({
   history: [
@@ -62,11 +67,15 @@ const remoteDeviceId = ref("");
 const connectDialogOpen = ref(false);
 const dialogRemoteDeviceId = ref("");
 const dialogAccessCode = ref("");
+const selectedVerificationMode = ref<VerificationMode>("TEMPORARY_CODE");
 
 const hostIdentity = computed(() => store.snapshot?.hostOverview.identity ?? null);
 const hostSettings = computed(() => store.hostSettings);
 const verificationMode = computed<VerificationMode>(
   () => (hostSettings.value?.verificationMode as VerificationMode) ?? "TEMPORARY_CODE",
+);
+const verificationModeLabel = computed(
+  () => verificationOptions.find((option) => option.value === selectedVerificationMode.value)?.label ?? "临时",
 );
 
 const verificationLabel = computed(() => {
@@ -80,6 +89,14 @@ const verificationLabel = computed(() => {
 });
 
 const formattedLocalDeviceId = computed(() => formatDeviceId(hostIdentity.value?.deviceId ?? ""));
+
+watch(
+  verificationMode,
+  (value) => {
+    selectedVerificationMode.value = value;
+  },
+  { immediate: true },
+);
 
 async function persistHostSettings(patch: Partial<HostSettingsInput>) {
   if (!hostSettings.value) {
@@ -162,6 +179,7 @@ function onAllowRemoteAssistanceChange(checked: boolean) {
 
 function onVerificationModeChange(value: AcceptableValue) {
   if (typeof value !== "string") return;
+  selectedVerificationMode.value = value as VerificationMode;
   void persistHostSettings({ verificationMode: value as VerificationMode });
 }
 
@@ -216,64 +234,62 @@ function onRemoteDeviceIdInput(value: string | number | undefined) {
             </section>
 
             <section class="border-b border-slate-300 px-5 py-4">
-              <div class="grid gap-3 xl:grid-cols-[160px_minmax(0,1fr)] xl:items-center">
+              <div class="grid gap-3 md:grid-cols-[132px_140px_170px_88px_96px] md:items-end md:justify-between">
                 <div class="max-w-[132px]">
                   <div class="text-xs text-slate-500">本设备 ID</div>
                   <div class="mt-2 text-2xl font-semibold tracking-[0.08em]">{{ formattedLocalDeviceId || "--" }}</div>
                 </div>
 
-                <div class="grid gap-3 md:grid-cols-[140px_170px_88px_96px] md:items-center md:justify-end">
-                  <div>
-                    <div class="text-xs text-slate-500">验证码</div>
-                    <div class="mt-2 flex h-9 max-w-[140px] items-center border border-slate-300 px-3 text-sm font-medium tracking-[0.12em]">
-                      {{ verificationLabel }}
-                    </div>
+                <div>
+                  <div class="text-xs text-slate-500">验证码</div>
+                  <div class="mt-2 flex h-9 max-w-[140px] items-center border border-slate-300 px-3 text-sm font-medium tracking-[0.12em]">
+                    {{ verificationLabel }}
                   </div>
+                </div>
 
-                  <div>
-                    <div class="text-xs text-slate-500">验证方式</div>
-                    <Select :model-value="verificationMode" @update:model-value="onVerificationModeChange">
-                      <SelectTrigger class="mt-2 h-9 w-full rounded-none border-slate-300 bg-white">
-                        <SelectValue placeholder="选择验证方式" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="TEMPORARY_CODE">临时</SelectItem>
-                        <SelectItem value="CUSTOM_CODE">自定义</SelectItem>
-                        <SelectItem value="BOTH_CODES">使用两种</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
+                <div>
+                  <div class="text-xs text-slate-500">验证方式</div>
+                  <Select :model-value="selectedVerificationMode" @update:model-value="onVerificationModeChange">
+                    <SelectTrigger class="mt-2 h-9 w-full rounded-none border-slate-300 bg-white">
+                      <SelectValue>{{ verificationModeLabel }}</SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem v-for="option in verificationOptions" :key="option.value" :value="option.value">
+                        {{ option.label }}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
 
-                  <div v-if="verificationMode === 'TEMPORARY_CODE'">
-                    <div class="text-xs text-slate-500">设置</div>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger as-child>
-                        <Button variant="outline" class="mt-2 h-9 w-full rounded-none border-slate-300 bg-white px-0 hover:bg-slate-50">
-                          <EllipsisVertical class="size-4 text-slate-500" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="start" class="w-44 rounded-none border-slate-300 p-0">
-                        <DropdownMenuItem class="rounded-none border-b border-slate-300 px-3 py-2 focus:bg-slate-100" @select="refreshTemporaryCode">
-                          <RefreshCcw class="size-4" />
-                          立即刷新
-                        </DropdownMenuItem>
-                        <DropdownMenuItem class="rounded-none border-b border-slate-300 px-3 py-2 focus:bg-slate-100" @select="onRefreshAfterEndChange(true)">
-                          自动刷新：被控结束后
-                        </DropdownMenuItem>
-                        <DropdownMenuItem class="rounded-none px-3 py-2 focus:bg-slate-100" @select="onRefreshAfterEndChange(false)">
-                          自动刷新：关闭
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                  <div v-else></div>
+                <div v-if="selectedVerificationMode === 'TEMPORARY_CODE'">
+                  <div class="text-xs text-slate-500">设置</div>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger as-child>
+                      <Button variant="outline" class="mt-2 h-9 w-full rounded-none border-slate-300 bg-white px-0 hover:bg-slate-50">
+                        <EllipsisVertical class="size-4 text-slate-500" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="start" class="w-44 rounded-none border-slate-300 p-0">
+                      <DropdownMenuItem class="rounded-none border-b border-slate-300 px-3 py-2 focus:bg-slate-100" @select="refreshTemporaryCode">
+                        <RefreshCcw class="size-4" />
+                        立即刷新
+                      </DropdownMenuItem>
+                      <DropdownMenuItem class="rounded-none border-b border-slate-300 px-3 py-2 focus:bg-slate-100" @select="onRefreshAfterEndChange(true)">
+                        自动刷新：被控结束后
+                      </DropdownMenuItem>
+                      <DropdownMenuItem class="rounded-none px-3 py-2 focus:bg-slate-100" @select="onRefreshAfterEndChange(false)">
+                        自动刷新：关闭
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+                <div v-else></div>
 
-                  <div>
-                    <div class="text-xs text-slate-500">复制</div>
-                    <Button variant="outline" class="mt-2 h-9 w-full rounded-none border-slate-300 px-3" @click="copyLocalDeviceInfo">
-                      <Copy class="size-4" />
-                    </Button>
-                  </div>
+                <div>
+                  <div class="text-xs text-slate-500">复制</div>
+                  <Button variant="outline" class="mt-2 h-9 w-full rounded-none border-slate-300 px-3" @click="copyLocalDeviceInfo">
+                    <Copy class="size-4" />
+                  </Button>
                 </div>
               </div>
 

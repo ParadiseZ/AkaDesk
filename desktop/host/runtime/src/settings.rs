@@ -5,12 +5,44 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ConnectionMethod {
+    AccessCode,
+    TrustOnly,
+    AccessCodeAndConsent,
+}
+
+impl Default for ConnectionMethod {
+    fn default() -> Self {
+        Self::AccessCode
+    }
+}
+
+impl ConnectionMethod {
+    pub fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::AccessCode => "ACCESS_CODE",
+            Self::TrustOnly => "TRUST_ONLY",
+            Self::AccessCodeAndConsent => "ACCESS_CODE_AND_CONSENT",
+        }
+    }
+
+    fn from_wire_value(value: impl AsRef<str>) -> Self {
+        match value.as_ref() {
+            "TRUST_ONLY" => Self::TrustOnly,
+            "ACCESS_CODE_AND_CONSENT" => Self::AccessCodeAndConsent,
+            _ => Self::AccessCode,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostSettings {
     pub allow_remote_assistance: bool,
     pub verification_mode: String,
-    pub connection_method: String,
+    pub connection_method: ConnectionMethod,
     pub notify_on_incoming_request: bool,
     pub auto_accept_trusted_controller: bool,
     pub temporary_verification_code: String,
@@ -24,7 +56,7 @@ impl Default for HostSettings {
         Self {
             allow_remote_assistance: true,
             verification_mode: default_verification_mode(),
-            connection_method: default_connection_method(),
+            connection_method: ConnectionMethod::default(),
             notify_on_incoming_request: true,
             auto_accept_trusted_controller: false,
             temporary_verification_code: generate_temporary_verification_code(),
@@ -40,7 +72,7 @@ impl HostSettings {
         HostSettingsSnapshot {
             allow_remote_assistance: self.allow_remote_assistance,
             verification_mode: self.verification_mode,
-            connection_method: self.connection_method,
+            connection_method: self.connection_method.as_wire_value().to_string(),
             notify_on_incoming_request: self.notify_on_incoming_request,
             auto_accept_trusted_controller: self.auto_accept_trusted_controller,
             temporary_verification_code: self.temporary_verification_code,
@@ -55,7 +87,7 @@ impl HostSettings {
         Self {
             allow_remote_assistance: snapshot.allow_remote_assistance,
             verification_mode: normalize_verification_mode(snapshot.verification_mode),
-            connection_method: normalize_connection_method(snapshot.connection_method),
+            connection_method: ConnectionMethod::from_wire_value(snapshot.connection_method),
             notify_on_incoming_request: snapshot.notify_on_incoming_request,
             auto_accept_trusted_controller: snapshot.auto_accept_trusted_controller,
             temporary_verification_code: normalize_temporary_code(
@@ -119,10 +151,6 @@ fn default_verification_mode() -> String {
     "TEMPORARY_CODE".to_string()
 }
 
-fn default_connection_method() -> String {
-    "ACCESS_CODE".to_string()
-}
-
 fn normalize_verification_mode(value: String) -> String {
     match value.as_str() {
         "TEMP_CODE_ONLY" => "TEMPORARY_CODE".to_string(),
@@ -130,13 +158,6 @@ fn normalize_verification_mode(value: String) -> String {
         "TRUSTED_ONLY" => "CUSTOM_CODE".to_string(),
         "TEMPORARY_CODE" | "CUSTOM_CODE" | "BOTH_CODES" => value,
         _ => default_verification_mode(),
-    }
-}
-
-fn normalize_connection_method(value: String) -> String {
-    match value.as_str() {
-        "ACCESS_CODE" | "TRUST_ONLY" | "ACCESS_CODE_AND_CONSENT" => value,
-        _ => default_connection_method(),
     }
 }
 

@@ -22,10 +22,13 @@ export interface HostIdentityView {
   platform: string;
 }
 
+export type VerificationMode = "TEMPORARY_CODE" | "CUSTOM_CODE" | "BOTH_CODES";
+export type ConnectionMethod = "ACCESS_CODE" | "TRUST_ONLY" | "ACCESS_CODE_AND_CONSENT";
+
 export interface HostSettingsView {
   allowRemoteAssistance: boolean;
-  verificationMode: string;
-  connectionMethod: string;
+  verificationMode: VerificationMode;
+  connectionMethod: ConnectionMethod;
   notifyOnIncomingRequest: boolean;
   autoAcceptTrustedController: boolean;
   temporaryVerificationCode: string;
@@ -90,8 +93,8 @@ export interface ShellSnapshot {
 
 export interface HostSettingsInput {
   allowRemoteAssistance: boolean;
-  verificationMode: string;
-  connectionMethod: string;
+  verificationMode: VerificationMode;
+  connectionMethod: ConnectionMethod;
   notifyOnIncomingRequest: boolean;
   autoAcceptTrustedController: boolean;
   temporaryVerificationCode: string;

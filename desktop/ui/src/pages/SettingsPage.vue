@@ -26,6 +26,11 @@ import { useShellStore } from "@/stores/shell";
 type ConnectionMethod = "ACCESS_CODE" | "TRUST_ONLY" | "ACCESS_CODE_AND_CONSENT";
 
 const store = useShellStore();
+const connectionMethodOptions = [
+  { value: "ACCESS_CODE", label: "验证码" },
+  { value: "TRUST_ONLY", label: "免密" },
+  { value: "ACCESS_CODE_AND_CONSENT", label: "双重验证" },
+] as const;
 
 const shellForm = reactive({
   launchOnStartup: false,
@@ -39,6 +44,10 @@ const shellForm = reactive({
 const hostSettings = computed(() => store.hostSettings);
 const securityMethod = computed<ConnectionMethod>(
   () => (hostSettings.value?.connectionMethod as ConnectionMethod) ?? "ACCESS_CODE",
+);
+const selectedSecurityMethod = ref<ConnectionMethod>("ACCESS_CODE");
+const securityMethodLabel = computed(
+  () => connectionMethodOptions.find((option) => option.value === selectedSecurityMethod.value)?.label ?? "验证码",
 );
 const routeOptions = computed(() =>
   routerAndIcon.map((item) => ({
@@ -63,6 +72,7 @@ watch(
   hostSettings,
   (value) => {
     if (!value) return;
+    selectedSecurityMethod.value = (value.connectionMethod as ConnectionMethod) ?? "ACCESS_CODE";
     customCodeDraft.value = value.customVerificationCode;
   },
   { immediate: true },
@@ -114,6 +124,7 @@ function onRouteChange(value: AcceptableValue) {
 
 function onConnectionMethodChange(value: AcceptableValue) {
   if (typeof value !== "string") return;
+  selectedSecurityMethod.value = value as ConnectionMethod;
   void persistHostSettings({ connectionMethod: value as ConnectionMethod });
 }
 
@@ -205,25 +216,25 @@ async function saveCustomCode() {
           <div class="border border-slate-300 bg-white">
             <div class="border-b border-slate-300 px-5 py-4">
               <h3 class="text-base font-medium">远程协助连接本设备的方式</h3>
-              <p class="mt-1 text-sm text-slate-500">{{ securityDescription(securityMethod) }}</p>
+              <p class="mt-1 text-sm text-slate-500">{{ securityDescription(selectedSecurityMethod) }}</p>
             </div>
             <div class="grid gap-4 px-5 py-4">
               <div class="max-w-[220px]">
                 <div class="text-xs text-slate-500">连接方式</div>
-                <Select :model-value="securityMethod" @update:model-value="onConnectionMethodChange">
+                <Select :model-value="selectedSecurityMethod" @update:model-value="onConnectionMethodChange">
                   <SelectTrigger class="mt-2 h-9 w-full rounded-none border-slate-300 bg-white">
-                    <SelectValue placeholder="选择连接方式" />
+                    <SelectValue>{{ securityMethodLabel }}</SelectValue>
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="ACCESS_CODE">验证码</SelectItem>
-                    <SelectItem value="TRUST_ONLY">免密</SelectItem>
-                    <SelectItem value="ACCESS_CODE_AND_CONSENT">双重验证</SelectItem>
+                    <SelectItem v-for="option in connectionMethodOptions" :key="option.value" :value="option.value">
+                      {{ option.label }}
+                    </SelectItem>
                   </SelectContent>
                 </Select>
               </div>
 
               <div
-                v-if="securityMethod === 'ACCESS_CODE' || securityMethod === 'ACCESS_CODE_AND_CONSENT'"
+                v-if="selectedSecurityMethod === 'ACCESS_CODE' || selectedSecurityMethod === 'ACCESS_CODE_AND_CONSENT'"
                 class="border border-slate-300"
               >
                 <div class="flex items-center justify-between px-4 py-3">
