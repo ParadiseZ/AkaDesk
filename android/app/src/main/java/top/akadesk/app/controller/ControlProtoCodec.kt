@@ -76,22 +76,22 @@ object ControlProtoCodec {
         requestId: String,
         controllerDeviceId: String,
         controlledDeviceId: String,
+        requestedCodec: VideoCodec?,
     ): ControlEnvelope {
+        val videoPreference = VideoPreference.newBuilder()
+            .setWidth(1280)
+            .setHeight(720)
+            .setFps(30)
+            .setBitrateKbps(4000)
+            .setAllowSameCodecSoftwareFallback(true)
+        requestedCodec?.let(videoPreference::setCodec)
         val payload = StartSessionRequest.newBuilder()
             .setIntent(
                 SessionIntent.newBuilder()
                     .setControllerDeviceId(controllerDeviceId)
                     .setControlledDeviceId(controlledDeviceId)
                     .setEnableInput(true)
-                    .setVideo(
-                        VideoPreference.newBuilder()
-                            .setCodec(VideoCodec.VIDEO_CODEC_H264)
-                            .setWidth(1280)
-                            .setHeight(720)
-                            .setFps(30)
-                            .setBitrateKbps(4000)
-                            .setAllowSameCodecSoftwareFallback(true)
-                    )
+                    .setVideo(videoPreference)
             )
             .build()
         return buildEnvelope(requestId, ControlMessageKind.CONTROL_MESSAGE_KIND_REQUEST, "StartSessionRequest", payload)

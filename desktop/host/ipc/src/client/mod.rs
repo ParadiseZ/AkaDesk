@@ -1,9 +1,15 @@
 use crate::codec::{read_envelope, write_envelope};
 use crate::types::{
-    CapabilitySnapshotChanged, CapabilitySnapshotResponse, GetCapabilitySnapshotRequest,
-    GetRuntimeStatusRequest, IpcEnvelope, IpcMessageKind, RuntimeStatusChanged,
-    RuntimeStatusResponse, CAPABILITY_SNAPSHOT_CHANGED, CAPABILITY_SNAPSHOT_RESPONSE,
-    GET_CAPABILITY_SNAPSHOT, GET_RUNTIME_STATUS, RUNTIME_STATUS_CHANGED, RUNTIME_STATUS_RESPONSE,
+    CapabilitySnapshotChanged, CapabilitySnapshotResponse, DiagnosticsResponse,
+    GetCapabilitySnapshotRequest, GetDiagnosticsRequest, GetHostOverviewRequest,
+    GetRuntimeStatusRequest, HostOverviewResponse, IpcEnvelope, IpcMessageKind,
+    RefreshTemporaryVerificationCodeRequest, RefreshTemporaryVerificationCodeResponse,
+    RuntimeStatusChanged, RuntimeStatusResponse, UpdateHostSettingsRequest,
+    UpdateHostSettingsResponse, CAPABILITY_SNAPSHOT_CHANGED, CAPABILITY_SNAPSHOT_RESPONSE,
+    DIAGNOSTICS_RESPONSE, GET_CAPABILITY_SNAPSHOT, GET_DIAGNOSTICS, GET_HOST_OVERVIEW,
+    GET_RUNTIME_STATUS, HOST_OVERVIEW_RESPONSE, REFRESH_TEMPORARY_VERIFICATION_CODE,
+    REFRESH_TEMPORARY_VERIFICATION_CODE_RESPONSE, RUNTIME_STATUS_CHANGED,
+    RUNTIME_STATUS_RESPONSE, UPDATE_HOST_SETTINGS, UPDATE_HOST_SETTINGS_RESPONSE,
 };
 use interprocess::local_socket::{prelude::*, GenericFilePath, GenericNamespaced, Stream};
 use prost::Message;
@@ -92,6 +98,39 @@ impl IpcClient {
             GET_CAPABILITY_SNAPSHOT,
             CAPABILITY_SNAPSHOT_RESPONSE,
             GetCapabilitySnapshotRequest {},
+        )
+    }
+
+    pub fn get_host_overview(&mut self) -> io::Result<HostOverviewResponse> {
+        self.request_response(
+            GET_HOST_OVERVIEW,
+            HOST_OVERVIEW_RESPONSE,
+            GetHostOverviewRequest {},
+        )
+    }
+
+    pub fn update_host_settings(
+        &mut self,
+        request: UpdateHostSettingsRequest,
+    ) -> io::Result<UpdateHostSettingsResponse> {
+        self.request_response(UPDATE_HOST_SETTINGS, UPDATE_HOST_SETTINGS_RESPONSE, request)
+    }
+
+    pub fn refresh_temporary_verification_code(
+        &mut self,
+    ) -> io::Result<RefreshTemporaryVerificationCodeResponse> {
+        self.request_response(
+            REFRESH_TEMPORARY_VERIFICATION_CODE,
+            REFRESH_TEMPORARY_VERIFICATION_CODE_RESPONSE,
+            RefreshTemporaryVerificationCodeRequest {},
+        )
+    }
+
+    pub fn get_diagnostics(&mut self) -> io::Result<DiagnosticsResponse> {
+        self.request_response(
+            GET_DIAGNOSTICS,
+            DIAGNOSTICS_RESPONSE,
+            GetDiagnosticsRequest {},
         )
     }
 

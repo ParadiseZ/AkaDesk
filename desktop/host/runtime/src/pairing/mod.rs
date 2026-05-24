@@ -116,6 +116,10 @@ impl PairingStore {
         self.file.records.contains_key(controller_device_id)
     }
 
+    pub fn count(&self) -> usize {
+        self.file.records.len()
+    }
+
     fn persist(&self) -> io::Result<()> {
         write_json(&self.path, &self.file)
     }

@@ -105,9 +105,143 @@ pub struct CapabilitySnapshotChanged {
     pub snapshot: Option<CapabilitySnapshot>,
 }
 
+#[derive(Clone, PartialEq, Message)]
+pub struct HostIdentitySnapshot {
+    #[prost(string, tag = "1")]
+    pub device_id: String,
+    #[prost(string, tag = "2")]
+    pub display_name: String,
+    #[prost(string, tag = "3")]
+    pub hostname: String,
+    #[prost(string, tag = "4")]
+    pub app_version: String,
+    #[prost(string, tag = "5")]
+    pub platform: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HostSettingsSnapshot {
+    #[prost(bool, tag = "1")]
+    pub allow_remote_assistance: bool,
+    #[prost(string, tag = "2")]
+    pub verification_mode: String,
+    #[prost(string, tag = "3")]
+    pub connection_method: String,
+    #[prost(bool, tag = "4")]
+    pub notify_on_incoming_request: bool,
+    #[prost(bool, tag = "5")]
+    pub auto_accept_trusted_controller: bool,
+    #[prost(int64, tag = "6")]
+    pub updated_at_ms: TimestampMs,
+    #[prost(string, tag = "7")]
+    pub temporary_verification_code: String,
+    #[prost(string, tag = "8")]
+    pub custom_verification_code: String,
+    #[prost(bool, tag = "9")]
+    pub refresh_temporary_code_after_controlled_end: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HostOverviewSnapshot {
+    #[prost(message, optional, tag = "1")]
+    pub identity: Option<HostIdentitySnapshot>,
+    #[prost(message, optional, tag = "2")]
+    pub settings: Option<HostSettingsSnapshot>,
+    #[prost(uint32, tag = "3")]
+    pub paired_controller_count: u32,
+    #[prost(uint32, tag = "4")]
+    pub control_port: u32,
+    #[prost(string, optional, tag = "5")]
+    pub active_controller_display_name: Option<String>,
+    #[prost(int64, tag = "6")]
+    pub updated_at_ms: TimestampMs,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DiagnosticEntry {
+    #[prost(string, tag = "1")]
+    pub level: String,
+    #[prost(string, tag = "2")]
+    pub code: String,
+    #[prost(string, tag = "3")]
+    pub message: String,
+    #[prost(int64, tag = "4")]
+    pub created_at_ms: TimestampMs,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetHostOverviewRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HostOverviewResponse {
+    #[prost(message, optional, tag = "1")]
+    pub overview: Option<HostOverviewSnapshot>,
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<ErrorInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HostOverviewChanged {
+    #[prost(message, optional, tag = "1")]
+    pub overview: Option<HostOverviewSnapshot>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct UpdateHostSettingsRequest {
+    #[prost(message, optional, tag = "1")]
+    pub settings: Option<HostSettingsSnapshot>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct UpdateHostSettingsResponse {
+    #[prost(message, optional, tag = "1")]
+    pub overview: Option<HostOverviewSnapshot>,
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<ErrorInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RefreshTemporaryVerificationCodeRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RefreshTemporaryVerificationCodeResponse {
+    #[prost(message, optional, tag = "1")]
+    pub overview: Option<HostOverviewSnapshot>,
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<ErrorInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetDiagnosticsRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DiagnosticsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub entries: Vec<DiagnosticEntry>,
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<ErrorInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DiagnosticsChanged {
+    #[prost(message, repeated, tag = "1")]
+    pub entries: Vec<DiagnosticEntry>,
+}
+
 pub const GET_RUNTIME_STATUS: &str = "GetRuntimeStatus";
 pub const RUNTIME_STATUS_RESPONSE: &str = "RuntimeStatusResponse";
 pub const RUNTIME_STATUS_CHANGED: &str = "RuntimeStatusChanged";
 pub const GET_CAPABILITY_SNAPSHOT: &str = "GetCapabilitySnapshot";
 pub const CAPABILITY_SNAPSHOT_RESPONSE: &str = "CapabilitySnapshotResponse";
 pub const CAPABILITY_SNAPSHOT_CHANGED: &str = "CapabilitySnapshotChanged";
+pub const GET_HOST_OVERVIEW: &str = "GetHostOverview";
+pub const HOST_OVERVIEW_RESPONSE: &str = "HostOverviewResponse";
+pub const HOST_OVERVIEW_CHANGED: &str = "HostOverviewChanged";
+pub const UPDATE_HOST_SETTINGS: &str = "UpdateHostSettings";
+pub const UPDATE_HOST_SETTINGS_RESPONSE: &str = "UpdateHostSettingsResponse";
+pub const REFRESH_TEMPORARY_VERIFICATION_CODE: &str = "RefreshTemporaryVerificationCode";
+pub const REFRESH_TEMPORARY_VERIFICATION_CODE_RESPONSE: &str =
+    "RefreshTemporaryVerificationCodeResponse";
+pub const GET_DIAGNOSTICS: &str = "GetDiagnostics";
+pub const DIAGNOSTICS_RESPONSE: &str = "DiagnosticsResponse";
+pub const DIAGNOSTICS_CHANGED: &str = "DiagnosticsChanged";

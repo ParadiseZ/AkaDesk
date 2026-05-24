@@ -1,6 +1,7 @@
 package top.akadesk.app.controller
 
 import akadesk.v1.ControlEnvelope
+import akadesk.v1.VideoCodec
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -22,7 +23,7 @@ class HostControlSession(
         fun onPairingSucceeded(host: ControlledHostSummary, pairToken: String)
         fun onDeviceSnapshotLoaded(host: ControlledHostSummary)
         fun onSessionAccepted(host: ControlledHostSummary, sessionId: String)
-        fun onSessionChanged(host: ControlledHostSummary, sessionId: String, summary: String)
+        fun onSessionChanged(host: ControlledHostSummary, sessionId: String, stateLabel: String, summary: String)
         fun onFailure(host: ControlledHostSummary, message: String)
     }
 
@@ -83,11 +84,11 @@ class HostControlSession(
         client.dispatcher.executorService.shutdown()
     }
 
-    fun requestH264Preview() {
+    fun requestRemoteSession(requestedCodec: VideoCodec?) {
         socket?.send(
             ByteString.of(
                 *ControlProtoCodec
-                    .buildStartSessionRequest(nextRequestId(), controllerDeviceId, host.deviceId)
+                    .buildStartSessionRequest(nextRequestId(), controllerDeviceId, host.deviceId, requestedCodec)
                     .toByteArray()
             )
         )
@@ -150,9 +151,10 @@ class HostControlSession(
                     return
                 }
                 val snapshot = changed.snapshot
+                val stateLabel = snapshot.state.name.removePrefix("SESSION_STATE_")
                 val summary = buildString {
                     append("state=")
-                    append(snapshot.state.name.removePrefix("SESSION_STATE_"))
+                    append(stateLabel)
                     if (snapshot.hasVideo()) {
                         val video = snapshot.video
                         append(" • codec=")
@@ -173,7 +175,7 @@ class HostControlSession(
                         append(video.controllerDecoder.name.removePrefix("CODEC_IMPLEMENTATION_"))
                     }
                 }
-                listener.onSessionChanged(host, snapshot.sessionId, summary)
+                listener.onSessionChanged(host, snapshot.sessionId, stateLabel, summary)
             }
         }
     }

@@ -1,15 +1,21 @@
 use host_ipc::client::IpcClient;
-use host_ipc::types::{CapabilitySnapshotResponse, RuntimeStatusResponse};
+use host_ipc::types::{
+    CapabilitySnapshotResponse, DiagnosticsResponse, HostOverviewResponse,
+    HostSettingsSnapshot, RefreshTemporaryVerificationCodeResponse, RuntimeStatusResponse,
+    UpdateHostSettingsRequest, UpdateHostSettingsResponse,
+};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-#[derive(Debug, Default)]
-pub struct HostBootstrapResult {
-    pub runtime_status: Option<RuntimeStatusResponse>,
-    pub capability_snapshot: Option<CapabilitySnapshotResponse>,
+#[derive(Debug)]
+pub struct HostSnapshotBundle {
+    pub runtime_status: RuntimeStatusResponse,
+    pub capability_snapshot: CapabilitySnapshotResponse,
+    pub host_overview: HostOverviewResponse,
+    pub diagnostics: DiagnosticsResponse,
 }
 
 #[derive(Debug, Default)]
@@ -20,8 +26,13 @@ pub struct HostSupervisor {
 }
 
 impl HostSupervisor {
-    pub fn start(&mut self) -> io::Result<HostBootstrapResult> {
-        self.ipc_name = format!("akadesk.m2.{}", std::process::id());
+    pub fn ensure_started(&mut self) -> io::Result<()> {
+        if self.is_running()? {
+            self.ready = true;
+            return Ok(());
+        }
+
+        self.ipc_name = format!("akadesk.desktop.{}", std::process::id());
         let host_runtime_bin = resolve_host_runtime_bin()?;
         let ffmpeg_bin_dir = resolve_local_ffmpeg_bin_dir()?;
 
@@ -34,20 +45,41 @@ impl HostSupervisor {
             .stderr(Stdio::inherit());
         prepend_path_env(&mut command, &ffmpeg_bin_dir);
 
-        let child = command.spawn()?;
-        self.child = Some(child);
-
-        let mut client = IpcClient::connect_with_retry(&self.ipc_name, Duration::from_secs(5))?;
-        let _ = client.recv_runtime_status_changed()?;
-        let _ = client.recv_capability_snapshot_changed()?;
-        let runtime_status = client.get_runtime_status()?;
-        let capability_snapshot = client.get_capability_snapshot()?;
+        self.child = Some(command.spawn()?);
+        let mut client = self.connect_client(Duration::from_secs(5))?;
+        let _ = client.get_runtime_status()?;
         self.ready = true;
+        Ok(())
+    }
 
-        Ok(HostBootstrapResult {
-            runtime_status: Some(runtime_status),
-            capability_snapshot: Some(capability_snapshot),
+    pub fn fetch_snapshot(&mut self) -> io::Result<HostSnapshotBundle> {
+        self.ensure_started()?;
+        let mut client = self.connect_client(Duration::from_secs(2))?;
+        Ok(HostSnapshotBundle {
+            runtime_status: client.get_runtime_status()?,
+            capability_snapshot: client.get_capability_snapshot()?,
+            host_overview: client.get_host_overview()?,
+            diagnostics: client.get_diagnostics()?,
         })
+    }
+
+    pub fn update_host_settings(
+        &mut self,
+        settings: HostSettingsSnapshot,
+    ) -> io::Result<UpdateHostSettingsResponse> {
+        self.ensure_started()?;
+        let mut client = self.connect_client(Duration::from_secs(2))?;
+        client.update_host_settings(UpdateHostSettingsRequest {
+            settings: Some(settings),
+        })
+    }
+
+    pub fn refresh_temporary_verification_code(
+        &mut self,
+    ) -> io::Result<RefreshTemporaryVerificationCodeResponse> {
+        self.ensure_started()?;
+        let mut client = self.connect_client(Duration::from_secs(2))?;
+        client.refresh_temporary_verification_code()
     }
 
     pub fn stop(&mut self) {
@@ -56,6 +88,24 @@ impl HostSupervisor {
             let _ = child.wait();
         }
         self.ready = false;
+    }
+
+    fn connect_client(&self, timeout: Duration) -> io::Result<IpcClient> {
+        IpcClient::connect_with_retry(&self.ipc_name, timeout)
+    }
+
+    fn is_running(&mut self) -> io::Result<bool> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(false);
+        };
+        match child.try_wait()? {
+            None => Ok(true),
+            Some(_) => {
+                self.child = None;
+                self.ready = false;
+                Ok(false)
+            }
+        }
     }
 }
 

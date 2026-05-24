@@ -315,6 +315,10 @@ fn handle_envelope(
                     )
                 }
             };
+            eprintln!(
+                "prepared H.264 session encoder={} packet_len={} keyframe={}",
+                prepared.encoder_name, prepared.smoke_packet_len, prepared.smoke_keyframe
+            );
 
             let snapshot = state
                 .sessions

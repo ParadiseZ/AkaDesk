@@ -4,8 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.akadesk.desktop_shell",
   "build": {
-    "beforeDevCommand": "",
-    "beforeBuildCommand": "",
+    "beforeDevCommand": "pnpm --dir ../ui dev --host 127.0.0.1 --port 1420",
+    "beforeBuildCommand": "pnpm --dir ../ui build",
+    "devUrl": "http://localhost:1420",
     "frontendDist": "../ui/dist"
   },
   "app": {

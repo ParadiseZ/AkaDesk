@@ -23,6 +23,8 @@ pub struct VideoRuntimeSupport {
 pub struct PreparedVideoSession {
     pub spec: VideoSessionSpec,
     pub encoder_name: String,
+    pub smoke_packet_len: usize,
+    pub smoke_keyframe: bool,
 }
 
 const DEFAULT_H264_WIDTH: u32 = 1280;
@@ -69,8 +71,8 @@ pub fn prepare_h264_session(intent: &SessionIntent) -> Result<PreparedVideoSessi
         bitrate_kbps: non_zero_or(video.bitrate_kbps, DEFAULT_H264_BITRATE_KBPS),
         allow_software_fallback: allow_software_fallback(&video),
     };
-    let prepared = host_windows::ffmpeg::prepare_h264_encoder(&request)?;
-    let host_encoder = match prepared.implementation {
+    let encoded = host_windows::ffmpeg::encode_h264_test_pattern(&request)?;
+    let host_encoder = match encoded.prepared.implementation {
         host_windows::ffmpeg::PreparedEncoderImplementation::Hardware => {
             CodecImplementation::Hardware as i32
         }
@@ -89,7 +91,9 @@ pub fn prepare_h264_session(intent: &SessionIntent) -> Result<PreparedVideoSessi
             host_encoder,
             controller_decoder: CodecImplementation::Software as i32,
         },
-        encoder_name: prepared.encoder_name,
+        encoder_name: encoded.prepared.encoder_name,
+        smoke_packet_len: encoded.packet_len,
+        smoke_keyframe: encoded.is_keyframe,
     })
 }
 

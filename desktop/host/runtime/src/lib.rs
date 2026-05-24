@@ -7,5 +7,6 @@ pub mod orchestration;
 pub mod pairing;
 pub mod service;
 pub mod session;
+pub mod settings;
 pub mod state;
 pub mod video;

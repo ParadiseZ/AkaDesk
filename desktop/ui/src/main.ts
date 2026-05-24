@@ -1,7 +1,7 @@
-import { appShellName } from "./app/AppShell";
+import { createApp } from "vue";
+import { createPinia } from "pinia";
+import AppShell from "@/app/AppShell.vue";
+import { router } from "./app/router";
+import "./styles/globals.css";
 
-export function bootstrap(): string {
-  return `${appShellName} ready for M2`;
-}
-
-console.log(bootstrap());
+createApp(AppShell).use(createPinia()).use(router).mount("#app");
