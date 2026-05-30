@@ -7,6 +7,7 @@ edition = "2021"
 host-contracts = { path = "../contracts" }
 
 [target.'cfg(windows)'.dependencies]
+base64 = "0.22"
 ffmpeg-sys-next = { version = "8.0.1", default-features = false, features = ["avcodec", "swscale"] }
 
 [lib]

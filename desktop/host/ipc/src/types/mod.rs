@@ -155,6 +155,44 @@ pub struct HostOverviewSnapshot {
     pub active_controller_display_name: Option<String>,
     #[prost(int64, tag = "6")]
     pub updated_at_ms: TimestampMs,
+    #[prost(message, optional, tag = "7")]
+    pub pending_remote_request: Option<PendingRemoteRequestSnapshot>,
+    #[prost(message, optional, tag = "8")]
+    pub video_stream: Option<VideoStreamSnapshot>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PendingRemoteRequestSnapshot {
+    #[prost(string, tag = "1")]
+    pub request_id: String,
+    #[prost(string, tag = "2")]
+    pub controller_device_id: String,
+    #[prost(string, tag = "3")]
+    pub controller_display_name: String,
+    #[prost(string, tag = "4")]
+    pub connection_method: String,
+    #[prost(int64, tag = "5")]
+    pub requested_at_ms: TimestampMs,
+    #[prost(int64, tag = "6")]
+    pub expires_at_ms: TimestampMs,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct VideoStreamSnapshot {
+    #[prost(string, tag = "1")]
+    pub session_id: String,
+    #[prost(uint64, tag = "2")]
+    pub packet_count: u64,
+    #[prost(uint64, tag = "3")]
+    pub keyframe_count: u64,
+    #[prost(uint64, tag = "4")]
+    pub latest_packet_len: u64,
+    #[prost(string, tag = "5")]
+    pub latest_frame_source_label: String,
+    #[prost(string, tag = "6")]
+    pub latest_error: String,
+    #[prost(int64, tag = "7")]
+    pub updated_at_ms: TimestampMs,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -212,6 +250,20 @@ pub struct RefreshTemporaryVerificationCodeResponse {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct RespondPendingRemoteRequestRequest {
+    #[prost(bool, tag = "1")]
+    pub allow: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RespondPendingRemoteRequestResponse {
+    #[prost(message, optional, tag = "1")]
+    pub overview: Option<HostOverviewSnapshot>,
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<ErrorInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct GetDiagnosticsRequest {}
 
 #[derive(Clone, PartialEq, Message)]
@@ -242,6 +294,8 @@ pub const UPDATE_HOST_SETTINGS_RESPONSE: &str = "UpdateHostSettingsResponse";
 pub const REFRESH_TEMPORARY_VERIFICATION_CODE: &str = "RefreshTemporaryVerificationCode";
 pub const REFRESH_TEMPORARY_VERIFICATION_CODE_RESPONSE: &str =
     "RefreshTemporaryVerificationCodeResponse";
+pub const RESPOND_PENDING_REMOTE_REQUEST: &str = "RespondPendingRemoteRequest";
+pub const RESPOND_PENDING_REMOTE_REQUEST_RESPONSE: &str = "RespondPendingRemoteRequestResponse";
 pub const GET_DIAGNOSTICS: &str = "GetDiagnostics";
 pub const DIAGNOSTICS_RESPONSE: &str = "DiagnosticsResponse";
 pub const DIAGNOSTICS_CHANGED: &str = "DiagnosticsChanged";

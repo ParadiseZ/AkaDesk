@@ -121,6 +121,27 @@ message SessionChangedEvent {
   SessionSnapshot snapshot = 1;
 }
 
+message HostVideoStreamEvent {
+  string session_id = 1;
+  uint64 packet_count = 2;
+  uint64 keyframe_count = 3;
+  uint64 latest_packet_len = 4;
+  string latest_frame_source_label = 5;
+  string latest_error = 6;
+  int64 updated_at_ms = 7;
+}
+
+message HostTransportStatusEvent {
+  string session_id = 1;
+  string peer_connection_state = 2;
+  bool remote_answer_applied = 3;
+  uint32 applied_remote_candidate_count = 4;
+  uint64 sent_sample_count = 5;
+  uint64 latest_sent_packet_len = 6;
+  string latest_error = 7;
+  int64 updated_at_ms = 8;
+}
+
 message MediaPreferenceOffer {
   VideoPreference video = 1;
   AudioPreference audio = 2;

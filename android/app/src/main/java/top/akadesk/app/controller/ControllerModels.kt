@@ -39,6 +39,18 @@ data class ControllerDisconnectNotice(
     val detail: String,
 )
 
+data class RemoteVideoPathDiagnosis(
+    val title: String,
+    val detail: String,
+    val level: RemoteVideoDiagnosisLevel,
+)
+
+enum class RemoteVideoDiagnosisLevel {
+    Info,
+    Warning,
+    Critical,
+}
+
 enum class HostAuthState {
     Unknown,
     PairingRequired,
@@ -61,7 +73,7 @@ enum class ControllerConnectMode(
     ),
     AwaitRemoteApproval(
         title = "等待对方允许",
-        description = "预留模式。后续可扩展为被控端明确允许后再进入远控。",
+        description = "发起远控请求并等待被控端桌面本地明确允许。",
     ),
 }
 

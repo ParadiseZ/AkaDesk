@@ -1,8 +1,9 @@
 use host_ipc::client::IpcClient;
 use host_ipc::types::{
     CapabilitySnapshotResponse, DiagnosticsResponse, HostOverviewResponse,
-    HostSettingsSnapshot, RefreshTemporaryVerificationCodeResponse, RuntimeStatusResponse,
-    UpdateHostSettingsRequest, UpdateHostSettingsResponse,
+    HostSettingsSnapshot, RefreshTemporaryVerificationCodeResponse,
+    RespondPendingRemoteRequestResponse, RuntimeStatusResponse, UpdateHostSettingsRequest,
+    UpdateHostSettingsResponse,
 };
 use std::ffi::OsString;
 use std::io;
@@ -80,6 +81,15 @@ impl HostSupervisor {
         self.ensure_started()?;
         let mut client = self.connect_client(Duration::from_secs(2))?;
         client.refresh_temporary_verification_code()
+    }
+
+    pub fn respond_pending_remote_request(
+        &mut self,
+        allow: bool,
+    ) -> io::Result<RespondPendingRemoteRequestResponse> {
+        self.ensure_started()?;
+        let mut client = self.connect_client(Duration::from_secs(2))?;
+        client.respond_pending_remote_request(allow)
     }
 
     pub fn stop(&mut self) {

@@ -1,6 +1,9 @@
+import com.google.protobuf.gradle.proto
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.google.protobuf)
 }
 
 android {
@@ -41,7 +44,30 @@ android {
 
     sourceSets {
         getByName("main") {
-            java.setSrcDirs(listOf("src/main/java", "src/main/java_generated"))
+            java.directories.addAll(
+                listOf("src/main/java")
+            )
+            java.directories.addAll(
+                listOf("src/main/java_generated")
+            )
+            proto {
+                srcDir("../../proto")
+            }
+        }
+    }
+}
+
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:${libs.versions.protobufLite.get()}"
+    }
+    generateProtoTasks {
+        all().configureEach {
+            builtins {
+                create("java") {
+                    option("lite")
+                }
+            }
         }
     }
 }
@@ -60,6 +86,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.okhttp)
     implementation(libs.protobuf.javalite)
+    implementation(libs.google.webrtc)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)

@@ -50,3 +50,20 @@ message SessionClosedEvent {
   ErrorInfo error = 3;
   int64 closed_at_ms = 4;
 }
+
+message WebRtcOffer {
+  string session_id = 1;
+  string sdp = 2;
+}
+
+message WebRtcAnswer {
+  string session_id = 1;
+  string sdp = 2;
+}
+
+message IceCandidate {
+  string session_id = 1;
+  string candidate = 2;
+  string sdp_mid = 3;
+  uint32 sdp_mline_index = 4;
+}

@@ -61,11 +61,13 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -82,13 +84,17 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.webrtc.SurfaceViewRenderer
 import top.akadesk.app.controller.ActiveRemoteSession
 import top.akadesk.app.controller.ControlledHostSummary
 import top.akadesk.app.controller.ControllerCoordinator
 import top.akadesk.app.controller.ControllerPairRecord
 import top.akadesk.app.controller.ControllerVideoCodecPreset
+import top.akadesk.app.controller.RemoteVideoDiagnosisLevel
+import top.akadesk.app.controller.RemoteVideoPathDiagnosis
 
 private enum class RootTab { Connect, Mine }
 private enum class ConnectListTab(val title: String) { Found("发现"), History("历史"), Favorite("收藏"), Paired("已配对") }
@@ -110,6 +116,7 @@ fun ControllerHomeApp(
     ) {
         when {
             coordinator.activeSession != null -> RemoteStreamScreen(
+                coordinator = coordinator,
                 session = coordinator.activeSession!!,
                 onDisconnect = coordinator::endRemoteSession,
             )
@@ -166,7 +173,7 @@ fun ControllerHomeApp(
                 onDismiss = coordinator::dismissSheets,
                 onTrustedConnect = { coordinator.connectRememberedHost(host) },
                 onVerification = { coordinator.openVerificationSheet(host) },
-                onAwaitApproval = { coordinator.openWaitingApprovalSheet(host) },
+                onAwaitApproval = { coordinator.connectAwaitRemoteApproval(host) },
             )
         }
 
@@ -701,10 +708,18 @@ private fun WaitingApprovalSheet(
 
 @Composable
 private fun RemoteStreamScreen(
+    coordinator: ControllerCoordinator,
     session: ActiveRemoteSession,
     onDisconnect: () -> Unit,
 ) {
     val now = rememberTickerMillis()
+    val videoReady = coordinator.hasActiveRemoteVideoTrack(session.sessionId)
+    val videoStalled = coordinator.isActiveRemoteVideoStalled(session.sessionId)
+    val remoteVideoDiagnosis = coordinator.activeRemoteVideoDiagnosis(session.sessionId)
+    val hostVideoStatus = coordinator.activeHostVideoStatus(session.sessionId)
+    val hostVideoStalled = coordinator.isActiveHostVideoStalled(session.sessionId)
+    val hostTransportStatus = coordinator.activeHostTransportStatus(session.sessionId)
+    val hostTransportStalled = coordinator.isActiveHostTransportStalled(session.sessionId)
     Row(
         modifier = Modifier
             .fillMaxSize()
@@ -717,35 +732,161 @@ private fun RemoteStreamScreen(
                 .fillMaxHeight()
                 .padding(14.dp)
                 .clip(RoundedCornerShape(20.dp))
-                .background(
-                    Brush.linearGradient(
-                        listOf(Color(0xFF7FB0FF), Color(0xFF2D58CF), Color(0xFF0A1020)),
-                    ),
-                ),
+                .background(Color.Black),
         ) {
+            key(session.sessionId ?: session.host.deviceId) {
+                var renderer by remember { mutableStateOf<SurfaceViewRenderer?>(null) }
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { context ->
+                        SurfaceViewRenderer(context).also { created ->
+                            renderer = created
+                            coordinator.bindActiveVideoRenderer(created)
+                        }
+                    },
+                    update = { bound ->
+                        renderer = bound
+                        coordinator.bindActiveVideoRenderer(bound)
+                    },
+                )
+                DisposableEffect(renderer) {
+                    onDispose {
+                        renderer?.let(coordinator::releaseActiveVideoRenderer)
+                    }
+                }
+            }
+            if (!videoReady) {
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .background(
+                            Brush.linearGradient(
+                                listOf(Color(0xFF7FB0FF), Color(0xFF2D58CF), Color(0xFF0A1020)),
+                            ),
+                        ),
+                )
+            }
             Column(
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 Text(session.host.displayName.ifBlank { "Windows" }, color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Text(formatDuration(now - session.startedAtMs), color = Color(0xFFD7E3FF))
-            }
-            Column(
-                modifier = Modifier.align(Alignment.Center),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                if (session.stateLabel != "STREAMING") {
-                    CircularProgressIndicator(color = Color.White, strokeWidth = 4.dp)
+                remoteVideoDiagnosis?.let { diagnosis ->
+                    RemoteVideoDiagnosisCard(diagnosis = diagnosis)
                 }
-                Text(
-                    if (session.stateLabel == "STREAMING") "显示桌面" else "启动画面传输",
-                    color = Color.White,
-                    style = MaterialTheme.typography.headlineSmall,
-                    fontWeight = FontWeight.Bold,
-                )
+            }
+            if (!videoReady) {
+                Column(
+                    modifier = Modifier.align(Alignment.Center),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    CircularProgressIndicator(color = Color.White, strokeWidth = 4.dp)
+                    Text(
+                        if (session.stateLabel == "STREAMING") "等待远端首帧" else "启动画面传输",
+                        color = Color.White,
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        session.summary,
+                        color = Color(0xFFD7E3FF),
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 24.dp),
+                    )
+                }
+            } else {
+                if (videoStalled) {
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(top = 18.dp),
+                        shape = RoundedCornerShape(999.dp),
+                        color = Color(0xCC8C2F02),
+                    ) {
+                        Text(
+                            "视频流疑似停滞",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                        )
+                    }
+                }
+                if (hostVideoStalled) {
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = 18.dp, end = 18.dp),
+                        shape = RoundedCornerShape(999.dp),
+                        color = Color(0xCC6B1223),
+                    ) {
+                        Text(
+                            "Host 出包异常",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                        )
+                    }
+                }
+                if (hostTransportStalled) {
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = 64.dp, end = 18.dp),
+                        shape = RoundedCornerShape(999.dp),
+                        color = Color(0xCC5C1F8A),
+                    ) {
+                        Text(
+                            "Transport 发送异常",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                        )
+                    }
+                }
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(20.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    color = Color(0x99040A14),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            session.summary,
+                            color = Color.White,
+                            style = MaterialTheme.typography.bodyMedium,
+                            textAlign = TextAlign.Center,
+                        )
+                        hostVideoStatus?.let { status ->
+                            Text(
+                                status,
+                                color = if (hostVideoStalled) Color(0xFFFFC9D2) else Color(0xFFD7E3FF),
+                                style = MaterialTheme.typography.bodySmall,
+                                textAlign = TextAlign.Center,
+                            )
+                        }
+                        hostTransportStatus?.let { status ->
+                            Text(
+                                status,
+                                color = if (hostTransportStalled) Color(0xFFE6C9FF) else Color(0xFFCFE0FF),
+                                style = MaterialTheme.typography.bodySmall,
+                                textAlign = TextAlign.Center,
+                            )
+                        }
+                    }
+                }
             }
         }
         Surface(
@@ -775,6 +916,45 @@ private fun RemoteStreamScreen(
                     Text("断开")
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun RemoteVideoDiagnosisCard(
+    diagnosis: RemoteVideoPathDiagnosis,
+    modifier: Modifier = Modifier,
+) {
+    val containerColor = when (diagnosis.level) {
+        RemoteVideoDiagnosisLevel.Info -> Color(0xAA0F203A)
+        RemoteVideoDiagnosisLevel.Warning -> Color(0xCC7A4A04)
+        RemoteVideoDiagnosisLevel.Critical -> Color(0xCC6B1223)
+    }
+    val accentColor = when (diagnosis.level) {
+        RemoteVideoDiagnosisLevel.Info -> Color(0xFF8FD3FF)
+        RemoteVideoDiagnosisLevel.Warning -> Color(0xFFFFD18A)
+        RemoteVideoDiagnosisLevel.Critical -> Color(0xFFFFB4C1)
+    }
+    Surface(
+        modifier = modifier.width(280.dp),
+        shape = RoundedCornerShape(16.dp),
+        color = containerColor,
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                diagnosis.title,
+                color = accentColor,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                diagnosis.detail,
+                color = Color.White,
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
     }
 }

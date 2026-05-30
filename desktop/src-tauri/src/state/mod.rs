@@ -2,7 +2,8 @@ use crate::diagnostics::ShellDiagnosticState;
 use crate::host::HostSupervisor;
 use host_ipc::types::{
     CapabilitySnapshot, DiagnosticEntry, HostIdentitySnapshot, HostOverviewSnapshot,
-    HostSettingsSnapshot, RuntimeStatusSnapshot,
+    HostSettingsSnapshot, PendingRemoteRequestSnapshot, RuntimeStatusSnapshot,
+    VideoStreamSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -56,7 +57,7 @@ impl AppState {
             .fetch_snapshot()
             .map_err(|err| err.to_string())?;
         let shell_settings = self.shell_store.lock().map_err(lock_err)?.settings.clone();
-        let incoming_request = self
+        let preview_request = self
             .incoming_request
             .lock()
             .map_err(lock_err)?
@@ -84,6 +85,11 @@ impl AppState {
         let runtime_status = host_bundle.runtime_status.status.unwrap_or_default();
         let capability = host_bundle.capability_snapshot.snapshot.unwrap_or_default();
         let host_overview = host_bundle.host_overview.overview.unwrap_or_default();
+        let incoming_request = host_overview
+            .pending_remote_request
+            .clone()
+            .map(IncomingRequestPreview::from)
+            .or(preview_request);
         let desktop_ui_state = if active_session.is_some() {
             "SESSION_ACTIVE_VIEW".to_string()
         } else {
@@ -211,22 +217,51 @@ impl AppState {
     }
 
     pub fn respond_incoming_request(&self, allow: bool) -> Result<ShellSnapshot, String> {
+        let pending_request = self
+            .supervisor
+            .lock()
+            .map_err(lock_err)?
+            .fetch_snapshot()
+            .ok()
+            .and_then(|bundle| bundle.host_overview.overview)
+            .and_then(|overview| overview.pending_remote_request);
         *self.incoming_request.lock().map_err(lock_err)? = None;
+        if pending_request.is_some() {
+            self.supervisor
+                .lock()
+                .map_err(lock_err)?
+                .respond_pending_remote_request(allow)
+                .map_err(|err| err.to_string())?;
+        }
         if allow {
+            let (peer_name, peer_subtitle) = pending_request
+                .as_ref()
+                .map(|request| {
+                    (
+                        request.controller_display_name.clone(),
+                        format!("{} 正在等待并已获准控制此电脑", request.controller_device_id),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        "Android Controller".to_string(),
+                        "1 台设备正在控制此电脑".to_string(),
+                    )
+                });
             *self.active_session.lock().map_err(lock_err)? = Some(ActiveSessionPresentation {
                 role: "controlled_host".to_string(),
-                peer_name: "Android Controller".to_string(),
-                peer_subtitle: "1 台设备正在控制此电脑".to_string(),
+                peer_name,
+                peer_subtitle,
                 started_at_ms: now_ms(),
             });
             self.push_shell_message(ShellMessage::info(
                 "REMOTE_ASSIST_REQUEST_ALLOWED",
-                "Incoming remote assist request preview marked as allowed.",
+                "Incoming remote assist request marked as allowed.",
             ))?;
         } else {
             self.push_shell_message(ShellMessage::warning(
                 "REMOTE_ASSIST_REQUEST_REJECTED",
-                "Incoming remote assist request preview marked as rejected.",
+                "Incoming remote assist request marked as rejected.",
             ))?;
         }
         self.bootstrap_snapshot()
@@ -427,6 +462,7 @@ pub struct HostOverviewView {
     pub paired_controller_count: u32,
     pub control_port: u32,
     pub active_controller_display_name: Option<String>,
+    pub video_stream: VideoStreamView,
     pub updated_at_ms: i64,
 }
 
@@ -438,6 +474,33 @@ impl From<HostOverviewSnapshot> for HostOverviewView {
             paired_controller_count: value.paired_controller_count,
             control_port: value.control_port,
             active_controller_display_name: value.active_controller_display_name,
+            video_stream: VideoStreamView::from(value.video_stream.unwrap_or_default()),
+            updated_at_ms: value.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoStreamView {
+    pub session_id: String,
+    pub packet_count: u64,
+    pub keyframe_count: u64,
+    pub latest_packet_len: u64,
+    pub latest_frame_source_label: String,
+    pub latest_error: String,
+    pub updated_at_ms: i64,
+}
+
+impl From<VideoStreamSnapshot> for VideoStreamView {
+    fn from(value: VideoStreamSnapshot) -> Self {
+        Self {
+            session_id: value.session_id,
+            packet_count: value.packet_count,
+            keyframe_count: value.keyframe_count,
+            latest_packet_len: value.latest_packet_len,
+            latest_frame_source_label: value.latest_frame_source_label,
+            latest_error: value.latest_error,
             updated_at_ms: value.updated_at_ms,
         }
     }
@@ -596,6 +659,16 @@ pub struct IncomingRequestPreview {
     pub controller_name: String,
     pub device_label: String,
     pub expires_at_ms: i64,
+}
+
+impl From<PendingRemoteRequestSnapshot> for IncomingRequestPreview {
+    fn from(value: PendingRemoteRequestSnapshot) -> Self {
+        Self {
+            controller_name: value.controller_display_name,
+            device_label: value.controller_device_id,
+            expires_at_ms: value.expires_at_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -1,3 +1,4 @@
+use host_runtime::approval::{PendingRemoteRequestStore, SharedPendingRemoteRequestStore};
 use host_runtime::control::{
     default_capability_flags, default_host_identity, spawn_control_server, ControlPlaneState,
 };
@@ -10,6 +11,10 @@ use host_runtime::generated::v1::{
 };
 use host_runtime::pairing::{now_ms, PairingStore};
 use host_runtime::session::SessionRegistry;
+use host_runtime::signaling::{SharedSignalingState, SignalingState};
+use host_runtime::settings::HostSettingsStore;
+use host_runtime::transport::{SharedTransportStatusState, TransportStatusState};
+use host_runtime::video::{SharedVideoStreamState, VideoStreamState};
 use mdns_sd::{Receiver, ServiceDaemon, ServiceEvent};
 use prost::Message;
 use std::fs;
@@ -169,6 +174,17 @@ fn test_control_state(port: u16) -> ControlPlaneState {
     let base_dir = std::env::temp_dir().join(format!("akadesk-m3-test-{}", now_ms()));
     fs::create_dir_all(&base_dir).expect("failed to create temp test dir");
     let pairing_store = PairingStore::load(&base_dir).expect("failed to create pairing store");
+    let settings = Arc::new(Mutex::new(
+        HostSettingsStore::load(&base_dir).expect("failed to create host settings store"),
+    ));
+    let pending_remote_requests: SharedPendingRemoteRequestStore =
+        Arc::new(Mutex::new(PendingRemoteRequestStore::default()));
+    let video_streams: SharedVideoStreamState =
+        Arc::new(Mutex::new(VideoStreamState::default()));
+    let signaling: SharedSignalingState =
+        Arc::new(Mutex::new(SignalingState::default()));
+    let transport_status: SharedTransportStatusState =
+        Arc::new(Mutex::new(TransportStatusState::default()));
     let host_identity = default_host_identity(
         "host-test-device".to_string(),
         "AkaDesk Test Host".to_string(),
@@ -188,6 +204,11 @@ fn test_control_state(port: u16) -> ControlPlaneState {
         capability_flags: default_capability_flags(),
         pairing_store: Arc::new(Mutex::new(pairing_store)),
         sessions: Arc::new(Mutex::new(SessionRegistry::default())),
+        settings,
+        pending_remote_requests,
+        video_streams,
+        signaling,
+        transport_status,
     }
 }
 

@@ -1,3 +1,4 @@
+pub mod approval;
 pub mod audio;
 pub mod control;
 pub mod diagnostics;
@@ -8,5 +9,7 @@ pub mod pairing;
 pub mod service;
 pub mod session;
 pub mod settings;
+pub mod signaling;
 pub mod state;
+pub mod transport;
 pub mod video;

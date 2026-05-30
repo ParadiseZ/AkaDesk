@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from "vue";
+import { RefreshCcw } from "lucide-vue-next";
 import type { AcceptableValue } from "reka-ui";
 import { Button } from "@/components/ui/button";
 import {
@@ -42,6 +43,7 @@ const shellForm = reactive({
 });
 
 const hostSettings = computed(() => store.hostSettings);
+const hostIdentity = computed(() => store.snapshot?.hostOverview.identity ?? null);
 const securityMethod = computed<ConnectionMethod>(
   () => (hostSettings.value?.connectionMethod as ConnectionMethod) ?? "ACCESS_CODE",
 );
@@ -49,6 +51,9 @@ const selectedSecurityMethod = ref<ConnectionMethod>("ACCESS_CODE");
 const securityMethodLabel = computed(
   () => connectionMethodOptions.find((option) => option.value === selectedSecurityMethod.value)?.label ?? "验证码",
 );
+const formattedLocalDeviceId = computed(() => formatDeviceId(hostIdentity.value?.deviceId ?? ""));
+const temporaryVerificationCodeLabel = computed(() => hostSettings.value?.temporaryVerificationCode.slice(0, 8) ?? "--");
+const customVerificationCodeLabel = computed(() => hostSettings.value?.customVerificationCode.trim() || "未设置");
 const routeOptions = computed(() =>
   routerAndIcon.map((item) => ({
     label: item.title,
@@ -82,6 +87,13 @@ function securityDescription(method: ConnectionMethod) {
   if (method === "TRUST_ONLY") return "不需验证码，同意后即可连接。";
   if (method === "ACCESS_CODE_AND_CONSENT") return "设备 id + 验证码 + 同意可连接。";
   return "设备 id + 验证码连接，文档方案是这种。";
+}
+
+function formatDeviceId(value: string) {
+  return value
+    .replace(/\s+/g, "")
+    .replace(/(\d{3})(?=\d)/g, "$1 ")
+    .trim();
 }
 
 function onCustomCodeInput(value: string | number | undefined) {
@@ -131,6 +143,10 @@ function onConnectionMethodChange(value: AcceptableValue) {
 function openCustomCodeDialog() {
   customCodeDraft.value = hostSettings.value?.customVerificationCode ?? "";
   customCodeDialogOpen.value = true;
+}
+
+function refreshTemporaryCode() {
+  void store.refreshTemporaryVerificationCode();
 }
 
 async function saveCustomCode() {
@@ -218,6 +234,39 @@ async function saveCustomCode() {
               <h3 class="text-base font-medium">远程协助连接本设备的方式</h3>
               <p class="mt-1 text-sm text-slate-500">{{ securityDescription(selectedSecurityMethod) }}</p>
             </div>
+            <section class="border-b border-slate-300 px-5 py-4">
+              <div class="grid gap-3 md:grid-cols-[160px_160px_120px_minmax(0,1fr)] md:items-end">
+                <div class="max-w-[160px]">
+                  <div class="text-xs text-slate-500">本设备 ID</div>
+                  <div class="mt-2 text-2xl font-semibold tracking-[0.08em]">{{ formattedLocalDeviceId || "--" }}</div>
+                </div>
+
+                <div class="max-w-[160px]">
+                  <div class="text-xs text-slate-500">当前临时验证码</div>
+                  <div class="mt-2 flex h-9 items-center border border-slate-300 px-3 text-sm font-medium tracking-[0.12em]">
+                    {{ temporaryVerificationCodeLabel }}
+                  </div>
+                </div>
+
+                <div>
+                  <div class="text-xs text-slate-500">刷新</div>
+                  <Button variant="outline" class="mt-2 h-9 w-full rounded-none border-slate-300 px-3" @click="refreshTemporaryCode">
+                    <RefreshCcw class="mr-2 size-4" />
+                    刷新
+                  </Button>
+                </div>
+
+                <div>
+                  <div class="text-xs text-slate-500">当前自定义验证码</div>
+                  <div class="mt-2 flex h-9 items-center border border-slate-300 px-3 text-sm">
+                    {{ customVerificationCodeLabel }}
+                  </div>
+                </div>
+              </div>
+              <p class="mt-3 text-xs text-slate-500">
+                被控端日常连接至少需要把本设备 ID 告诉控制端；使用验证码连接时，再把当前验证码一并提供给对方。
+              </p>
+            </section>
             <div class="grid gap-4 px-5 py-4">
               <div class="max-w-[220px]">
                 <div class="text-xs text-slate-500">连接方式</div>

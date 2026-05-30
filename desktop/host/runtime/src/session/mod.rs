@@ -55,6 +55,20 @@ impl SessionRegistry {
         self.active.as_ref().map(|session| &session.session_id)
     }
 
+    pub fn active_snapshot_for_controller(&self, controller_device_id: &str) -> Option<SessionSnapshot> {
+        let session = self.active.as_ref()?;
+        if session.controller_device_id != controller_device_id {
+            return None;
+        }
+        if session.state == SessionState::Disconnecting as i32
+            || session.state == SessionState::Disconnected as i32
+            || session.state == SessionState::Failed as i32
+        {
+            return None;
+        }
+        Some(session.snapshot())
+    }
+
     pub fn activate_preparing(
         &mut self,
         session_id: String,
@@ -92,5 +106,69 @@ impl SessionRegistry {
         let snapshot = context.snapshot();
         self.active = Some(context);
         snapshot
+    }
+
+    pub fn should_keep_running(&self, session_id: &str) -> bool {
+        self.active
+            .as_ref()
+            .map(|session| {
+                session.session_id.0 == session_id
+                    && session.state != SessionState::Disconnecting as i32
+                    && session.state != SessionState::Disconnected as i32
+                    && session.state != SessionState::Failed as i32
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn mark_streaming(&mut self, session_id: &str) -> Option<SessionSnapshot> {
+        let now = now_ms();
+        let session = self.active.as_mut()?;
+        if session.session_id.0 != session_id {
+            return None;
+        }
+        session.state = SessionState::Streaming as i32;
+        if session.streaming_started_at_ms == 0 {
+            session.streaming_started_at_ms = now;
+        }
+        session.updated_at_ms = now;
+        Some(session.snapshot())
+    }
+
+    pub fn touch_active(&mut self, session_id: &str) -> bool {
+        let Some(session) = self.active.as_mut() else {
+            return false;
+        };
+        if session.session_id.0 != session_id {
+            return false;
+        }
+        session.updated_at_ms = now_ms();
+        true
+    }
+
+    pub fn mark_failed(&mut self, session_id: &str) -> Option<SessionSnapshot> {
+        let now = now_ms();
+        let session = self.active.as_mut()?;
+        if session.session_id.0 != session_id {
+            return None;
+        }
+        session.state = SessionState::Failed as i32;
+        session.updated_at_ms = now;
+        session.closed_at_ms = now;
+        Some(session.snapshot())
+    }
+
+    pub fn mark_disconnected(&mut self, session_id: &str) -> Option<SessionSnapshot> {
+        let now = now_ms();
+        let session = self.active.as_mut()?;
+        if session.session_id.0 != session_id {
+            return None;
+        }
+        if session.disconnecting_started_at_ms == 0 {
+            session.disconnecting_started_at_ms = now;
+        }
+        session.state = SessionState::Disconnected as i32;
+        session.updated_at_ms = now;
+        session.closed_at_ms = now;
+        Some(session.snapshot())
     }
 }

@@ -1,3 +1,7 @@
+use crate::approval::{
+    PendingRemoteRequestSnapshot as RuntimePendingRemoteRequestSnapshot,
+    PendingRemoteRequestStore, SharedPendingRemoteRequestStore,
+};
 use crate::control::{
     default_capability_flags, default_host_identity, ControlPlaneState, DEFAULT_CONTROL_PORT,
 };
@@ -5,14 +9,19 @@ use crate::diagnostics::{DiagnosticBuffer, SharedDiagnosticBuffer};
 use crate::generated::v1::DevicePresence;
 use crate::pairing::{load_runtime_base_dir, HostIdentity, PairingStore, SharedPairingStore};
 use crate::session::{SessionRegistry, SharedSessionRegistry};
+use crate::signaling::{SharedSignalingState, SignalingState};
 use crate::settings::HostSettingsStore;
 use crate::state::RuntimeStatus;
+use crate::transport::{SharedTransportStatusState, TransportStatusState};
+use crate::video::{SharedVideoStreamState, VideoStreamState};
 use host_ipc::types::{
     CapabilitySnapshot, CapabilitySnapshotChanged, DiagnosticsChanged, DiagnosticsResponse,
-    RefreshTemporaryVerificationCodeResponse,
+    RefreshTemporaryVerificationCodeResponse, RespondPendingRemoteRequestResponse,
     HostIdentitySnapshot, HostOverviewChanged, HostOverviewResponse, HostOverviewSnapshot,
-    HostSettingsSnapshot, InputCapabilitySnapshot, RuntimeStatusChanged, RuntimeStatusResponse,
-    RuntimeStatusSnapshot, UpdateHostSettingsResponse,
+    HostSettingsSnapshot, InputCapabilitySnapshot,
+    PendingRemoteRequestSnapshot as IpcPendingRemoteRequestSnapshot, RuntimeStatusChanged,
+    RuntimeStatusResponse, RuntimeStatusSnapshot, UpdateHostSettingsResponse,
+    VideoStreamSnapshot as IpcVideoStreamSnapshot,
 };
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -24,6 +33,10 @@ pub struct RuntimeService {
     sessions: SharedSessionRegistry,
     control_state: ControlPlaneState,
     settings: Arc<Mutex<HostSettingsStore>>,
+    pending_remote_requests: SharedPendingRemoteRequestStore,
+    video_streams: SharedVideoStreamState,
+    signaling: SharedSignalingState,
+    transport_status: SharedTransportStatusState,
     diagnostics: SharedDiagnosticBuffer,
 }
 
@@ -36,6 +49,13 @@ impl RuntimeService {
         let pairing_store: SharedPairingStore =
             Arc::new(Mutex::new(PairingStore::load(&base_dir)?));
         let sessions: SharedSessionRegistry = Arc::new(Mutex::new(SessionRegistry::default()));
+        let pending_remote_requests: SharedPendingRemoteRequestStore =
+            Arc::new(Mutex::new(PendingRemoteRequestStore::default()));
+        let video_streams: SharedVideoStreamState =
+            Arc::new(Mutex::new(VideoStreamState::default()));
+        let signaling: SharedSignalingState = Arc::new(Mutex::new(SignalingState::default()));
+        let transport_status: SharedTransportStatusState =
+            Arc::new(Mutex::new(TransportStatusState::default()));
         let device_identity = default_host_identity(
             host_identity.device_id.clone(),
             host_identity.display_name.clone(),
@@ -55,6 +75,11 @@ impl RuntimeService {
             capability_flags: default_capability_flags(),
             pairing_store,
             sessions: Arc::clone(&sessions),
+            settings: Arc::clone(&settings),
+            pending_remote_requests: Arc::clone(&pending_remote_requests),
+            video_streams: Arc::clone(&video_streams),
+            signaling: Arc::clone(&signaling),
+            transport_status: Arc::clone(&transport_status),
         };
         if let Ok(mut buffer) = diagnostics.lock() {
             buffer.push(
@@ -72,6 +97,10 @@ impl RuntimeService {
             sessions,
             control_state,
             settings,
+            pending_remote_requests,
+            video_streams,
+            signaling,
+            transport_status,
             diagnostics,
         })
     }
@@ -86,6 +115,10 @@ impl RuntimeService {
 
     pub fn control_state(&self) -> &ControlPlaneState {
         &self.control_state
+    }
+
+    pub fn video_streams(&self) -> &SharedVideoStreamState {
+        &self.video_streams
     }
 
     pub fn runtime_status_response(&self) -> RuntimeStatusResponse {
@@ -208,6 +241,38 @@ impl RuntimeService {
         })
     }
 
+    pub fn respond_pending_remote_request(
+        &self,
+        allow: bool,
+    ) -> io::Result<RespondPendingRemoteRequestResponse> {
+        let handled = self
+            .pending_remote_requests
+            .lock()
+            .map_err(lock_err)?
+            .respond(allow);
+        if let Ok(mut buffer) = self.diagnostics.lock() {
+            if handled {
+                buffer.push(
+                    if allow { "info" } else { "warning" },
+                    if allow {
+                        "REMOTE_ASSIST_REQUEST_ALLOWED"
+                    } else {
+                        "REMOTE_ASSIST_REQUEST_REJECTED"
+                    },
+                    if allow {
+                        "Desktop shell allowed the pending remote assistance request."
+                    } else {
+                        "Desktop shell rejected the pending remote assistance request."
+                    },
+                );
+            }
+        }
+        Ok(RespondPendingRemoteRequestResponse {
+            overview: self.host_overview_snapshot(),
+            error: None,
+        })
+    }
+
     pub fn diagnostics_response(&self) -> DiagnosticsResponse {
         DiagnosticsResponse {
             entries: self.diagnostic_entries(),
@@ -222,7 +287,22 @@ impl RuntimeService {
     }
 
     fn host_overview_snapshot(&self) -> Option<HostOverviewSnapshot> {
+        let pending_remote_request = self
+            .pending_remote_requests
+            .lock()
+            .ok()
+            .and_then(|mut store| {
+                store.clear_expired();
+                store.snapshot()
+            })
+            .map(IpcPendingRemoteRequestSnapshot::from);
         let settings = self.settings.lock().ok().map(|store| store.snapshot());
+        let video_stream = self
+            .video_streams
+            .lock()
+            .ok()
+            .map(|streams| streams.snapshot())
+            .map(IpcVideoStreamSnapshot::from);
         let paired_controller_count = self
             .control_state
             .pairing_store
@@ -249,6 +329,8 @@ impl RuntimeService {
             control_port: self.control_state.advertised_presence.control_port as u32,
             active_controller_display_name,
             updated_at_ms: crate::pairing::now_ms(),
+            pending_remote_request,
+            video_stream,
         })
     }
 
@@ -268,4 +350,31 @@ impl Default for RuntimeService {
 
 fn lock_err<T>(_: std::sync::PoisonError<T>) -> io::Error {
     io::Error::new(io::ErrorKind::Other, "runtime state lock poisoned")
+}
+
+impl From<RuntimePendingRemoteRequestSnapshot> for IpcPendingRemoteRequestSnapshot {
+    fn from(value: RuntimePendingRemoteRequestSnapshot) -> Self {
+        Self {
+            request_id: value.request_id,
+            controller_device_id: value.controller_device_id,
+            controller_display_name: value.controller_display_name,
+            connection_method: value.connection_method,
+            requested_at_ms: value.requested_at_ms,
+            expires_at_ms: value.expires_at_ms,
+        }
+    }
+}
+
+impl From<crate::video::VideoStreamSnapshot> for IpcVideoStreamSnapshot {
+    fn from(value: crate::video::VideoStreamSnapshot) -> Self {
+        Self {
+            session_id: value.session_id,
+            packet_count: value.packet_count,
+            keyframe_count: value.keyframe_count,
+            latest_packet_len: value.latest_packet_len as u64,
+            latest_frame_source_label: value.latest_frame_source_label,
+            latest_error: value.latest_error,
+            updated_at_ms: value.updated_at_ms,
+        }
+    }
 }

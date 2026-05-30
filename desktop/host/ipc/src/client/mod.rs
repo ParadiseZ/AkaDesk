@@ -3,12 +3,14 @@ use crate::types::{
     CapabilitySnapshotChanged, CapabilitySnapshotResponse, DiagnosticsResponse,
     GetCapabilitySnapshotRequest, GetDiagnosticsRequest, GetHostOverviewRequest,
     GetRuntimeStatusRequest, HostOverviewResponse, IpcEnvelope, IpcMessageKind,
+    RespondPendingRemoteRequestRequest, RespondPendingRemoteRequestResponse,
     RefreshTemporaryVerificationCodeRequest, RefreshTemporaryVerificationCodeResponse,
     RuntimeStatusChanged, RuntimeStatusResponse, UpdateHostSettingsRequest,
     UpdateHostSettingsResponse, CAPABILITY_SNAPSHOT_CHANGED, CAPABILITY_SNAPSHOT_RESPONSE,
     DIAGNOSTICS_RESPONSE, GET_CAPABILITY_SNAPSHOT, GET_DIAGNOSTICS, GET_HOST_OVERVIEW,
     GET_RUNTIME_STATUS, HOST_OVERVIEW_RESPONSE, REFRESH_TEMPORARY_VERIFICATION_CODE,
     REFRESH_TEMPORARY_VERIFICATION_CODE_RESPONSE, RUNTIME_STATUS_CHANGED,
+    RESPOND_PENDING_REMOTE_REQUEST, RESPOND_PENDING_REMOTE_REQUEST_RESPONSE,
     RUNTIME_STATUS_RESPONSE, UPDATE_HOST_SETTINGS, UPDATE_HOST_SETTINGS_RESPONSE,
 };
 use interprocess::local_socket::{prelude::*, GenericFilePath, GenericNamespaced, Stream};
@@ -123,6 +125,17 @@ impl IpcClient {
             REFRESH_TEMPORARY_VERIFICATION_CODE,
             REFRESH_TEMPORARY_VERIFICATION_CODE_RESPONSE,
             RefreshTemporaryVerificationCodeRequest {},
+        )
+    }
+
+    pub fn respond_pending_remote_request(
+        &mut self,
+        allow: bool,
+    ) -> io::Result<RespondPendingRemoteRequestResponse> {
+        self.request_response(
+            RESPOND_PENDING_REMOTE_REQUEST,
+            RESPOND_PENDING_REMOTE_REQUEST_RESPONSE,
+            RespondPendingRemoteRequestRequest { allow },
         )
     }
 

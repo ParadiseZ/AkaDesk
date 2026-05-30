@@ -2,10 +2,12 @@ use host_ipc::server::{serve_forever, IpcRequestHandler};
 use host_ipc::types::{
     GetCapabilitySnapshotRequest, GetDiagnosticsRequest, GetHostOverviewRequest,
     GetRuntimeStatusRequest, IpcEnvelope, IpcMessageKind,
-    RefreshTemporaryVerificationCodeRequest, UpdateHostSettingsRequest,
+    RefreshTemporaryVerificationCodeRequest, RespondPendingRemoteRequestRequest,
+    UpdateHostSettingsRequest,
     CAPABILITY_SNAPSHOT_CHANGED, DIAGNOSTICS_CHANGED, GET_CAPABILITY_SNAPSHOT, GET_DIAGNOSTICS,
     GET_HOST_OVERVIEW, GET_RUNTIME_STATUS, HOST_OVERVIEW_CHANGED,
-    REFRESH_TEMPORARY_VERIFICATION_CODE, RUNTIME_STATUS_CHANGED, UPDATE_HOST_SETTINGS,
+    REFRESH_TEMPORARY_VERIFICATION_CODE, RESPOND_PENDING_REMOTE_REQUEST,
+    RUNTIME_STATUS_CHANGED, UPDATE_HOST_SETTINGS,
 };
 use host_runtime::control::spawn_control_server;
 use host_runtime::discovery::publish_presence;
@@ -120,6 +122,15 @@ impl IpcRequestHandler for RuntimeIpcHandler {
                     envelope.request_id,
                     host_ipc::types::REFRESH_TEMPORARY_VERIFICATION_CODE_RESPONSE,
                     self.service.refresh_temporary_verification_code()?,
+                )
+            }
+            RESPOND_PENDING_REMOTE_REQUEST => {
+                let request = RespondPendingRemoteRequestRequest::decode(&envelope.payload[..])
+                    .map_err(decode_err)?;
+                response_envelope(
+                    envelope.request_id,
+                    host_ipc::types::RESPOND_PENDING_REMOTE_REQUEST_RESPONSE,
+                    self.service.respond_pending_remote_request(request.allow)?,
                 )
             }
             GET_DIAGNOSTICS => {

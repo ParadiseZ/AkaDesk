@@ -131,7 +131,6 @@ pub struct PendingChallenge {
     pub controller_device_id: String,
     pub controller_display_name: String,
     pub challenge_id: String,
-    pub verification_code: String,
 }
 
 pub type SharedPairingStore = Arc<Mutex<PairingStore>>;

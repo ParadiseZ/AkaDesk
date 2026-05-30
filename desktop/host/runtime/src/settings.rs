@@ -28,7 +28,7 @@ impl ConnectionMethod {
         }
     }
 
-    fn from_wire_value(value: impl AsRef<str>) -> Self {
+    pub fn from_wire_value(value: impl AsRef<str>) -> Self {
         match value.as_ref() {
             "TRUST_ONLY" => Self::TrustOnly,
             "ACCESS_CODE_AND_CONSENT" => Self::AccessCodeAndConsent,
@@ -68,6 +68,25 @@ impl Default for HostSettings {
 }
 
 impl HostSettings {
+    pub fn connection_method(&self) -> ConnectionMethod {
+        self.connection_method
+    }
+
+    pub fn accepts_access_code(&self, submitted_code: &str) -> bool {
+        let normalized = normalize_submitted_code(submitted_code);
+        if normalized.is_empty() {
+            return false;
+        }
+        match self.verification_mode.as_str() {
+            "CUSTOM_CODE" => normalized == self.custom_verification_code,
+            "BOTH_CODES" => {
+                normalized == self.temporary_verification_code
+                    || normalized == self.custom_verification_code
+            }
+            _ => normalized == self.temporary_verification_code,
+        }
+    }
+
     pub fn into_snapshot(self) -> HostSettingsSnapshot {
         HostSettingsSnapshot {
             allow_remote_assistance: self.allow_remote_assistance,
@@ -127,6 +146,10 @@ impl HostSettingsStore {
         self.settings.clone().into_snapshot()
     }
 
+    pub fn current(&self) -> HostSettings {
+        self.settings.clone()
+    }
+
     pub fn update(&mut self, snapshot: HostSettingsSnapshot) -> io::Result<HostSettingsSnapshot> {
         self.settings = HostSettings::from_snapshot(snapshot);
         write_json(&self.path, &self.settings)?;
@@ -177,6 +200,10 @@ fn normalize_custom_code(value: String) -> String {
     } else {
         normalized
     }
+}
+
+fn normalize_submitted_code(value: &str) -> String {
+    value.trim().to_ascii_uppercase()
 }
 
 fn generate_temporary_verification_code() -> String {
