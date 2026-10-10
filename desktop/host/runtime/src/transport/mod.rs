@@ -1,10 +1,12 @@
 use crate::audio::SharedAudioStreamState;
 use crate::generated::v1::{IceCandidate, WebRtcOffer};
+use crate::input::SharedInputState;
 use crate::pairing::now_ms;
 use crate::session::SharedSessionRegistry;
 use crate::signaling::SharedSignalingState;
 use crate::video::SharedVideoStreamState;
 use prost::bytes::Bytes;
+use prost::Message;
 use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use std::collections::VecDeque;
@@ -70,6 +72,7 @@ pub fn spawn_h264_webrtc_transport_loop(
     signaling: SharedSignalingState,
     transport_status: SharedTransportStatusState,
     audio_streams: SharedAudioStreamState,
+    input: SharedInputState,
     session_id: String,
     fps: u32,
     h264_fmtp_line: String,
@@ -178,18 +181,32 @@ pub fn spawn_h264_webrtc_transport_loop(
             let video_streams_for_state = Arc::clone(&video_streams);
             let transport_status_for_state = Arc::clone(&transport_status);
             let media_send_ready_for_state = Arc::clone(&media_send_ready);
+            let input_for_state = Arc::clone(&input);
             peer_connection.on_peer_connection_state_change(Box::new(move |state| {
                 let sessions = Arc::clone(&sessions_for_state);
                 let session_id = session_id_for_state.clone();
                 let video_streams = Arc::clone(&video_streams_for_state);
                 let transport_status = Arc::clone(&transport_status_for_state);
                 let media_send_ready = Arc::clone(&media_send_ready_for_state);
+                let input = Arc::clone(&input_for_state);
                 Box::pin(async move {
                     eprintln!("webrtc peer connection state session={session_id} state={state:?}");
                     media_send_ready.store(
                         matches!(state, RTCPeerConnectionState::Connected),
                         Ordering::Relaxed,
                     );
+                    if matches!(
+                        state,
+                        RTCPeerConnectionState::Disconnected
+                            | RTCPeerConnectionState::Failed
+                            | RTCPeerConnectionState::Closed
+                    ) {
+                        if let Ok(mut input) = input.lock() {
+                            if let Err(error) = input.release_held(&session_id) {
+                                eprintln!("release remote input failed: {error}");
+                            }
+                        }
+                    }
                     if let Ok(mut status) = transport_status.lock() {
                         status.record_peer_connection_state(&session_id, format!("{state:?}"));
                     }
@@ -277,6 +294,59 @@ pub fn spawn_h264_webrtc_transport_loop(
             } else {
                 None
             };
+            let has_input = sessions.lock().ok().is_some_and(|registry| {
+                registry
+                    .active
+                    .as_ref()
+                    .is_some_and(|s| s.session_id.0 == session_id && s.input_enabled)
+            });
+            if has_input {
+                let channel = peer_connection
+                    .create_data_channel(
+                        "input",
+                        Some(
+                            webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+                                ordered: Some(true),
+                                protocol: Some("akadesk.input.v1".into()),
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let weak_channel = Arc::downgrade(&channel);
+                let input_for_messages = Arc::clone(&input);
+                let sessions_for_messages = Arc::clone(&sessions);
+                let bound_id = session_id.clone();
+                channel.on_message(Box::new(move |message| {
+                    let weak_channel = weak_channel.clone();
+                    let input = Arc::clone(&input_for_messages);
+                    let sessions = Arc::clone(&sessions_for_messages);
+                    let id = bound_id.clone();
+                    Box::pin(async move {
+                        if message.is_string {
+                            return;
+                        }
+                        let result = crate::input::process(&sessions, &input, &id, &message.data);
+                        if let Some(channel) = weak_channel.upgrade() {
+                            let _ = channel.send(&Bytes::from(result.encode_to_vec())).await;
+                        }
+                    })
+                }));
+                let input_for_close = Arc::clone(&input);
+                let id_for_close = session_id.clone();
+                channel.on_close(Box::new(move || {
+                    let input = Arc::clone(&input_for_close);
+                    let id = id_for_close.clone();
+                    Box::pin(async move {
+                        if let Ok(mut state) = input.lock() {
+                            if let Err(error) = state.finish(&id) {
+                                eprintln!("input channel cleanup failed: {error}");
+                            }
+                        }
+                    })
+                }));
+            }
             let offer = peer_connection
                 .create_offer(None)
                 .await
@@ -719,6 +789,7 @@ mod audio_tests {
             Arc::clone(&signaling),
             status,
             Arc::new(Mutex::new(crate::audio::AudioStreamState::default())),
+            Arc::new(Mutex::new(crate::input::InputState::default())),
             id.clone(),
             30,
             "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".into(),
@@ -982,6 +1053,7 @@ pub fn spawn_h264_webrtc_transport_loop(
     _: SharedSignalingState,
     _: SharedTransportStatusState,
     _: SharedAudioStreamState,
+    _: SharedInputState,
     _: String,
     _: u32,
     _: String,

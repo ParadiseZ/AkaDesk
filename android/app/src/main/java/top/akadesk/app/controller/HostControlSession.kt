@@ -73,6 +73,10 @@ internal class HostControlSession(
     @Volatile
     private var socket: WebSocket? = null
     private var pendingChallengeId: String? = null
+    @Volatile private var supportsInput = false
+    private var snapshotLoaded = false
+    private var startRequested = false
+    private var pendingStartCodec: VideoCodec? = null
     private val lastHeartbeatPongAtMs = AtomicLong(0L)
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
@@ -163,7 +167,15 @@ internal class HostControlSession(
     }
 
     fun requestRemoteSession(requestedCodec: VideoCodec?) {
-        send(ControlProtoCodec.buildStartSessionRequest(nextRequestId(), controllerDeviceId, host.deviceId, requestedCodec))
+        val request = synchronized(lifecycleLock) {
+            if (closed) return
+            if (!snapshotLoaded) {
+                startRequested = true
+                pendingStartCodec = requestedCodec
+                null
+            } else ControlProtoCodec.buildStartSessionRequest(nextRequestId(), controllerDeviceId, host.deviceId, requestedCodec, supportsInput)
+        }
+        request?.let(::send)
     }
 
     fun requestStopSession(sessionId: String) {
@@ -214,6 +226,15 @@ internal class HostControlSession(
             "DeviceSnapshotResponse" -> {
                 val response = ControlProtoCodec.decodeDeviceSnapshotResponse(envelope)
                 if (response.hasSnapshot()) {
+                    val pending = synchronized(lifecycleLock) {
+                        supportsInput = response.snapshot.capabilityFlags.supportsInput
+                        snapshotLoaded = true
+                        if (startRequested && !closed) {
+                            startRequested = false
+                            ControlProtoCodec.buildStartSessionRequest(nextRequestId(), controllerDeviceId, host.deviceId, pendingStartCodec, supportsInput)
+                        } else null
+                    }
+                    pending?.let(::send)
                     listener.onDeviceSnapshotLoaded(host)
                 } else {
                     val message = if (response.hasError()) response.error.message else "Snapshot unavailable"

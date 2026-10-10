@@ -6,6 +6,7 @@ pub mod diagnostics;
 pub mod discovery;
 pub mod events;
 pub mod generated;
+pub mod input;
 pub mod orchestration;
 pub mod pairing;
 pub mod service;

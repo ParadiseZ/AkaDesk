@@ -105,6 +105,7 @@ object ControlProtoCodec {
         controllerDeviceId: String,
         controlledDeviceId: String,
         requestedCodec: VideoCodec?,
+        enableInput: Boolean = true,
     ): ControlEnvelope {
         val videoPreference = VideoPreference.newBuilder()
             .setWidth(960)
@@ -118,7 +119,7 @@ object ControlProtoCodec {
                 SessionIntent.newBuilder()
                     .setControllerDeviceId(controllerDeviceId)
                     .setControlledDeviceId(controlledDeviceId)
-                    .setEnableInput(false)
+                    .setEnableInput(enableInput)
                     .setVideo(videoPreference)
                     .setAudio(AudioPreference.newBuilder().setCodec(AudioCodec.AUDIO_CODEC_OPUS)
                         .setSampleRate(48_000).setChannels(2).setBitrateKbps(64))

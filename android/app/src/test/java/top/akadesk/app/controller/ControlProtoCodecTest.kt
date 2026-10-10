@@ -9,14 +9,14 @@ import org.junit.Test
 
 class ControlProtoCodecTest {
     @Test
-    fun sessionRequestUsesFullHostIdentityAndViewOnlyH264() {
+    fun sessionRequestUsesFullHostIdentityAndH264WithInput() {
         val hostId = "AbCdEf012345GhIjKl678901"
         val wire = ControlProtoCodec.buildStartSessionRequest("start-1", "phone", hostId, VideoCodec.VIDEO_CODEC_H264)
         val decoded = ControlEnvelope.parseFrom(wire.toByteArray())
         val intent = StartSessionRequest.parseFrom(decoded.payload).intent
         assertEquals(hostId, intent.controlledDeviceId)
         assertEquals("phone", intent.controllerDeviceId)
-        assertFalse(intent.enableInput)
+        assertTrue(intent.enableInput)
         assertTrue(intent.hasAudio())
         assertEquals(akadesk.v1.AudioCodec.AUDIO_CODEC_OPUS, intent.audio.codec)
         assertEquals(48_000, intent.audio.sampleRate)
@@ -26,6 +26,10 @@ class ControlProtoCodecTest {
         assertEquals(VideoCodec.VIDEO_CODEC_H264, intent.video.codec)
         assertEquals(960, intent.video.width)
         assertEquals(540, intent.video.height)
+    }
+    @Test fun viewOnlyHostCanStillBeRequestedWithoutInput() {
+        val wire=ControlProtoCodec.buildStartSessionRequest("start","phone","host",VideoCodec.VIDEO_CODEC_H264,false)
+        assertFalse(StartSessionRequest.parseFrom(wire.payload).intent.enableInput)
     }
 
     @Test

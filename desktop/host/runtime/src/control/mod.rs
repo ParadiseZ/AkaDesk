@@ -38,8 +38,17 @@ pub fn reap_finished_session(state: &ControlPlaneState) -> io::Result<()> {
     else {
         return Ok(());
     };
-    crate::audio::finish_audio_session(&state.audio_streams, &snapshot.session_id)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    // Attempt both releases even if one fails; an audio restore error must not
+    // leave remote keys held, nor should input cleanup prevent audio restoration.
+    let input_cleanup = state
+        .input
+        .lock()
+        .map_err(session_lock_err)?
+        .finish(&snapshot.session_id);
+    let audio_cleanup =
+        crate::audio::finish_audio_session(&state.audio_streams, &snapshot.session_id);
+    input_cleanup.map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    audio_cleanup.map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
     state
         .video_streams
         .lock()
@@ -305,6 +314,7 @@ struct SentTransportEventState {
 #[derive(Debug, Clone)]
 pub struct ControlPlaneState {
     pub audio_streams: crate::audio::SharedAudioStreamState,
+    pub input: crate::input::SharedInputState,
     pub host_identity: DeviceIdentity,
     pub advertised_presence: DevicePresence,
     pub capability_flags: CapabilityFlags,
@@ -909,7 +919,9 @@ fn handle_envelope(
                 );
             }
 
-            if intent.enable_input || !intent.target_display_id.is_empty() {
+            if (intent.enable_input && !state.capability_flags.supports_input)
+                || !intent.target_display_id.is_empty()
+            {
                 return send_start_session_rejected(
                     websocket,
                     &envelope.request_id,
@@ -932,6 +944,7 @@ fn handle_envelope(
                 }
             }
             let audio_preference = intent.audio.clone();
+            let enable_input = intent.enable_input;
             if state
                 .sessions
                 .lock()
@@ -1129,12 +1142,45 @@ fn handle_envelope(
                     }
                 }
             }
+            if enable_input {
+                let prepared = {
+                    let mut registry = state.sessions.lock().map_err(session_lock_err)?;
+                    if !registry.should_keep_running(&snapshot.session_id) {
+                        Err("Session stopped before input preparation".to_string())
+                    } else {
+                        let result = state
+                            .input
+                            .lock()
+                            .map_err(session_lock_err)?
+                            .prepare(&snapshot.session_id);
+                        if result.is_ok() {
+                            registry.active.as_mut().unwrap().input_enabled = true;
+                        }
+                        result
+                    }
+                };
+                if let Err(error) = prepared {
+                    state
+                        .sessions
+                        .lock()
+                        .map_err(session_lock_err)?
+                        .mark_failed(&snapshot.session_id);
+                    let _ = reap_finished_session(state);
+                    return send_start_session_rejected(
+                        websocket,
+                        &envelope.request_id,
+                        snapshot.session_id,
+                        simple_error("INPUT_PREPARE_FAILED", &error),
+                    );
+                }
+            }
             let transport_startup = crate::transport::spawn_h264_webrtc_transport_loop(
                 Arc::clone(&state.sessions),
                 Arc::clone(&state.video_streams),
                 Arc::clone(&state.signaling),
                 Arc::clone(&state.transport_status),
                 Arc::clone(&state.audio_streams),
+                Arc::clone(&state.input),
                 snapshot.session_id.clone(),
                 snapshot
                     .video
@@ -2186,7 +2232,7 @@ pub fn default_capability_flags() -> CapabilityFlags {
     let video_support = crate::video::detect_runtime_video_support();
     CapabilityFlags {
         supports_audio: cfg!(windows),
-        supports_input: false,
+        supports_input: cfg!(windows),
         supports_display_control: false,
         supports_hardware_encode: video_support.has_h264_hardware_encoder,
         supports_hardware_decode: false,

@@ -16,12 +16,13 @@ import top.akadesk.app.ui.home.ControllerHomeApp
 import top.akadesk.app.ui.theme.AkaDeskTheme
 
 class MainActivity : ComponentActivity() {
+    private lateinit var coordinator: top.akadesk.app.controller.ControllerCoordinator
     private var originalOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         originalOrientation = savedInstanceState?.getInt("normal_orientation") ?: requestedOrientation
         enableEdgeToEdge()
-        val coordinator = ViewModelProvider(this)[ControllerViewModel::class.java].coordinator
+        coordinator = ViewModelProvider(this)[ControllerViewModel::class.java].coordinator
         setContent {
             val viewing = coordinator.activeSession != null
             LaunchedEffect(viewing) {
@@ -45,5 +46,20 @@ class MainActivity : ComponentActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putInt("normal_orientation", originalOrientation)
         super.onSaveInstanceState(outState)
+    }
+    override fun onStart() {
+        super.onStart()
+        if (::coordinator.isInitialized) coordinator.inputForeground = true
+    }
+    override fun onStop() {
+        if (::coordinator.isInitialized) {
+            coordinator.inputForeground = false
+            coordinator.releaseRemoteInput()
+        }
+        super.onStop()
+    }
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        if (::coordinator.isInitialized && coordinator.hardwareKey(event)) return true
+        return super.dispatchKeyEvent(event)
     }
 }

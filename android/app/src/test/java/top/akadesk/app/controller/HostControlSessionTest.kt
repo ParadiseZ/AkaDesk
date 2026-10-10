@@ -11,6 +11,28 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class HostControlSessionTest {
+    @Test fun earlyStartWaitsForCapabilitiesAndEnablesInputExactlyOnce() {
+        val fixture=Fixture();fixture.open()
+        fixture.receive("ControlHelloAck",ControlHelloAck.newBuilder().setAccepted(true).build())
+        fixture.session.requestRemoteSession(VideoCodec.VIDEO_CODEC_H264)
+        fun starts()=fixture.socket.messages.map {ControlEnvelope.parseFrom(it.toByteArray())}.filter {it.type=="StartSessionRequest"}
+        assertTrue(starts().isEmpty())
+        val snapshot=DeviceSnapshotResponse.newBuilder().setSnapshot(DeviceSnapshot.newBuilder()
+            .setCapabilityFlags(CapabilityFlags.newBuilder().setSupportsInput(true))).build()
+        fixture.receive("DeviceSnapshotResponse",snapshot)
+        fixture.receive("DeviceSnapshotResponse",snapshot)
+        assertEquals(1,starts().size)
+        assertTrue(StartSessionRequest.parseFrom(starts().single().payload).intent.enableInput)
+    }
+    @Test fun viewOnlyCapabilitiesAndCloseDoNotEnableOrReplayPendingInput() {
+        val fixture=Fixture();fixture.open();fixture.session.requestRemoteSession(null)
+        fixture.receive("DeviceSnapshotResponse",DeviceSnapshotResponse.newBuilder().setSnapshot(DeviceSnapshot.getDefaultInstance()).build())
+        val start=fixture.socket.messages.map {ControlEnvelope.parseFrom(it.toByteArray())}.single {it.type=="StartSessionRequest"}
+        assertFalse(StartSessionRequest.parseFrom(start.payload).intent.enableInput)
+        val closed=Fixture();closed.open();closed.session.requestRemoteSession(null);closed.session.close()
+        closed.receive("DeviceSnapshotResponse",DeviceSnapshotResponse.newBuilder().setSnapshot(DeviceSnapshot.getDefaultInstance()).build())
+        assertFalse(closed.socket.messages.map {ControlEnvelope.parseFrom(it.toByteArray())}.any {it.type=="StartSessionRequest"})
+    }
     @Test fun heartbeatTimeoutCancelsSocketAndIgnoresLateCallbacks() {
         val fixture = Fixture()
         fixture.open()

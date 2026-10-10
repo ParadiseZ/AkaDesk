@@ -9,7 +9,7 @@ host-contracts = { path = "../contracts" }
 [target.'cfg(windows)'.dependencies]
 base64 = "0.22"
 ffmpeg-sys-next = { version = "8.0.1", default-features = false, features = ["avcodec", "swscale"] }
-windows = { version = "0.61.3", features = ["Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Shell_PropertiesSystem", "Win32_Devices_FunctionDiscovery"] }
+windows = { version = "0.61.3", features = ["Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Shell_PropertiesSystem", "Win32_Devices_FunctionDiscovery", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi"] }
 
 [lib]
 path = "src/lib.rs"

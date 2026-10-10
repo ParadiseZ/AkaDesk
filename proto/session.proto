@@ -43,6 +43,7 @@ message SessionSnapshot {
   int64 updated_at_ms = 13;
   int64 closed_at_ms = 14;
   bool mute_controlled_local_playback = 15;
+  bool input_enabled = 16;
 }
 
 message SessionClosedEvent {

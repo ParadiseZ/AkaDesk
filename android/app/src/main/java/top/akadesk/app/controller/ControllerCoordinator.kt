@@ -37,6 +37,50 @@ class ControllerCoordinator(context: Context) {
     private val appContext = context.applicationContext
     private val mainHandler = Handler(Looper.getMainLooper())
     private val pairingStore = ControllerPairingStore(appContext)
+    private val inputProfileStore = InputProfileStore(appContext)
+    var inputShortcuts by mutableStateOf(inputProfileStore.load())
+        private set
+    var remoteInputReady by mutableStateOf(false)
+        private set
+    var inputError by mutableStateOf<String?>(null)
+        private set
+    private var pointerX = 0.5f
+    private var pointerY = 0.5f
+    var editingLocalInput = false
+    var inputForeground = true
+    private fun inputAvailable() = inputForeground && remoteInputReady && activeSession?.stateLabel != "DISCONNECTING" && pendingStopSessionId == null
+    fun pointerInput(x:Float, y:Float, pressed:Boolean, moveOnly:Boolean=false) {
+        if (!inputAvailable() || activeRemoteVideoStalled) return
+        pointerX=x; pointerY=y
+        webRtcSession?.input?.pointer(x,y,if(moveOnly) akadesk.v1.PointerButton.POINTER_BUTTON_UNSPECIFIED else akadesk.v1.PointerButton.POINTER_BUTTON_LEFT,pressed)
+    }
+    fun rightClick() {
+        if (!inputAvailable()) return
+        webRtcSession?.input?.pointer(pointerX,pointerY,akadesk.v1.PointerButton.POINTER_BUTTON_RIGHT,true)
+        webRtcSession?.input?.pointer(pointerX,pointerY,akadesk.v1.PointerButton.POINTER_BUTTON_RIGHT,false)
+    }
+    fun scrollInput(x:Float, y:Float) { if (inputAvailable()) webRtcSession?.input?.scroll(x,y) }
+    fun sendShortcut(value:InputShortcut) {
+        if (!inputAvailable() || !InputKeys.valid(value)) return
+        webRtcSession?.input?.key(value.key,true,value.ctrl,value.alt,value.shift,value.meta)
+        webRtcSession?.input?.key(value.key,false,value.ctrl,value.alt,value.shift,value.meta)
+    }
+    fun sendText(value:String):Boolean {
+        if (!inputAvailable()) return false
+        releaseRemoteInput()
+        return webRtcSession?.input?.text(value)==true
+    }
+    fun releaseRemoteInput() { webRtcSession?.input?.release() }
+    fun saveInputShortcuts(values:List<InputShortcut>):Boolean {
+        if (!inputProfileStore.save(values)) return false
+        inputShortcuts=values.toList(); return true
+    }
+    fun hardwareKey(event:android.view.KeyEvent):Boolean {
+        if (!inputAvailable() || editingLocalInput) return false
+        val key=InputKeys.fromAndroid(event.keyCode) ?: return false
+        if (event.action !in listOf(android.view.KeyEvent.ACTION_DOWN,android.view.KeyEvent.ACTION_UP)) return false
+        return webRtcSession?.input?.key(key,event.action==android.view.KeyEvent.ACTION_DOWN,event.isCtrlPressed,event.isAltPressed,event.isShiftPressed,event.isMetaPressed)==true
+    }
     private val controllerDeviceId = pairingStore.controllerDeviceId()
 
     private var discoveryClient: HostDiscoveryClient? = null
@@ -348,6 +392,7 @@ class ControllerCoordinator(context: Context) {
     }
 
     fun endRemoteSession() {
+        releaseRemoteInput()
         val hostName = activeSession?.host?.displayName ?: pendingSessionTarget?.displayName ?: "当前设备"
         val sessionId = activeSession?.sessionId
         val currentControlSession = controlSession
@@ -960,6 +1005,21 @@ class ControllerCoordinator(context: Context) {
             appContext = appContext,
             sessionId = sessionId,
             callbacks = object : AndroidWebRtcSession.Callbacks {
+                override fun onInputStateChanged(sessionId: String, ready: Boolean) {
+                    mainHandler.post {
+                        if (generation != mediaGeneration || activeSession?.sessionId != sessionId) return@post
+                        if (!ready && remoteInputReady && pendingStopSessionId == null) inputError="输入连接已断开，请重新连接"
+                        if (ready) inputError=null
+                        remoteInputReady=ready
+                    }
+                }
+                override fun onInputError(sessionId: String) {
+                    mainHandler.post {
+                        if (generation != mediaGeneration || activeSession?.sessionId != sessionId) return@post
+                        remoteInputReady=false
+                        inputError="电脑暂时无法接收操作，请重新连接"
+                    }
+                }
                 override fun onStateChanged(sessionId: String, detail: String) {
                     mainHandler.post {
                         if (generation != mediaGeneration) return@post
@@ -1050,6 +1110,7 @@ class ControllerCoordinator(context: Context) {
                             return@post
                         }
                         activeRemoteVideoStalled = true
+                        releaseRemoteInput()
                         activeSession = activeSession?.copy(
                             summary = "远端视频流疑似停滞，${stalledForMs}ms 未收到新帧（累计 ${frameCount} 帧）"
                         )
@@ -1102,6 +1163,9 @@ class ControllerCoordinator(context: Context) {
         mediaGeneration++
         webRtcSession?.close()
         webRtcSession = null
+        remoteInputReady=false
+        inputError=null
+        pointerX=0.5f; pointerY=0.5f
         mainHandler.removeCallbacks(audioMuteTimeout)
         remoteAudioReady = false
         computerAudioAvailable = false

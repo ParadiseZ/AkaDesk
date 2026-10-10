@@ -50,6 +50,12 @@ pub struct KeyInputCommand {
     pub timestamp_ms: TimestampMs,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TextInputCommand {
+    pub text: String,
+    pub timestamp_ms: TimestampMs,
+}
+
 pub trait InputCapabilityQueryPort {
     async fn get_input_capabilities(&self) -> HostResult<InputCapabilitySnapshot>;
 }
@@ -59,5 +65,6 @@ pub trait InputInjectionPort {
     async fn inject_pointer_event(&self, event: PointerInputCommand) -> HostResult<()>;
     async fn inject_scroll_event(&self, event: ScrollInputCommand) -> HostResult<()>;
     async fn inject_key_event(&self, event: KeyInputCommand) -> HostResult<()>;
+    async fn inject_text_event(&self, event: TextInputCommand) -> HostResult<()>;
     async fn release_input(&self, request: InputReleaseRequest) -> HostResult<()>;
 }

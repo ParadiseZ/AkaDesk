@@ -5,6 +5,8 @@ package akadesk.v1;
 option java_multiple_files = true;
 option java_package = "akadesk.v1";
 
+import "common.proto";
+
 enum PointerButton {
   POINTER_BUTTON_UNSPECIFIED = 0;
   POINTER_BUTTON_LEFT = 1;
@@ -52,5 +54,26 @@ message InputEvent {
     PointerEvent pointer = 2;
     ScrollEvent scroll = 3;
     KeyEvent key = 4;
+    TextInputEvent text = 5;
+    ReleaseInputEvent release = 6;
   }
+}
+
+// key_code uses Windows virtual-key codes, independent of Android key codes.
+// Scroll deltas count wheel detents: +Y scrolls up, +X scrolls right.
+message TextInputEvent {
+  uint64 seq = 1;
+  string text = 2;
+  int64 timestamp_ms = 3;
+}
+
+message ReleaseInputEvent {
+  uint64 seq = 1;
+  int64 timestamp_ms = 2;
+}
+
+message InputResult {
+  string session_id = 1;
+  uint64 seq = 2;
+  ErrorInfo error = 3;
 }

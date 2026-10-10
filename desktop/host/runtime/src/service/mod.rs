@@ -101,6 +101,7 @@ impl RuntimeService {
             transport_status: Arc::clone(&transport_status),
             pairing_attempts: Arc::new(Mutex::new(crate::auth::PairingAttemptLimiter::default())),
             audio_streams,
+            input: Arc::new(Mutex::new(crate::input::InputState::default())),
         };
         if let Ok(mut buffer) = diagnostics.lock() {
             buffer.push(
@@ -200,9 +201,9 @@ impl RuntimeService {
                     .capability_flags
                     .supports_display_control,
                 input: Some(InputCapabilitySnapshot {
-                    supports_pointer: false,
-                    supports_scroll: false,
-                    supports_keyboard: false,
+                    supports_pointer: cfg!(windows),
+                    supports_scroll: cfg!(windows),
+                    supports_keyboard: cfg!(windows),
                 }),
                 updated_at_ms: self.runtime_status_snapshot().updated_at_ms,
             }),

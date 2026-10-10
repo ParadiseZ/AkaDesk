@@ -56,6 +56,9 @@ class AndroidWebRtcSession(
         fun onRemoteVideoStalled(sessionId: String, stalledForMs: Long, frameCount: Int)
         fun onRemoteVideoFlowResumed(sessionId: String, width: Int, height: Int, frameCount: Int)
         fun onFailure(sessionId: String, message: String)
+        fun onInputStateChanged(sessionId: String, ready: Boolean) {}
+        fun onInputResult(sessionId: String, result: akadesk.v1.InputResult) {}
+        fun onInputError(sessionId: String) {}
     }
 
     private val eglBase: EglBase
@@ -68,6 +71,11 @@ class AndroidWebRtcSession(
     private val appliedRemoteCandidateKeys = mutableSetOf<String>()
     private val renderLock = Any()
     private val mainHandler = Handler(Looper.getMainLooper())
+    val input = RemoteInputChannel(sessionId,
+        onReady = { callbacks.onInputStateChanged(sessionId, it) },
+        onResult = { callbacks.onInputResult(sessionId, it) },
+        onError = { callbacks.onInputError(sessionId) },
+    )
 
     @Volatile
     private var closed = false
@@ -372,6 +380,7 @@ class AndroidWebRtcSession(
         if (closed) {
             return
         }
+        input.close()
         closed = true
         synchronized(candidateLock) {
             pendingRemoteCandidates.clear()
@@ -449,7 +458,9 @@ class AndroidWebRtcSession(
 
                 override fun onRemoveStream(stream: MediaStream?) = Unit
 
-                override fun onDataChannel(dataChannel: DataChannel?) = Unit
+                override fun onDataChannel(dataChannel: DataChannel?) {
+                    if (dataChannel != null) input.attach(dataChannel)
+                }
 
                 override fun onRenegotiationNeeded() {
                     callbacks.onStateChanged(sessionId, "远端请求重协商，当前 Android 侧暂未扩展该路径")

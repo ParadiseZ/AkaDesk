@@ -206,6 +206,7 @@ fn test_control_state(port: u16) -> ControlPlaneState {
         "0.1.0-test".to_string(),
     );
     ControlPlaneState {
+        input: Arc::new(Mutex::new(host_runtime::input::InputState::default())),
         audio_streams: Arc::new(Mutex::new(host_runtime::audio::AudioStreamState::new(
             &base_dir,
         ))),
