@@ -575,6 +575,7 @@ class AndroidWebRtcSession(
             }
 
             override fun onCreateFailure(error: String?) {
+                if (closed) return
                 if (action == "set remote offer") {
                     remoteOfferSetInFlight = false
                 }
@@ -582,6 +583,7 @@ class AndroidWebRtcSession(
             }
 
             override fun onSetFailure(error: String?) {
+                if (closed) return
                 if (action == "set remote offer") {
                     remoteOfferSetInFlight = false
                 }

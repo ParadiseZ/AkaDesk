@@ -9,6 +9,9 @@ import akadesk.v1.VideoCodec
 import akadesk.v1.WebRtcOffer
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import com.google.protobuf.InvalidProtocolBufferException
+import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -17,22 +20,36 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import java.util.concurrent.atomic.AtomicLong
 
-class HostControlSession(
+internal interface ControlSessionScheduler {
+    fun schedule(task: Runnable, delayMs: Long)
+    fun cancel(task: Runnable)
+}
+
+internal class AndroidControlSessionScheduler : ControlSessionScheduler {
+    private val handler = Handler(Looper.getMainLooper())
+    override fun schedule(task: Runnable, delayMs: Long) { handler.postDelayed(task, delayMs) }
+    override fun cancel(task: Runnable) { handler.removeCallbacks(task) }
+}
+
+internal class HostControlSession(
     private val host: ControlledHostSummary,
     private val controllerDeviceId: String,
     private val pairToken: String?,
     private val listener: Listener,
+    private val scheduler: ControlSessionScheduler = AndroidControlSessionScheduler(),
+    private val elapsedRealtimeMs: () -> Long = SystemClock::elapsedRealtime,
+    private val createWebSocket: (Request, WebSocketListener) -> WebSocket = sharedClient::newWebSocket,
 ) {
     companion object {
         private const val HEARTBEAT_INTERVAL_MS = 2_000L
         private const val HEARTBEAT_TIMEOUT_MS = 6_000L
+        private val sharedClient = OkHttpClient()
     }
 
     @Volatile
     private var closed = false
-    @Volatile
-    private var failureReported = false
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val lifecycleLock = Any()
+    private var started = false
 
     interface Listener {
         fun onAuthenticated(host: ControlledHostSummary)
@@ -50,63 +67,60 @@ class HostControlSession(
         fun onFailure(host: ControlledHostSummary, message: String)
     }
 
-    private val client = OkHttpClient()
     private val requestCounter = AtomicLong(0)
+    @Volatile
     private var socket: WebSocket? = null
     private var pendingChallengeId: String? = null
-    private var lastHeartbeatPongAtMs = 0L
+    private val lastHeartbeatPongAtMs = AtomicLong(0L)
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
             if (closed) {
                 return
             }
             val currentSocket = socket ?: return
-            val now = System.currentTimeMillis()
-            if (lastHeartbeatPongAtMs > 0L && now - lastHeartbeatPongAtMs >= HEARTBEAT_TIMEOUT_MS) {
+            val now = elapsedRealtimeMs()
+            if (now - lastHeartbeatPongAtMs.get() >= HEARTBEAT_TIMEOUT_MS) {
                 notifyFailure("Control heartbeat timeout")
-                currentSocket.cancel()
                 return
             }
-            currentSocket.send(
-                ByteString.of(
-                    *ControlProtoCodec
-                        .buildHeartbeatPing(nextRequestId(), now)
-                        .toByteArray()
-                )
-            )
-            mainHandler.postDelayed(this, HEARTBEAT_INTERVAL_MS)
+            send(ControlProtoCodec.buildHeartbeatPing(nextRequestId(), System.currentTimeMillis()), currentSocket)
+            if (!closed) scheduler.schedule(this, HEARTBEAT_INTERVAL_MS)
         }
     }
 
     fun connect() {
-        closed = false
-        failureReported = false
-        lastHeartbeatPongAtMs = System.currentTimeMillis()
-        val request = Request.Builder()
-            .url("ws://${host.hostAddress}:${host.controlPort}/")
-            .build()
-        socket = client.newWebSocket(request, object : WebSocketListener() {
+        synchronized(lifecycleLock) {
+            if (closed || started) return
+            started = true
+        }
+        val request = try {
+            Request.Builder()
+                .url(HttpUrl.Builder().scheme("http").host(host.hostAddress).port(host.controlPort).build())
+                .build()
+        } catch (_: IllegalArgumentException) {
+            notifyFailure("Invalid control endpoint")
+            return
+        }
+        val connected = createWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (closed) {
-                    webSocket.close(1000, "close")
+                    webSocket.cancel()
                     return
                 }
-                webSocket.send(
-                    ByteString.of(
-                        *ControlProtoCodec
-                            .buildControlHello(nextRequestId(), controllerDeviceId, pairToken)
-                            .toByteArray()
-                    )
-                )
-                mainHandler.removeCallbacks(heartbeatRunnable)
-                mainHandler.postDelayed(heartbeatRunnable, HEARTBEAT_INTERVAL_MS)
+                lastHeartbeatPongAtMs.set(elapsedRealtimeMs())
+                send(ControlProtoCodec.buildControlHello(nextRequestId(), controllerDeviceId, pairToken), webSocket)
+                if (!closed) scheduler.schedule(heartbeatRunnable, HEARTBEAT_INTERVAL_MS)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 if (closed) {
                     return
                 }
-                handleEnvelope(ControlProtoCodec.decodeEnvelope(bytes.toByteArray()))
+                try {
+                    handleEnvelope(ControlProtoCodec.decodeEnvelope(bytes.toByteArray()))
+                } catch (_: InvalidProtocolBufferException) {
+                    notifyFailure("Invalid control message")
+                }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -122,76 +136,44 @@ class HostControlSession(
                 }
                 notifyFailure(if (reason.isBlank()) "Control connection closed" else reason)
             }
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                webSocket.close(code, reason)
+                notifyFailure(if (reason.isBlank()) "Control connection closed" else reason)
+            }
         })
+        synchronized(lifecycleLock) {
+            if (closed) connected.cancel() else socket = connected
+        }
     }
 
     fun requestPairing(displayName: String) {
-        socket?.send(
-            ByteString.of(
-                *ControlProtoCodec
-                    .buildPairingRequest(nextRequestId(), controllerDeviceId, displayName)
-                    .toByteArray()
-            )
-        )
+        send(ControlProtoCodec.buildPairingRequest(nextRequestId(), controllerDeviceId, displayName))
     }
 
     fun confirmPairing(code: String) {
         val challengeId = pendingChallengeId ?: return
-        socket?.send(
-            ByteString.of(
-                *ControlProtoCodec
-                    .buildPairingConfirm(nextRequestId(), challengeId, code)
-                    .toByteArray()
-            )
-        )
+        send(ControlProtoCodec.buildPairingConfirm(nextRequestId(), challengeId, code))
     }
 
     fun close() {
-        closed = true
-        mainHandler.removeCallbacks(heartbeatRunnable)
-        socket?.close(1000, "close")
-        socket = null
-        client.dispatcher.executorService.shutdown()
+        terminate()
     }
 
     fun requestRemoteSession(requestedCodec: VideoCodec?) {
-        socket?.send(
-            ByteString.of(
-                *ControlProtoCodec
-                    .buildStartSessionRequest(nextRequestId(), controllerDeviceId, host.deviceId, requestedCodec)
-                    .toByteArray()
-            )
-        )
+        send(ControlProtoCodec.buildStartSessionRequest(nextRequestId(), controllerDeviceId, host.deviceId, requestedCodec))
     }
 
     fun requestStopSession(sessionId: String) {
-        socket?.send(
-            ByteString.of(
-                *ControlProtoCodec
-                    .buildStopSessionRequest(nextRequestId(), sessionId)
-                    .toByteArray()
-            )
-        )
+        send(ControlProtoCodec.buildStopSessionRequest(nextRequestId(), sessionId))
     }
 
     fun sendWebRtcAnswer(sessionId: String, sdp: String) {
-        socket?.send(
-            ByteString.of(
-                *ControlProtoCodec
-                    .buildWebRtcAnswer(nextRequestId(), sessionId, sdp)
-                    .toByteArray()
-            )
-        )
+        send(ControlProtoCodec.buildWebRtcAnswer(nextRequestId(), sessionId, sdp))
     }
 
     fun sendIceCandidate(sessionId: String, candidate: String, sdpMid: String, sdpMlineIndex: Int) {
-        socket?.send(
-            ByteString.of(
-                *ControlProtoCodec
-                    .buildIceCandidate(nextRequestId(), sessionId, candidate, sdpMid, sdpMlineIndex)
-                    .toByteArray()
-            )
-        )
+        send(ControlProtoCodec.buildIceCandidate(nextRequestId(), sessionId, candidate, sdpMid, sdpMlineIndex))
     }
 
     private fun handleEnvelope(envelope: ControlEnvelope) {
@@ -200,13 +182,7 @@ class HostControlSession(
                 val ack = ControlProtoCodec.decodeControlHelloAck(envelope)
                 if (ack.accepted) {
                     listener.onAuthenticated(host)
-                    socket?.send(
-                        ByteString.of(
-                            *ControlProtoCodec
-                                .buildGetDeviceSnapshot(nextRequestId())
-                                .toByteArray()
-                        )
-                    )
+                    send(ControlProtoCodec.buildGetDeviceSnapshot(nextRequestId()))
                 } else {
                     val message = if (ack.hasError()) ack.error.message else "Pairing required"
                     val errorCode = if (ack.hasError()) ack.error.code else ""
@@ -227,16 +203,10 @@ class HostControlSession(
                 if (result.accepted) {
                     listener.onPairingSucceeded(host, result.pairToken)
                     listener.onAuthenticated(host)
-                    socket?.send(
-                        ByteString.of(
-                            *ControlProtoCodec
-                                .buildGetDeviceSnapshot(nextRequestId())
-                                .toByteArray()
-                        )
-                    )
+                    send(ControlProtoCodec.buildGetDeviceSnapshot(nextRequestId()))
                 } else {
                     val message = if (result.hasError()) result.error.message else "Pairing failed"
-                    listener.onFailure(host, message)
+                    notifyFailure(message)
                 }
             }
             "DeviceSnapshotResponse" -> {
@@ -245,12 +215,12 @@ class HostControlSession(
                     listener.onDeviceSnapshotLoaded(host)
                 } else {
                     val message = if (response.hasError()) response.error.message else "Snapshot unavailable"
-                    listener.onFailure(host, message)
+                    notifyFailure(message)
                 }
             }
             "HeartbeatPong" -> {
                 ControlProtoCodec.decodeHeartbeatPong(envelope)
-                lastHeartbeatPongAtMs = System.currentTimeMillis()
+                lastHeartbeatPongAtMs.set(elapsedRealtimeMs())
             }
             "StartSessionAccepted" -> {
                 val accepted = ControlProtoCodec.decodeStartSessionAccepted(envelope)
@@ -260,12 +230,12 @@ class HostControlSession(
             "StartSessionRejected" -> {
                 val rejected = ControlProtoCodec.decodeStartSessionRejected(envelope)
                 val message = if (rejected.hasError()) rejected.error.message else "Session rejected"
-                listener.onFailure(host, message)
+                notifyFailure(message)
             }
             "SessionChangedEvent" -> {
                 val changed = ControlProtoCodec.decodeSessionChangedEvent(envelope)
                 if (!changed.hasSnapshot()) {
-                    listener.onFailure(host, "SessionChangedEvent missing snapshot")
+                    notifyFailure("SessionChangedEvent missing snapshot")
                     return
                 }
                 val snapshot = changed.snapshot
@@ -318,12 +288,23 @@ class HostControlSession(
     private fun nextRequestId(): String = "android-${requestCounter.incrementAndGet()}"
 
     private fun notifyFailure(message: String) {
-        if (closed || failureReported) {
-            return
+        if (terminate()) listener.onFailure(host, message)
+    }
+
+    private fun send(envelope: ControlEnvelope, target: WebSocket? = socket) {
+        if (!closed && target != null && !target.send(ByteString.of(*envelope.toByteArray()))) {
+            notifyFailure("Control send failed")
         }
-        failureReported = true
-        mainHandler.removeCallbacks(heartbeatRunnable)
-        socket = null
-        listener.onFailure(host, message)
+    }
+
+    private fun terminate(): Boolean {
+        val currentSocket = synchronized(lifecycleLock) {
+            if (closed) return false
+            closed = true
+            socket.also { socket = null }
+        }
+        scheduler.cancel(heartbeatRunnable)
+        currentSocket?.cancel()
+        return true
     }
 }

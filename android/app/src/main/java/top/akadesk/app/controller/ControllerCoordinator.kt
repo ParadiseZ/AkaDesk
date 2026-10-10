@@ -42,6 +42,7 @@ class ControllerCoordinator(context: Context) {
     private var discoveryClient: HostDiscoveryClient? = null
     private var controlSession: HostControlSession? = null
     private var webRtcSession: AndroidWebRtcSession? = null
+    private var mediaGeneration = 0L
     private var activeVideoRenderer: SurfaceViewRenderer? = null
     private var pendingSessionTarget: ControlledHostSummary? = null
     private var pendingConnectMode: ControllerConnectMode? = null
@@ -55,9 +56,42 @@ class ControllerCoordinator(context: Context) {
     private var pendingRecoveredSessionHost: ControlledHostSummary? = null
     private var pendingLocalAnswer: PendingLocalAnswer? = null
     private val pendingLocalIceCandidates = linkedSetOf<PendingLocalIceCandidate>()
+    private val operationTimeouts = RemoteSessionTimeouts(
+        scheduler = AndroidControlSessionScheduler(),
+        onRecoveryTimeout = recovery@ {
+            val host = pendingControlReconnectHost ?: return@recovery
+            handlePreservedSessionRecoveryFailure(host, "连接恢复超时，请重新连接", "控制通道未在 30 秒内恢复")
+        },
+        onStopTimeout = stopping@ {
+            if (pendingStopSessionId != activeSession?.sessionId || pendingStopSessionId == null) return@stopping
+            clearPendingControlReconnect()
+            closeControlSession()
+            closeWebRtcSession()
+            activeSession = null
+            disconnectNotice = ControllerDisconnectNotice(
+                title = "已停止查看",
+                message = "电脑未确认断开，已退出当前画面",
+                detail = "可在电脑上确认屏幕共享是否已停止。",
+            )
+            logWarn("Stop-session confirmation deadline reached")
+        },
+        onStopRetry = retry@ {
+            val sessionId = pendingStopSessionId ?: return@retry
+            val host = activeSession?.host ?: return@retry
+            if (activeSession?.sessionId != sessionId) return@retry
+            closeControlSession()
+            scheduleControlReconnect(host)
+            activeSession = activeSession?.copy(summary = "正在重新连接并确认断开")
+            logWarn("Stop-session confirmation timed out; reconnecting session=$sessionId")
+        },
+    )
     private val controlReconnectRunnable = Runnable {
         controlReconnectScheduled = false
-        val host = pendingControlReconnectHost ?: return@Runnable
+        val previousHost = pendingControlReconnectHost ?: return@Runnable
+        val host = hosts.firstOrNull {
+            it.deviceId == previousHost.deviceId && it.reachable && it.hostAddress.isNotBlank()
+        } ?: previousHost
+        pendingControlReconnectHost = host
         if (!shouldKeepActiveMediaSession(host)) {
             clearPendingControlReconnect()
             return@Runnable
@@ -73,35 +107,11 @@ class ControllerCoordinator(context: Context) {
             return@Runnable
         }
         clearPendingSessionRecoveryValidation()
-        if (pendingStopSessionId == sessionId) {
-            if (controlSession != null) {
-                controlSession?.close()
-                controlSession = null
-                scheduleControlReconnect(host)
-                activeSession = activeSession?.copy(
-                    summary = "断开请求超时，正在重连控制通道后重试",
-                )
-                logWarn("Stop-session request timed out; reconnecting control channel for ${host.displayName} session=$sessionId")
-            } else {
-                clearPendingControlReconnect()
-                controlSession?.close()
-                controlSession = null
-                closeWebRtcSession()
-                activeSession = null
-                disconnectNotice = ControllerDisconnectNotice(
-                    title = "远程控制已断开",
-                    message = "当前会话已经结束",
-                    detail = "控制通道恢复后未找到可断开的活动会话",
-                )
-                logWarn("Stop-session recovery timed out without active session for ${host.displayName} session=$sessionId")
-            }
-        } else {
-            handlePreservedSessionRecoveryFailure(
-                host,
-                "会话已失效",
-                "控制通道恢复后未找到可恢复的活动会话",
-            )
-        }
+        handlePreservedSessionRecoveryFailure(
+            host,
+            "会话已失效",
+            "控制通道恢复后未找到可恢复的活动会话",
+        )
     }
 
     val hosts = androidx.compose.runtime.mutableStateListOf<ControlledHostSummary>()
@@ -175,11 +185,11 @@ class ControllerCoordinator(context: Context) {
     private var controlGeneration = 0L
 
     fun stopDiscovery() {
-        controlGeneration++
         discoveryClient?.stop()
         clearPendingControlReconnect()
-        controlSession?.close()
+        closeControlSession()
         closeWebRtcSession()
+        activeSession = null
     }
 
     fun openHostActions(host: ControlledHostSummary) {
@@ -189,6 +199,9 @@ class ControllerCoordinator(context: Context) {
     }
 
     fun dismissSheets() {
+        if (pendingSessionTarget != null && (verificationTarget != null || waitingApprovalTarget != null)) {
+            cancelWaitingApprovalSheet()
+        }
         selectedHostForActions = null
         verificationTarget = null
         waitingApprovalTarget = null
@@ -212,8 +225,7 @@ class ControllerCoordinator(context: Context) {
     fun cancelWaitingApprovalSheet() {
         waitingApprovalTarget = null
         clearPendingControlReconnect()
-        controlSession?.close()
-        controlSession = null
+        closeControlSession()
         closeWebRtcSession()
         activeSession = null
         pendingSessionTarget = null
@@ -322,11 +334,13 @@ class ControllerCoordinator(context: Context) {
         val sessionId = activeSession?.sessionId
         val currentControlSession = controlSession
         if (!sessionId.isNullOrBlank()) {
+            if (pendingStopSessionId == sessionId) return
             pendingStopSessionId = sessionId
+            clearPendingSessionRecoveryValidation()
+            operationTimeouts.beginStop()
             if (currentControlSession != null) {
-                clearPendingControlReconnect()
                 currentControlSession.requestStopSession(sessionId)
-                activeSession?.host?.let { schedulePendingSessionRecoveryValidation(it, sessionId) }
+                scheduleStopSessionRetry()
             } else {
                 activeSession?.host?.let(::scheduleControlReconnect)
             }
@@ -338,8 +352,7 @@ class ControllerCoordinator(context: Context) {
             return
         }
         clearPendingControlReconnect()
-        controlSession?.close()
-        controlSession = null
+        closeControlSession()
         closeWebRtcSession()
         activeSession = null
         pendingSessionTarget = null
@@ -393,7 +406,7 @@ class ControllerCoordinator(context: Context) {
                 override fun onAuthenticated(host: ControlledHostSummary) {
                     mainHandler.post {
                         if (generation != controlGeneration) return@post
-                        clearPendingControlReconnect()
+                        clearScheduledControlReconnect()
                         val authenticated = host.copy(authState = HostAuthState.Authenticated)
                         pairingStore.refreshPairRecord(
                             deviceId = host.deviceId,
@@ -417,11 +430,12 @@ class ControllerCoordinator(context: Context) {
                                     },
                                 )
                             }
-                            activeSession?.sessionId?.let { schedulePendingSessionRecoveryValidation(host, it) }
                             if (pendingStopSessionId == activeSession?.sessionId) {
                                 controlSession?.requestStopSession(pendingStopSessionId!!)
+                                scheduleStopSessionRetry()
                                 logInfo("Re-sent stop session request after control reconnect session=$pendingStopSessionId")
                             } else {
+                                activeSession?.sessionId?.let { schedulePendingSessionRecoveryValidation(host, it) }
                                 resendActiveLocalSignaling()
                             }
                         } else if (shouldAutoStartSessionAfterAuth && pendingSessionTarget?.deviceId == host.deviceId) {
@@ -519,6 +533,10 @@ class ControllerCoordinator(context: Context) {
                 override fun onSessionAccepted(host: ControlledHostSummary, sessionId: String, stateLabel: String) {
                     mainHandler.post {
                         if (generation != controlGeneration) return@post
+                        if (pendingStopSessionId != null) return@post
+                        val currentSessionId = activeSession?.sessionId
+                        if (!currentSessionId.isNullOrBlank() &&
+                            (currentSessionId != sessionId || webRtcSession != null)) return@post
                         closeWebRtcSession()
                         selectedHostForActions = null
                         verificationTarget = null
@@ -554,6 +572,7 @@ class ControllerCoordinator(context: Context) {
                         if (isTerminalSessionState(stateLabel)) {
                             if (activeSession?.sessionId != sessionId && pendingStopSessionId != sessionId) return@post
                             clearPendingControlReconnect()
+                            closeControlSession()
                             closeWebRtcSession()
                             activeSession = null
                             waitingApprovalTarget = null
@@ -569,6 +588,11 @@ class ControllerCoordinator(context: Context) {
                             logWarn("Session ended $sessionId state=$stateLabel summary=$summary")
                             return@post
                         }
+                        val currentSessionId = activeSession?.sessionId
+                        if (!currentSessionId.isNullOrBlank() && currentSessionId != sessionId) {
+                            logWarn("Ignoring state for stale session=$sessionId, active=$currentSessionId")
+                            return@post
+                        }
                         if (activeSession?.sessionId != sessionId) {
                             closeWebRtcSession()
                             activeHostVideoStatus = null
@@ -577,12 +601,12 @@ class ControllerCoordinator(context: Context) {
                             activeHostTransportStalled = false
                         }
                         if (activeSession?.sessionId == sessionId) {
-                            clearPendingSessionRecoveryValidation()
+                            confirmActiveSessionRecovery(sessionId)
                         }
                         activeSession = ActiveRemoteSession(
                             host = host,
                             sessionId = sessionId,
-                            stateLabel = stateLabel,
+                            stateLabel = if (pendingStopSessionId == sessionId) "DISCONNECTING" else stateLabel,
                             summary = summary,
                             startedAtMs = activeSession?.startedAtMs ?: System.currentTimeMillis(),
                         )
@@ -602,7 +626,8 @@ class ControllerCoordinator(context: Context) {
                             logWarn("Ignoring WebRTC offer for stale session=${offer.sessionId}, active=$activeSessionId")
                             return@post
                         }
-                        clearPendingSessionRecoveryValidation()
+                        if (pendingStopSessionId == offer.sessionId) return@post
+                        confirmActiveSessionRecovery(offer.sessionId)
                         val session = ensureWebRtcSession(host, offer.sessionId)
                         session.applyRemoteOffer(offer)
                         logInfo("Received WebRTC offer for ${host.displayName} session=${offer.sessionId} sdpLen=${offer.sdp.length}")
@@ -624,7 +649,8 @@ class ControllerCoordinator(context: Context) {
                             logWarn("Ignoring remote ICE candidate for stale session=${candidate.sessionId}, active=$activeSessionId")
                             return@post
                         }
-                        clearPendingSessionRecoveryValidation()
+                        if (pendingStopSessionId == candidate.sessionId) return@post
+                        confirmActiveSessionRecovery(candidate.sessionId)
                         val session = ensureWebRtcSession(host, candidate.sessionId)
                         session.addRemoteIceCandidate(candidate)
                         logInfo("Received remote ICE candidate for ${host.displayName} session=${candidate.sessionId}")
@@ -637,7 +663,7 @@ class ControllerCoordinator(context: Context) {
                         if (activeSession?.sessionId != event.sessionId) {
                             return@post
                         }
-                        clearPendingSessionRecoveryValidation()
+                        confirmActiveSessionRecovery(event.sessionId)
                         val hostStalled = event.latestError.isNotBlank() ||
                             (System.currentTimeMillis() - event.updatedAtMs) >= 2_500L
                         activeHostVideoStalled = hostStalled
@@ -660,7 +686,7 @@ class ControllerCoordinator(context: Context) {
                         if (activeSession?.sessionId != event.sessionId) {
                             return@post
                         }
-                        clearPendingSessionRecoveryValidation()
+                        confirmActiveSessionRecovery(event.sessionId)
                         val transportStalled = event.latestError.isNotBlank() ||
                             event.peerConnectionState.equals("Failed", ignoreCase = true) ||
                             event.peerConnectionState.equals("Disconnected", ignoreCase = true) ||
@@ -687,8 +713,7 @@ class ControllerCoordinator(context: Context) {
                         }
                         clearPendingSessionRecoveryValidation()
                         clearPendingControlReconnect()
-                        controlSession?.close()
-                        controlSession = null
+                        closeControlSession()
                         closeWebRtcSession()
                         pendingStopSessionId = null
                         activeSession = null
@@ -705,7 +730,9 @@ class ControllerCoordinator(context: Context) {
                     mainHandler.post {
                         if (generation != controlGeneration) return@post
                         val keepActiveVideoSession = shouldKeepActiveMediaSession(host)
-                        controlSession = null
+                        clearPendingSessionRecoveryValidation()
+                        operationTimeouts.cancelStopRetry()
+                        closeControlSession()
                         waitingApprovalTarget = null
                         pendingSessionTarget = null
                         pendingConnectMode = null
@@ -875,12 +902,14 @@ class ControllerCoordinator(context: Context) {
             return current
         }
         closeWebRtcSession()
+        val generation = mediaGeneration
         return AndroidWebRtcSession(
             appContext = appContext,
             sessionId = sessionId,
             callbacks = object : AndroidWebRtcSession.Callbacks {
                 override fun onStateChanged(sessionId: String, detail: String) {
                     mainHandler.post {
+                        if (generation != mediaGeneration) return@post
                         if (activeSession?.sessionId == sessionId) {
                             activeSession = activeSession?.copy(summary = detail)
                         }
@@ -890,6 +919,7 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onLocalAnswer(sessionId: String, sdp: String) {
                     mainHandler.post {
+                        if (generation != mediaGeneration) return@post
                         if (activeSession?.sessionId != sessionId) return@post
                         pendingLocalAnswer = PendingLocalAnswer(sessionId, sdp)
                         controlSession?.sendWebRtcAnswer(sessionId, sdp)
@@ -905,6 +935,7 @@ class ControllerCoordinator(context: Context) {
                     sdpMlineIndex: Int,
                 ) {
                     mainHandler.post {
+                        if (generation != mediaGeneration) return@post
                         if (activeSession?.sessionId != sessionId) return@post
                         pendingLocalIceCandidates += PendingLocalIceCandidate(
                             sessionId = sessionId,
@@ -923,6 +954,7 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onRemoteVideoTrack(sessionId: String) {
                     mainHandler.post {
+                        if (generation != mediaGeneration) return@post
                         if (activeSession?.sessionId != sessionId) {
                             return@post
                         }
@@ -935,6 +967,7 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onRemoteVideoFirstFrame(sessionId: String, width: Int, height: Int) {
                     mainHandler.post {
+                        if (generation != mediaGeneration) return@post
                         if (activeSession?.sessionId != sessionId) {
                             return@post
                         }
@@ -950,6 +983,7 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onRemoteVideoStalled(sessionId: String, stalledForMs: Long, frameCount: Int) {
                     mainHandler.post {
+                        if (generation != mediaGeneration) return@post
                         if (activeSession?.sessionId != sessionId) {
                             return@post
                         }
@@ -963,6 +997,7 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onRemoteVideoFlowResumed(sessionId: String, width: Int, height: Int, frameCount: Int) {
                     mainHandler.post {
+                        if (generation != mediaGeneration) return@post
                         if (activeSession?.sessionId != sessionId) {
                             return@post
                         }
@@ -978,11 +1013,13 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onFailure(sessionId: String, message: String) {
                     mainHandler.post {
+                        if (generation != mediaGeneration) return@post
                         if (activeSession?.sessionId != sessionId) {
                             return@post
                         }
-                        closeWebRtcSession()
-                        activeSession = activeSession?.copy(summary = "Android WebRTC 失败: $message")
+                        closeWebRtcSession(retainPendingStop = true)
+                        activeSession = activeSession?.copy(summary = "画面连接失败，正在结束查看")
+                        endRemoteSession()
                         logError("Android WebRTC failure session=$sessionId message=$message")
                     }
                 }
@@ -999,11 +1036,15 @@ class ControllerCoordinator(context: Context) {
         }
     }
 
-    private fun closeWebRtcSession() {
+    private fun closeWebRtcSession(retainPendingStop: Boolean = false) {
+        mediaGeneration++
         webRtcSession?.close()
         webRtcSession = null
         clearPendingSessionRecoveryValidation()
-        pendingStopSessionId = null
+        if (!retainPendingStop) {
+            pendingStopSessionId = null
+            operationTimeouts.finishStop()
+        }
         pendingLocalAnswer = null
         pendingLocalIceCandidates.clear()
         activeRemoteVideoReady = false
@@ -1041,7 +1082,7 @@ class ControllerCoordinator(context: Context) {
     private fun shouldKeepActiveMediaSession(host: ControlledHostSummary): Boolean {
         return activeSession?.host?.deviceId == host.deviceId &&
             !activeSession?.sessionId.isNullOrBlank() &&
-            webRtcSession != null
+            (webRtcSession != null || pendingStopSessionId == activeSession?.sessionId)
     }
 
     private fun handlePreservedSessionRecoveryFailure(
@@ -1051,8 +1092,7 @@ class ControllerCoordinator(context: Context) {
     ) {
         clearPendingControlReconnect()
         clearPendingSessionRecoveryValidation()
-        controlSession?.close()
-        controlSession = null
+        closeControlSession()
         closeWebRtcSession()
         activeSession = null
         upsertHost(host.copy(authState = HostAuthState.PairingRequired))
@@ -1065,6 +1105,7 @@ class ControllerCoordinator(context: Context) {
     }
 
     private fun scheduleControlReconnect(host: ControlledHostSummary) {
+        operationTimeouts.beginRecovery()
         pendingControlReconnectHost = host
         if (controlReconnectScheduled) {
             return
@@ -1091,6 +1132,7 @@ class ControllerCoordinator(context: Context) {
 
     private fun clearPendingControlReconnect() {
         clearScheduledControlReconnect()
+        operationTimeouts.finishRecovery()
         pendingControlReconnectHost = null
         controlReconnectAttempt = 0
     }
@@ -1106,6 +1148,22 @@ class ControllerCoordinator(context: Context) {
         pendingRecoveredSessionId = null
         pendingRecoveredSessionHost = null
         mainHandler.removeCallbacks(sessionRecoveryTimeoutRunnable)
+    }
+
+    private fun confirmActiveSessionRecovery(sessionId: String) {
+        if (pendingRecoveredSessionId != sessionId) return
+        clearPendingSessionRecoveryValidation()
+        clearPendingControlReconnect()
+    }
+
+    private fun scheduleStopSessionRetry() {
+        operationTimeouts.awaitStopConfirmation()
+    }
+
+    private fun closeControlSession() {
+        controlGeneration++
+        controlSession?.close()
+        controlSession = null
     }
 
     private fun isTerminalSessionState(stateLabel: String): Boolean {
