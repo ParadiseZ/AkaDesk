@@ -1,26 +1,27 @@
 use crate::approval::{
-    PendingRemoteRequestSnapshot as RuntimePendingRemoteRequestSnapshot,
-    PendingRemoteRequestStore, SharedPendingRemoteRequestStore,
+    PendingRemoteRequestSnapshot as RuntimePendingRemoteRequestSnapshot, PendingRemoteRequestStore,
+    SharedPendingRemoteRequestStore,
 };
 use crate::control::{
     default_capability_flags, default_host_identity, ControlPlaneState, DEFAULT_CONTROL_PORT,
 };
 use crate::diagnostics::{DiagnosticBuffer, SharedDiagnosticBuffer};
+use crate::events::{SharedStateSignal, StateSignal};
 use crate::generated::v1::DevicePresence;
+use crate::generated::v1::SessionState;
 use crate::pairing::{load_runtime_base_dir, HostIdentity, PairingStore, SharedPairingStore};
 use crate::session::{SessionRegistry, SharedSessionRegistry};
-use crate::signaling::{SharedSignalingState, SignalingState};
 use crate::settings::HostSettingsStore;
-use crate::state::RuntimeStatus;
+use crate::signaling::{SharedSignalingState, SignalingState};
 use crate::transport::{SharedTransportStatusState, TransportStatusState};
 use crate::video::{SharedVideoStreamState, VideoStreamState};
 use host_ipc::types::{
     CapabilitySnapshot, CapabilitySnapshotChanged, DiagnosticsChanged, DiagnosticsResponse,
-    RefreshTemporaryVerificationCodeResponse, RespondPendingRemoteRequestResponse,
     HostIdentitySnapshot, HostOverviewChanged, HostOverviewResponse, HostOverviewSnapshot,
     HostSettingsSnapshot, InputCapabilitySnapshot,
-    PendingRemoteRequestSnapshot as IpcPendingRemoteRequestSnapshot, RuntimeStatusChanged,
-    RuntimeStatusResponse, RuntimeStatusSnapshot, UpdateHostSettingsResponse,
+    PendingRemoteRequestSnapshot as IpcPendingRemoteRequestSnapshot,
+    RefreshTemporaryVerificationCodeResponse, RespondPendingRemoteRequestResponse,
+    RuntimeStatusChanged, RuntimeStatusResponse, RuntimeStatusSnapshot, UpdateHostSettingsResponse,
     VideoStreamSnapshot as IpcVideoStreamSnapshot,
 };
 use std::io;
@@ -29,28 +30,39 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug)]
 pub struct RuntimeService {
     host_identity: HostIdentity,
-    status: RuntimeStatus,
     sessions: SharedSessionRegistry,
     control_state: ControlPlaneState,
     settings: Arc<Mutex<HostSettingsStore>>,
     pending_remote_requests: SharedPendingRemoteRequestStore,
     video_streams: SharedVideoStreamState,
-    signaling: SharedSignalingState,
-    transport_status: SharedTransportStatusState,
     diagnostics: SharedDiagnosticBuffer,
+    state_signal: SharedStateSignal,
 }
 
 impl RuntimeService {
     pub fn new() -> io::Result<Self> {
         let base_dir = load_runtime_base_dir();
-        let host_identity = HostIdentity::load_or_create(&base_dir)?;
-        let settings = Arc::new(Mutex::new(HostSettingsStore::load(&base_dir)?));
-        let diagnostics: SharedDiagnosticBuffer = Arc::new(Mutex::new(DiagnosticBuffer::default()));
+        Self::new_in(&base_dir)
+    }
+
+    pub fn new_in(base_dir: &std::path::Path) -> io::Result<Self> {
+        let host_identity = HostIdentity::load_or_create(base_dir)?;
+        let state_signal: SharedStateSignal = Arc::new(StateSignal::default());
+        let mut settings_store = HostSettingsStore::load(&base_dir)?;
+        settings_store.set_signal(Arc::clone(&state_signal));
+        let settings = Arc::new(Mutex::new(settings_store));
+        let mut diagnostics_buffer = DiagnosticBuffer::default();
+        diagnostics_buffer.set_signal(Arc::clone(&state_signal));
+        let diagnostics: SharedDiagnosticBuffer = Arc::new(Mutex::new(diagnostics_buffer));
         let pairing_store: SharedPairingStore =
             Arc::new(Mutex::new(PairingStore::load(&base_dir)?));
-        let sessions: SharedSessionRegistry = Arc::new(Mutex::new(SessionRegistry::default()));
+        let mut session_registry = SessionRegistry::default();
+        session_registry.set_signal(Arc::clone(&state_signal));
+        let sessions: SharedSessionRegistry = Arc::new(Mutex::new(session_registry));
+        let mut pending_request_store = PendingRemoteRequestStore::default();
+        pending_request_store.set_signal(Arc::clone(&state_signal));
         let pending_remote_requests: SharedPendingRemoteRequestStore =
-            Arc::new(Mutex::new(PendingRemoteRequestStore::default()));
+            Arc::new(Mutex::new(pending_request_store));
         let video_streams: SharedVideoStreamState =
             Arc::new(Mutex::new(VideoStreamState::default()));
         let signaling: SharedSignalingState = Arc::new(Mutex::new(SignalingState::default()));
@@ -80,6 +92,7 @@ impl RuntimeService {
             video_streams: Arc::clone(&video_streams),
             signaling: Arc::clone(&signaling),
             transport_status: Arc::clone(&transport_status),
+            pairing_attempts: Arc::new(Mutex::new(crate::auth::PairingAttemptLimiter::default())),
         };
         if let Ok(mut buffer) = diagnostics.lock() {
             buffer.push(
@@ -93,20 +106,42 @@ impl RuntimeService {
         }
         Ok(Self {
             host_identity,
-            status: RuntimeStatus::default(),
             sessions,
             control_state,
             settings,
             pending_remote_requests,
             video_streams,
-            signaling,
-            transport_status,
             diagnostics,
+            state_signal,
         })
     }
 
-    pub fn status(&self) -> &RuntimeStatus {
-        &self.status
+    pub fn state_events(&self) -> &SharedStateSignal {
+        &self.state_signal
+    }
+
+    pub fn stop_session(
+        &self,
+        session_id: &str,
+    ) -> io::Result<host_ipc::types::StopSessionResponse> {
+        let stopped = self
+            .sessions
+            .lock()
+            .map_err(lock_err)?
+            .mark_disconnected(session_id)
+            .is_some();
+        if stopped {
+            self.reap_finished_session()?;
+        }
+        Ok(host_ipc::types::StopSessionResponse {
+            session_id: session_id.to_owned(),
+            stopped,
+            error: None,
+        })
+    }
+
+    pub fn reap_finished_session(&self) -> io::Result<()> {
+        crate::control::reap_finished_session(&self.control_state)
     }
 
     pub fn sessions(&self) -> &SharedSessionRegistry {
@@ -136,31 +171,8 @@ impl RuntimeService {
     }
 
     pub fn ipc_runtime_status_changed(&self) -> RuntimeStatusChanged {
-        let (active_session_id, updated_at_ms) = match self.sessions.lock() {
-            Ok(sessions) => (
-                sessions
-                    .active_session_id()
-                    .map(|session_id| session_id.0.clone()),
-                sessions
-                    .active
-                    .as_ref()
-                    .map(|session| session.updated_at_ms)
-                    .unwrap_or(self.status.updated_at_ms),
-            ),
-            Err(_) => (
-                self.status
-                    .active_session_id
-                    .as_ref()
-                    .map(|session_id| session_id.0.clone()),
-                self.status.updated_at_ms,
-            ),
-        };
         RuntimeStatusChanged {
-            status: Some(RuntimeStatusSnapshot {
-                state_label: self.status.state_label.to_string(),
-                active_session_id,
-                updated_at_ms,
-            }),
+            status: Some(self.runtime_status_snapshot()),
         }
     }
 
@@ -174,11 +186,11 @@ impl RuntimeService {
                     .capability_flags
                     .supports_display_control,
                 input: Some(InputCapabilitySnapshot {
-                    supports_pointer: true,
-                    supports_scroll: true,
-                    supports_keyboard: true,
+                    supports_pointer: false,
+                    supports_scroll: false,
+                    supports_keyboard: false,
                 }),
-                updated_at_ms: self.status.updated_at_ms,
+                updated_at_ms: self.runtime_status_snapshot().updated_at_ms,
             }),
         }
     }
@@ -201,6 +213,17 @@ impl RuntimeService {
         settings: HostSettingsSnapshot,
     ) -> io::Result<UpdateHostSettingsResponse> {
         let updated_settings = self.settings.lock().map_err(lock_err)?.update(settings)?;
+        if !updated_settings.allow_remote_assistance {
+            let session_id = self
+                .sessions
+                .lock()
+                .map_err(lock_err)?
+                .active_session_id()
+                .map(|id| id.0.clone());
+            if let Some(session_id) = session_id {
+                self.stop_session(&session_id)?;
+            }
+        }
         if let Ok(mut buffer) = self.diagnostics.lock() {
             buffer.push(
                 "info",
@@ -220,7 +243,7 @@ impl RuntimeService {
     pub fn refresh_temporary_verification_code(
         &self,
     ) -> io::Result<RefreshTemporaryVerificationCodeResponse> {
-        let updated_settings = self
+        let _updated_settings = self
             .settings
             .lock()
             .map_err(lock_err)?
@@ -229,10 +252,7 @@ impl RuntimeService {
             buffer.push(
                 "info",
                 "HOST_TEMP_CODE_REFRESHED",
-                format!(
-                    "Temporary verification code refreshed to {}.",
-                    updated_settings.temporary_verification_code
-                ),
+                "Temporary verification code refreshed.",
             );
         }
         Ok(RefreshTemporaryVerificationCodeResponse {
@@ -243,13 +263,20 @@ impl RuntimeService {
 
     pub fn respond_pending_remote_request(
         &self,
+        request_id: &str,
         allow: bool,
     ) -> io::Result<RespondPendingRemoteRequestResponse> {
         let handled = self
             .pending_remote_requests
             .lock()
             .map_err(lock_err)?
-            .respond(allow);
+            .respond(request_id, allow);
+        if !handled {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "该远控请求已结束，请确认当前请求",
+            ));
+        }
         if let Ok(mut buffer) = self.diagnostics.lock() {
             if handled {
                 buffer.push(
@@ -310,11 +337,20 @@ impl RuntimeService {
             .ok()
             .map(|store| store.count() as u32)
             .unwrap_or_default();
-        let active_controller_display_name = self.sessions.lock().ok().and_then(|sessions| {
+        let active_controller_id = self.sessions.lock().ok().and_then(|sessions| {
             sessions
                 .active
                 .as_ref()
+                .filter(|session| session.closed_at_ms == 0)
                 .map(|session| session.controller_device_id.clone())
+        });
+        let active_controller_display_name = active_controller_id.map(|id| {
+            self.control_state
+                .pairing_store
+                .lock()
+                .ok()
+                .and_then(|store| store.controller_display_name(&id))
+                .unwrap_or(id)
         });
         Some(HostOverviewSnapshot {
             identity: Some(HostIdentitySnapshot {
@@ -342,6 +378,34 @@ impl RuntimeService {
     }
 }
 
+impl RuntimeService {
+    fn runtime_status_snapshot(&self) -> RuntimeStatusSnapshot {
+        let now = crate::pairing::now_ms();
+        let Ok(sessions) = self.sessions.lock() else {
+            return RuntimeStatusSnapshot {
+                state_label: "READY".to_string(),
+                active_session_id: None,
+                updated_at_ms: now,
+                active_started_at_ms: 0,
+            };
+        };
+        let Some(session) = sessions.active.as_ref() else {
+            return RuntimeStatusSnapshot {
+                state_label: "READY".to_string(),
+                active_session_id: None,
+                updated_at_ms: now,
+                active_started_at_ms: 0,
+            };
+        };
+        RuntimeStatusSnapshot {
+            state_label: runtime_state_label_for_session_state(session.state).to_string(),
+            active_session_id: Some(session.session_id.0.clone()),
+            updated_at_ms: session.updated_at_ms,
+            active_started_at_ms: session.created_at_ms,
+        }
+    }
+}
+
 impl Default for RuntimeService {
     fn default() -> Self {
         Self::new().expect("failed to initialize runtime service")
@@ -350,6 +414,21 @@ impl Default for RuntimeService {
 
 fn lock_err<T>(_: std::sync::PoisonError<T>) -> io::Error {
     io::Error::new(io::ErrorKind::Other, "runtime state lock poisoned")
+}
+
+fn runtime_state_label_for_session_state(state: i32) -> &'static str {
+    match state {
+        x if x == SessionState::Negotiating as i32
+            || x == SessionState::Preparing as i32
+            || x == SessionState::Connecting as i32 =>
+        {
+            "SESSION_PREPARING"
+        }
+        x if x == SessionState::Streaming as i32 => "STREAMING",
+        x if x == SessionState::Disconnecting as i32 => "STOPPING",
+        x if x == SessionState::Failed as i32 => "ERROR",
+        _ => "READY",
+    }
 }
 
 impl From<RuntimePendingRemoteRequestSnapshot> for IpcPendingRemoteRequestSnapshot {

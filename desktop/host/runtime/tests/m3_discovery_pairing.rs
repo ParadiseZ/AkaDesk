@@ -11,8 +11,8 @@ use host_runtime::generated::v1::{
 };
 use host_runtime::pairing::{now_ms, PairingStore};
 use host_runtime::session::SessionRegistry;
-use host_runtime::signaling::{SharedSignalingState, SignalingState};
 use host_runtime::settings::HostSettingsStore;
+use host_runtime::signaling::{SharedSignalingState, SignalingState};
 use host_runtime::transport::{SharedTransportStatusState, TransportStatusState};
 use host_runtime::video::{SharedVideoStreamState, VideoStreamState};
 use mdns_sd::{Receiver, ServiceDaemon, ServiceEvent};
@@ -78,12 +78,17 @@ fn discovery_publish_pairing_and_reauth_work_together() {
         pairing_request,
     );
     let challenge: PairingChallenge = recv_typed(&mut socket, "PairingChallenge");
-    assert!(!challenge.verification_code.is_empty());
+    assert!(challenge.verification_code.is_empty());
 
     let confirm = PairingConfirm {
         request_id: "pairing-confirm-1".to_string(),
         challenge_id: challenge.challenge_id.clone(),
-        verification_code: challenge.verification_code.clone(),
+        verification_code: state
+            .settings
+            .lock()
+            .unwrap()
+            .current()
+            .temporary_verification_code,
     };
     send_envelope(
         &mut socket,
@@ -138,7 +143,7 @@ fn discovery_publish_pairing_and_reauth_work_together() {
                 controller_device_id: "android-controller-1".to_string(),
                 controlled_device_id: "host-test-device".to_string(),
                 target_display_id: String::new(),
-                enable_input: true,
+                enable_input: false,
                 video: Some(VideoPreference {
                     codec: VideoCodec::H264 as i32,
                     width: 1280,
@@ -167,6 +172,17 @@ fn discovery_publish_pairing_and_reauth_work_together() {
         assert_eq!(video.codec, VideoCodec::H264 as i32);
         assert_eq!(video.width, 1280);
         assert_eq!(video.height, 720);
+        let offer: host_runtime::generated::v1::WebRtcOffer =
+            recv_typed(&mut reconnect_socket, "WebRtcOffer");
+        let candidate: host_runtime::generated::v1::IceCandidate =
+            recv_typed(&mut reconnect_socket, "IceCandidate");
+        let mid = offer
+            .sdp
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("a=mid:"))
+            .expect("offer media MID");
+        assert_eq!(candidate.sdp_mid, mid);
+        assert_eq!(candidate.sdp_mline_index, 0);
     }
 }
 
@@ -179,10 +195,8 @@ fn test_control_state(port: u16) -> ControlPlaneState {
     ));
     let pending_remote_requests: SharedPendingRemoteRequestStore =
         Arc::new(Mutex::new(PendingRemoteRequestStore::default()));
-    let video_streams: SharedVideoStreamState =
-        Arc::new(Mutex::new(VideoStreamState::default()));
-    let signaling: SharedSignalingState =
-        Arc::new(Mutex::new(SignalingState::default()));
+    let video_streams: SharedVideoStreamState = Arc::new(Mutex::new(VideoStreamState::default()));
+    let signaling: SharedSignalingState = Arc::new(Mutex::new(SignalingState::default()));
     let transport_status: SharedTransportStatusState =
         Arc::new(Mutex::new(TransportStatusState::default()));
     let host_identity = default_host_identity(
@@ -209,6 +223,9 @@ fn test_control_state(port: u16) -> ControlPlaneState {
         video_streams,
         signaling,
         transport_status,
+        pairing_attempts: Arc::new(Mutex::new(
+            host_runtime::auth::PairingAttemptLimiter::default(),
+        )),
     }
 }
 
@@ -239,8 +256,13 @@ fn allocate_port() -> u16 {
 fn connect_ws(
     port: u16,
 ) -> tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>> {
-    let (socket, _) =
+    let (mut socket, _) =
         connect(format!("ws://127.0.0.1:{port}/")).expect("failed to connect websocket");
+    if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(12)))
+            .unwrap();
+    }
     socket
 }
 
@@ -271,6 +293,13 @@ fn recv_typed<T: Message + Default>(
         let frame = socket.read().expect("failed to read websocket frame");
         if let WsMessage::Binary(bytes) = frame {
             let envelope = ControlEnvelope::decode(&bytes[..]).expect("failed to decode envelope");
+            eprintln!("waiting for {expected_type}, received {}", envelope.r#type);
+            assert!(
+                envelope.r#type != "StartSessionRejected",
+                "session start rejected: {:?}",
+                host_runtime::generated::v1::StartSessionRejected::decode(&envelope.payload[..])
+                    .unwrap()
+            );
             if envelope.r#type == expected_type {
                 return T::decode(&envelope.payload[..]).expect("failed to decode payload");
             }

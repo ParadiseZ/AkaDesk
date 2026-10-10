@@ -2,10 +2,16 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AkaDesk Desktop Shell",
   "version": "0.1.0",
-  "identifier": "com.akadesk.desktop_shell",
+  "identifier": "com.akadesk.desktop-shell",
   "build": {
-    "beforeDevCommand": "pnpm --dir ../ui dev --host 127.0.0.1 --port 1420",
-    "beforeBuildCommand": "pnpm --dir ../ui build",
+    "beforeDevCommand": {
+      "script": "powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/start-desktop.ps1",
+      "cwd": "../src-tauri"
+    },
+    "beforeBuildCommand": {
+      "script": "powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/build-desktop.ps1",
+      "cwd": "../src-tauri"
+    },
     "devUrl": "http://localhost:1420",
     "frontendDist": "../ui/dist"
   },
@@ -17,6 +23,19 @@
         "height": 800,
         "resizable": true
       }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "resources": {
+      "resources/host/": "host/"
+    },
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
     ]
   }
 }

@@ -16,6 +16,7 @@ import org.webrtc.SurfaceViewRenderer
 
 class ControllerCoordinator(context: Context) {
     companion object {
+        private const val TAG = "AkaDeskController"
         private const val CONTROL_RECONNECT_BASE_DELAY_MS = 1_000L
         private const val CONTROL_RECONNECT_MAX_DELAY_MS = 8_000L
         private const val SESSION_RECOVERY_TIMEOUT_MS = 3_000L
@@ -116,6 +117,8 @@ class ControllerCoordinator(context: Context) {
     var remoteAssistDeviceId by mutableStateOf("")
     var preferredVideoCodec by mutableStateOf(pairingStore.preferredVideoCodec())
     var activeSession by mutableStateOf<ActiveRemoteSession?>(null)
+    var activeVideoAspectRatio by mutableStateOf(16f / 9f)
+        private set
     var activeRemoteVideoReady by mutableStateOf(false)
         private set
     var activeRemoteVideoStalled by mutableStateOf(false)
@@ -159,6 +162,9 @@ class ControllerCoordinator(context: Context) {
                 onError = { message ->
                     mainHandler.post { logWarn(message) }
                 },
+                onHostLost = { serviceName ->
+                    mainHandler.post { hosts.removeAll { it.serviceName == serviceName } }
+                },
             )
         }
         hosts.clear()
@@ -166,7 +172,10 @@ class ControllerCoordinator(context: Context) {
         discoveryClient?.start()
     }
 
+    private var controlGeneration = 0L
+
     fun stopDiscovery() {
+        controlGeneration++
         discoveryClient?.stop()
         clearPendingControlReconnect()
         controlSession?.close()
@@ -367,6 +376,7 @@ class ControllerCoordinator(context: Context) {
     }
 
     private fun connect(host: ControlledHostSummary, preserveMedia: Boolean) {
+        val generation = ++controlGeneration
         if (!preserveMedia) {
             clearPendingControlReconnect()
             closeWebRtcSession()
@@ -382,6 +392,7 @@ class ControllerCoordinator(context: Context) {
             listener = object : HostControlSession.Listener {
                 override fun onAuthenticated(host: ControlledHostSummary) {
                     mainHandler.post {
+                        if (generation != controlGeneration) return@post
                         clearPendingControlReconnect()
                         val authenticated = host.copy(authState = HostAuthState.Authenticated)
                         pairingStore.refreshPairRecord(
@@ -423,6 +434,7 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onPairingRequired(host: ControlledHostSummary, message: String, errorCode: String) {
                     mainHandler.post {
+                        if (generation != controlGeneration) return@post
                         if (preserveMedia && activeSession?.host?.deviceId == host.deviceId) {
                             handlePreservedSessionRecoveryFailure(host, "认证已失效", message)
                             return@post
@@ -462,6 +474,7 @@ class ControllerCoordinator(context: Context) {
                     challengeType: PairingChallengeType,
                 ) {
                     mainHandler.post {
+                        if (generation != controlGeneration) return@post
                         val target = host.copy(authState = HostAuthState.PairingPending)
                         upsertHost(target)
                         logInfo("Pairing challenge received for ${host.displayName} type=${challengeType.name}")
@@ -482,6 +495,7 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onPairingSucceeded(host: ControlledHostSummary, pairToken: String) {
                     mainHandler.post {
+                        if (generation != controlGeneration) return@post
                         waitingApprovalTarget = null
                         pairingStore.savePairToken(
                             deviceId = host.deviceId,
@@ -497,12 +511,14 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onDeviceSnapshotLoaded(host: ControlledHostSummary) {
                     mainHandler.post {
+                        if (generation != controlGeneration) return@post
                         logInfo("Device snapshot loaded for ${host.displayName}")
                     }
                 }
 
                 override fun onSessionAccepted(host: ControlledHostSummary, sessionId: String, stateLabel: String) {
                     mainHandler.post {
+                        if (generation != controlGeneration) return@post
                         closeWebRtcSession()
                         selectedHostForActions = null
                         verificationTarget = null
@@ -534,7 +550,9 @@ class ControllerCoordinator(context: Context) {
                     summary: String,
                 ) {
                     mainHandler.post {
+                        if (generation != controlGeneration) return@post
                         if (isTerminalSessionState(stateLabel)) {
+                            if (activeSession?.sessionId != sessionId && pendingStopSessionId != sessionId) return@post
                             clearPendingControlReconnect()
                             closeWebRtcSession()
                             activeSession = null
@@ -546,7 +564,7 @@ class ControllerCoordinator(context: Context) {
                             disconnectNotice = ControllerDisconnectNotice(
                                 title = "远程控制已断开",
                                 message = "被控端会话已结束",
-                                detail = "state=$stateLabel • $summary",
+                                detail = if (stateLabel == "FAILED") "画面连接失败，请重试。" else "电脑已停止屏幕共享。",
                             )
                             logWarn("Session ended $sessionId state=$stateLabel summary=$summary")
                             return@post
@@ -574,6 +592,7 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onWebRtcOffer(host: ControlledHostSummary, offer: WebRtcOffer) {
                     mainHandler.post {
+                        if (generation != controlGeneration) return@post
                         val activeSessionId = activeSession?.sessionId
                         if (activeSessionId.isNullOrBlank()) {
                             logWarn("Ignoring WebRTC offer for inactive session=${offer.sessionId}")
@@ -595,6 +614,7 @@ class ControllerCoordinator(context: Context) {
                     candidate: IceCandidate,
                 ) {
                     mainHandler.post {
+                        if (generation != controlGeneration) return@post
                         val activeSessionId = activeSession?.sessionId
                         if (activeSessionId.isNullOrBlank()) {
                             logWarn("Ignoring remote ICE candidate for inactive session=${candidate.sessionId}")
@@ -613,6 +633,7 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onHostVideoStream(host: ControlledHostSummary, event: HostVideoStreamEvent) {
                     mainHandler.post {
+                        if (generation != controlGeneration) return@post
                         if (activeSession?.sessionId != event.sessionId) {
                             return@post
                         }
@@ -635,6 +656,7 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onHostTransportStatus(host: ControlledHostSummary, event: HostTransportStatusEvent) {
                     mainHandler.post {
+                        if (generation != controlGeneration) return@post
                         if (activeSession?.sessionId != event.sessionId) {
                             return@post
                         }
@@ -659,6 +681,7 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onSessionClosed(host: ControlledHostSummary, sessionId: String, reason: String) {
                     mainHandler.post {
+                        if (generation != controlGeneration) return@post
                         if (activeSession?.sessionId != sessionId) {
                             return@post
                         }
@@ -672,7 +695,7 @@ class ControllerCoordinator(context: Context) {
                         disconnectNotice = ControllerDisconnectNotice(
                             title = "远程控制已断开",
                             message = "当前会话已经结束",
-                            detail = "reason=$reason",
+                            detail = if (reason == "CONTROLLER_REQUEST") "已停止查看电脑画面。" else "屏幕共享已结束。",
                         )
                         logInfo("Session closed session=$sessionId reason=$reason")
                     }
@@ -680,6 +703,7 @@ class ControllerCoordinator(context: Context) {
 
                 override fun onFailure(host: ControlledHostSummary, message: String) {
                     mainHandler.post {
+                        if (generation != controlGeneration) return@post
                         val keepActiveVideoSession = shouldKeepActiveMediaSession(host)
                         controlSession = null
                         waitingApprovalTarget = null
@@ -865,24 +889,12 @@ class ControllerCoordinator(context: Context) {
                 }
 
                 override fun onLocalAnswer(sessionId: String, sdp: String) {
-                    pendingLocalAnswer = PendingLocalAnswer(sessionId, sdp)
-                    val sentImmediately = controlSession != null
-                    controlSession?.sendWebRtcAnswer(sessionId, sdp)
                     mainHandler.post {
-                        if (activeSession?.sessionId == sessionId) {
-                            activeSession = activeSession?.copy(
-                                summary = if (sentImmediately) {
-                                    "本地 Answer 已发送，等待远端媒体"
-                                } else {
-                                    "本地 Answer 已生成，等待控制通道恢复后补发"
-                                },
-                            )
-                        }
-                        if (sentImmediately) {
-                            logInfo("Sent local WebRTC answer session=$sessionId sdpLen=${sdp.length}")
-                        } else {
-                            logWarn("Queued local WebRTC answer session=$sessionId until control reconnect")
-                        }
+                        if (activeSession?.sessionId != sessionId) return@post
+                        pendingLocalAnswer = PendingLocalAnswer(sessionId, sdp)
+                        controlSession?.sendWebRtcAnswer(sessionId, sdp)
+                        activeSession = activeSession?.copy(summary = "正在等待远端画面")
+                        logInfo("Local WebRTC answer ready session=$sessionId")
                     }
                 }
 
@@ -892,17 +904,20 @@ class ControllerCoordinator(context: Context) {
                     sdpMid: String,
                     sdpMlineIndex: Int,
                 ) {
-                    pendingLocalIceCandidates += PendingLocalIceCandidate(
-                        sessionId = sessionId,
-                        candidate = candidate,
-                        sdpMid = sdpMid,
-                        sdpMlineIndex = sdpMlineIndex,
-                    )
-                    if (controlSession != null) {
-                        controlSession?.sendIceCandidate(sessionId, candidate, sdpMid, sdpMlineIndex)
-                        logInfo("Sent local ICE candidate session=$sessionId")
-                    } else {
-                        logWarn("Queued local ICE candidate session=$sessionId until control reconnect")
+                    mainHandler.post {
+                        if (activeSession?.sessionId != sessionId) return@post
+                        pendingLocalIceCandidates += PendingLocalIceCandidate(
+                            sessionId = sessionId,
+                            candidate = candidate,
+                            sdpMid = sdpMid,
+                            sdpMlineIndex = sdpMlineIndex,
+                        )
+                        if (controlSession != null) {
+                            controlSession?.sendIceCandidate(sessionId, candidate, sdpMid, sdpMlineIndex)
+                            logInfo("Sent local ICE candidate session=$sessionId")
+                        } else {
+                            logWarn("Queued local ICE candidate session=$sessionId until control reconnect")
+                        }
                     }
                 }
 
@@ -923,6 +938,7 @@ class ControllerCoordinator(context: Context) {
                         if (activeSession?.sessionId != sessionId) {
                             return@post
                         }
+                        activeVideoAspectRatio = width.toFloat() / height.coerceAtLeast(1)
                         activeRemoteVideoReady = true
                         activeRemoteVideoStalled = false
                         activeSession = activeSession?.copy(
@@ -950,6 +966,7 @@ class ControllerCoordinator(context: Context) {
                         if (activeSession?.sessionId != sessionId) {
                             return@post
                         }
+                        activeVideoAspectRatio = width.toFloat() / height.coerceAtLeast(1)
                         activeRemoteVideoReady = true
                         activeRemoteVideoStalled = false
                         activeSession = activeSession?.copy(
@@ -1142,7 +1159,4 @@ class ControllerCoordinator(context: Context) {
         Log.e(TAG, message)
     }
 
-    companion object {
-        private const val TAG = "AkaDeskController"
-    }
 }

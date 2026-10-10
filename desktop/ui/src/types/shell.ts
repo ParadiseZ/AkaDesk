@@ -64,12 +64,14 @@ export interface ShellMessage {
 }
 
 export interface IncomingRequestPreview {
+  requestId: string;
   controllerName: string;
   deviceLabel: string;
   expiresAtMs: number;
 }
 
 export interface ActiveSessionPresentation {
+  sessionId: string;
   role: "controller" | "controlled_host" | string;
   peerName: string;
   peerSubtitle: string;

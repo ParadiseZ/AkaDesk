@@ -201,7 +201,7 @@ class AndroidWebRtcSession(
                 onSetSuccess = {
                     remoteOfferSetInFlight = false
                     remoteDescriptionApplied = true
-                    attachExistingRemoteVideoTrack("远端 Offer 已应用后发现现有视频轨道")
+
                     drainPendingRemoteCandidates()
                     callbacks.onStateChanged(sessionId, "远端 Offer 已应用，正在生成 Answer")
                     peerConnection.createAnswer(
@@ -214,7 +214,7 @@ class AndroidWebRtcSession(
                                         onSetSuccess = {
                                             if (!localAnswerSent) {
                                                 localAnswerSent = true
-                                                attachExistingRemoteVideoTrack("本地 Answer 已生效后发现现有视频轨道")
+
                                                 drainPendingRemoteCandidates()
                                                 callbacks.onLocalAnswer(sessionId, description.description)
                                                 callbacks.onStateChanged(
@@ -241,7 +241,7 @@ class AndroidWebRtcSession(
             return
         }
         val nativeCandidate = IceCandidate(
-            candidate.sdpMid.takeIf { it.isNotBlank() },
+            candidate.sdpMid,
             candidate.sdpMlineIndex,
             candidate.candidate,
         )
@@ -286,7 +286,7 @@ class AndroidWebRtcSession(
             renderer = target
             remoteVideoTrack?.addSink(target)
         }
-        attachExistingRemoteVideoTrack("渲染器已绑定后发现现有视频轨道")
+
         callbacks.onStateChanged(sessionId, "Android 渲染器已绑定，等待远端视频帧")
     }
 
@@ -344,20 +344,14 @@ class AndroidWebRtcSession(
 
                 override fun onStandardizedIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
                     newState?.let {
-                        if (it == PeerConnection.IceConnectionState.CONNECTED ||
-                            it == PeerConnection.IceConnectionState.COMPLETED
-                        ) {
-                            attachExistingRemoteVideoTrack("ICE 已连通后发现现有视频轨道")
-                        }
+
                         callbacks.onStateChanged(sessionId, "ICE 状态=${it.name}")
                     }
                 }
 
                 override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
                     newState?.let {
-                        if (it == PeerConnection.PeerConnectionState.CONNECTED) {
-                            attachExistingRemoteVideoTrack("PeerConnection 已连通后发现现有视频轨道")
-                        }
+
                         callbacks.onStateChanged(sessionId, "PeerConnection 状态=${it.name}")
                     }
                 }
@@ -415,13 +409,6 @@ class AndroidWebRtcSession(
 
     private fun ensureVideoReceiveTransceiver() {
         try {
-            val existingVideo = peerConnection.transceivers.orEmpty().any { transceiver ->
-                transceiver.mediaType == MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO
-            }
-            if (existingVideo) {
-                callbacks.onStateChanged(sessionId, "Android 已存在视频接收 transceiver，等待远端 Offer")
-                return
-            }
             val init = RtpTransceiver.RtpTransceiverInit(
                 RtpTransceiver.RtpTransceiverDirection.RECV_ONLY
             )
@@ -469,15 +456,6 @@ class AndroidWebRtcSession(
         callbacks.onStateChanged(sessionId, "$detail，等待远端首帧")
     }
 
-    private fun attachExistingRemoteVideoTrack(detail: String) {
-        val track = peerConnection.transceivers.orEmpty()
-            .asSequence()
-            .mapNotNull { transceiver -> transceiver.receiver?.track() as? VideoTrack }
-            .firstOrNull()
-            ?: return
-        attachRemoteVideoTrack(track, detail)
-    }
-
     private fun drainPendingRemoteCandidates() {
         val candidatesToReplay = synchronized(candidateLock) {
             if (pendingRemoteCandidates.isEmpty()) {
@@ -509,13 +487,18 @@ class AndroidWebRtcSession(
         attempts: Int,
         allowDeferredRetry: Boolean,
     ) {
-        val accepted = peerConnection.addIceCandidate(candidate)
+        val mid = RemoteIceMedia.resolveMid(remoteOfferSdp.orEmpty(), candidate.sdpMid, candidate.sdpMLineIndex)
+        if (mid == null || candidate.sdp.isBlank()) {
+            callbacks.onFailure(sessionId, "远端 ICE candidate 的媒体标识无效")
+            return
+        }
+        val accepted = peerConnection.addIceCandidate(IceCandidate(mid, candidate.sdpMLineIndex, candidate.sdp))
         if (accepted) {
             synchronized(candidateLock) {
                 appliedRemoteCandidateKeys += candidateKey
                 pendingRemoteCandidateKeys -= candidateKey
             }
-            attachExistingRemoteVideoTrack("远端 ICE 已写入后发现现有视频轨道")
+
             callbacks.onStateChanged(sessionId, "已写入远端 ICE candidate")
         } else if (allowDeferredRetry && attempts < MAX_REMOTE_CANDIDATE_RETRIES) {
             synchronized(candidateLock) {

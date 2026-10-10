@@ -59,6 +59,8 @@ pub struct StreamingH264EncoderSession {
     next_pts: i64,
     force_keyframe_next: bool,
     cached_parameter_sets_annexb: Vec<u8>,
+    source_width: u32,
+    source_height: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -102,7 +104,7 @@ pub fn prepare_h264_encoder(request: &H264EncoderRequest) -> Result<PreparedH264
 pub fn encode_h264_test_pattern(
     request: &H264EncoderRequest,
 ) -> Result<EncodedH264SmokeFrame, String> {
-    encode_h264_bgra_frame(request, None, 0)
+    encode_h264_bgra_frame(request, None, 0, request.width, request.height)
 }
 
 #[cfg(windows)]
@@ -110,10 +112,12 @@ pub fn encode_h264_bgra_frame(
     request: &H264EncoderRequest,
     bgra_bytes: Option<&[u8]>,
     bgra_stride: usize,
+    source_width: u32,
+    source_height: u32,
 ) -> Result<EncodedH264SmokeFrame, String> {
     silence_ffmpeg_logs();
     let mut session = start_h264_streaming_encoder(request)?;
-    let encoded = session.encode_frame(bgra_bytes, bgra_stride)?;
+    let encoded = session.encode_frame(bgra_bytes, bgra_stride, source_width, source_height)?;
     Ok(EncodedH264SmokeFrame {
         prepared: session.prepared().clone(),
         packet_len: encoded.packet_len,
@@ -209,6 +213,8 @@ fn try_start_h264_streaming_encoder(
         next_pts: 0,
         force_keyframe_next: true,
         cached_parameter_sets_annexb: Vec::new(),
+        source_width: request.width,
+        source_height: request.height,
     })
 }
 
@@ -258,22 +264,37 @@ fn open_h264_encoder_context(
     let tune_key = CString::new("tune").expect("valid tune key");
     let tune_value = CString::new("zerolatency").expect("valid tune value");
     let profile_key = CString::new("profile").expect("valid profile key");
-    let profile_value = CString::new("constrained_baseline").expect("valid profile value");
+    let profile_value = CString::new("baseline").expect("valid profile value");
     let keyint_key = CString::new("keyint").expect("valid keyint key");
     let min_keyint_key = CString::new("min-keyint").expect("valid min-keyint key");
     let scenecut_key = CString::new("scenecut").expect("valid scenecut key");
-    let keyint_value =
-        CString::new(keyframe_interval.to_string()).map_err(|_| "invalid keyint value".to_string())?;
+    let keyint_value = CString::new(keyframe_interval.to_string())
+        .map_err(|_| "invalid keyint value".to_string())?;
     let scenecut_value = CString::new("0").expect("valid scenecut value");
 
     if name == "libx264" {
         unsafe {
             av_dict_set(&mut options, preset_key.as_ptr(), preset_value.as_ptr(), 0);
             av_dict_set(&mut options, tune_key.as_ptr(), tune_value.as_ptr(), 0);
-            av_dict_set(&mut options, profile_key.as_ptr(), profile_value.as_ptr(), 0);
+            av_dict_set(
+                &mut options,
+                profile_key.as_ptr(),
+                profile_value.as_ptr(),
+                0,
+            );
             av_dict_set(&mut options, keyint_key.as_ptr(), keyint_value.as_ptr(), 0);
-            av_dict_set(&mut options, min_keyint_key.as_ptr(), keyint_value.as_ptr(), 0);
-            av_dict_set(&mut options, scenecut_key.as_ptr(), scenecut_value.as_ptr(), 0);
+            av_dict_set(
+                &mut options,
+                min_keyint_key.as_ptr(),
+                keyint_value.as_ptr(),
+                0,
+            );
+            av_dict_set(
+                &mut options,
+                scenecut_key.as_ptr(),
+                scenecut_value.as_ptr(),
+                0,
+            );
         }
     }
 
@@ -388,12 +409,41 @@ impl StreamingH264EncoderSession {
         &mut self,
         bgra_bytes: Option<&[u8]>,
         bgra_stride: usize,
+        source_width: u32,
+        source_height: u32,
     ) -> Result<EncodedH264Packet, String> {
         use ffmpeg_sys_next::{
             av_frame_make_writable, av_packet_unref, avcodec_receive_packet, avcodec_send_frame,
             sws_scale,
         };
 
+        if bgra_bytes.is_some()
+            && (source_width != self.source_width || source_height != self.source_height)
+        {
+            if source_width == 0
+                || source_height == 0
+                || source_width > 16384
+                || source_height > 16384
+            {
+                return Err("invalid captured frame dimensions".to_string());
+            }
+            // Rebuild the source buffer/scaler when the monitor resolution changes.
+            let mut frame = FrameGuard::allocate()?;
+            let mut source_request = self.request.clone();
+            source_request.width = source_width;
+            source_request.height = source_height;
+            initialize_bgra_source_frame(frame.as_mut_ptr(), &source_request)?;
+            let sws = SwsContextGuard::new_scaled(
+                source_width,
+                source_height,
+                self.request.width,
+                self.request.height,
+            )?;
+            self.src_frame = frame;
+            self.sws = sws;
+            self.source_width = source_width;
+            self.source_height = source_height;
+        }
         unsafe {
             ffmpeg_status(
                 av_frame_make_writable(self.src_frame.as_mut_ptr()),
@@ -409,14 +459,14 @@ impl StreamingH264EncoderSession {
                     self.src_frame.as_mut_ptr(),
                     source,
                     bgra_stride,
-                    self.request.width,
-                    self.request.height,
+                    self.source_width,
+                    self.source_height,
                 )?;
             } else {
                 fill_bgra_test_pattern(
                     self.src_frame.as_mut_ptr(),
-                    self.request.width,
-                    self.request.height,
+                    self.source_width,
+                    self.source_height,
                 );
             }
 
@@ -425,7 +475,7 @@ impl StreamingH264EncoderSession {
                 (*self.src_frame.as_mut_ptr()).data.as_ptr() as *const *const u8,
                 (*self.src_frame.as_mut_ptr()).linesize.as_ptr(),
                 0,
-                self.request.height as i32,
+                self.source_height as i32,
                 (*self.dst_frame.as_mut_ptr()).data.as_mut_ptr(),
                 (*self.dst_frame.as_mut_ptr()).linesize.as_mut_ptr(),
             );
@@ -434,11 +484,11 @@ impl StreamingH264EncoderSession {
             }
 
             if self.force_keyframe_next {
-                (*self.dst_frame.as_mut_ptr()).key_frame = 1;
+                (*self.dst_frame.as_mut_ptr()).flags |= ffmpeg_sys_next::AV_FRAME_FLAG_KEY;
                 (*self.dst_frame.as_mut_ptr()).pict_type =
                     ffmpeg_sys_next::AVPictureType::AV_PICTURE_TYPE_I;
             } else {
-                (*self.dst_frame.as_mut_ptr()).key_frame = 0;
+                (*self.dst_frame.as_mut_ptr()).flags &= !ffmpeg_sys_next::AV_FRAME_FLAG_KEY;
                 (*self.dst_frame.as_mut_ptr()).pict_type =
                     ffmpeg_sys_next::AVPictureType::AV_PICTURE_TYPE_NONE;
             }
@@ -456,15 +506,13 @@ impl StreamingH264EncoderSession {
             )?;
 
             let packet_len = (*self.packet.as_mut_ptr()).size as usize;
-            let packet_bytes = std::slice::from_raw_parts(
-                (*self.packet.as_mut_ptr()).data,
-                packet_len,
-            )
-            .to_vec();
+            let packet_bytes =
+                std::slice::from_raw_parts((*self.packet.as_mut_ptr()).data, packet_len).to_vec();
             let is_keyframe =
                 ((*self.packet.as_mut_ptr()).flags & ffmpeg_sys_next::AV_PKT_FLAG_KEY) != 0;
             let nal_length_size = detect_h264_avcc_nal_length_size(self.context.as_mut_ptr());
-            let parameter_sets = extract_h264_parameter_sets(self.context.as_mut_ptr(), &packet_bytes);
+            let parameter_sets =
+                extract_h264_parameter_sets(self.context.as_mut_ptr(), &packet_bytes);
             if !parameter_sets.is_empty() {
                 self.cached_parameter_sets_annexb = parameter_sets;
             }
@@ -506,10 +554,7 @@ fn normalize_h264_access_unit(
     } else {
         avcc_to_annexb(packet_bytes, nal_length_size)?
     };
-    if is_keyframe
-        && !parameter_sets_annexb.is_empty()
-        && !contains_parameter_sets(&annexb)
-    {
+    if is_keyframe && !parameter_sets_annexb.is_empty() && !contains_parameter_sets(&annexb) {
         let mut prefixed = Vec::with_capacity(parameter_sets_annexb.len() + annexb.len());
         prefixed.extend_from_slice(parameter_sets_annexb);
         prefixed.extend_from_slice(&annexb);
@@ -914,13 +959,22 @@ struct SwsContextGuard(*mut ffmpeg_sys_next::SwsContext);
 #[cfg(windows)]
 impl SwsContextGuard {
     fn new(width: u32, height: u32) -> Result<Self, String> {
+        Self::new_scaled(width, height, width, height)
+    }
+
+    fn new_scaled(
+        source_width: u32,
+        source_height: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
         use ffmpeg_sys_next::{sws_getContext, AVPixelFormat, SwsFlags};
         use std::ptr;
 
         let sws = unsafe {
             sws_getContext(
-                width as i32,
-                height as i32,
+                source_width as i32,
+                source_height as i32,
                 AVPixelFormat::AV_PIX_FMT_BGRA,
                 width as i32,
                 height as i32,
@@ -957,6 +1011,68 @@ mod tests {
         encode_h264_test_pattern, prepare_h264_encoder, probe_codec_inventory, H264EncoderRequest,
         PreparedEncoderImplementation,
     };
+
+    #[cfg(windows)]
+    #[test]
+    fn x264_software_fallback_produces_annexb_with_parameter_sets() {
+        let request = H264EncoderRequest {
+            width: 64,
+            height: 36,
+            fps: 30,
+            bitrate_kbps: 1_000,
+            allow_software_fallback: true,
+        };
+        let mut encoder = super::try_start_h264_streaming_encoder(
+            "libx264",
+            PreparedEncoderImplementation::Software,
+            &request,
+        )
+        .unwrap();
+        let packet = encoder.encode_frame(None, 64 * 4, 64, 36).unwrap();
+        assert!(packet.is_keyframe);
+        assert!(super::contains_parameter_sets(&packet.bytes));
+        assert!(encoder.rtp_fmtp_line().contains("profile-level-id=42e01f"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn downscaling_preserves_bottom_right_of_source_and_handles_resolution_change() {
+        let request = H264EncoderRequest {
+            width: 64,
+            height: 36,
+            fps: 30,
+            bitrate_kbps: 1_000,
+            allow_software_fallback: true,
+        };
+        let mut encoder = super::start_h264_streaming_encoder(&request).unwrap();
+        for (width, height) in [(128usize, 72usize), (192, 108)] {
+            let mut pixels = vec![0u8; width * height * 4];
+            for y in 0..height {
+                for x in 0..width {
+                    let offset = (y * width + x) * 4;
+                    if x >= width / 2 && y >= height / 2 {
+                        pixels[offset..offset + 3].fill(255);
+                    }
+                    pixels[offset + 3] = 255;
+                }
+            }
+            encoder
+                .encode_frame(Some(&pixels), width * 4, width as u32, height as u32)
+                .unwrap();
+            unsafe {
+                let frame = encoder.dst_frame.as_mut_ptr();
+                let stride = (*frame).linesize[0] as usize;
+                assert!(*(*frame).data[0].add(stride * 2 + 2) < 30);
+                assert!(
+                    *(*frame).data[0].add(stride * 33 + 61) > 200,
+                    "bottom-right source quadrant was cropped instead of scaled"
+                );
+            }
+        }
+        assert!(encoder
+            .encode_frame(Some(&[0; 4]), 192 * 4, 192, 108)
+            .is_err());
+    }
 
     #[test]
     fn detects_h264_codec_support_from_local_sdk() {

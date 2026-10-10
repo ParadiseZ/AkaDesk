@@ -27,9 +27,12 @@ pub fn save_shell_settings(
     state: State<Arc<AppState>>,
     settings: ShellSettings,
 ) -> Result<ShellSnapshot, String> {
-    snapshot_command(&app, state, "SAVE_SHELL_SETTINGS_FAILED", move |app_state| {
-        app_state.save_shell_settings(settings)
-    })
+    snapshot_command(
+        &app,
+        state,
+        "SAVE_SHELL_SETTINGS_FAILED",
+        move |app_state| app_state.save_shell_settings(settings),
+    )
 }
 
 #[tauri::command]
@@ -38,9 +41,12 @@ pub fn update_host_settings(
     state: State<Arc<AppState>>,
     settings: HostSettingsInput,
 ) -> Result<ShellSnapshot, String> {
-    snapshot_command(&app, state, "UPDATE_HOST_SETTINGS_FAILED", move |app_state| {
-        app_state.update_host_settings(settings)
-    })
+    snapshot_command(
+        &app,
+        state,
+        "UPDATE_HOST_SETTINGS_FAILED",
+        move |app_state| app_state.update_host_settings(settings),
+    )
 }
 
 #[tauri::command]
@@ -72,20 +78,27 @@ pub fn preview_incoming_request(
     app: AppHandle,
     state: State<Arc<AppState>>,
 ) -> Result<ShellSnapshot, String> {
-    snapshot_command(&app, state, "PREVIEW_INCOMING_REQUEST_FAILED", |app_state| {
-        app_state.preview_incoming_request()
-    })
+    snapshot_command(
+        &app,
+        state,
+        "PREVIEW_INCOMING_REQUEST_FAILED",
+        |app_state| app_state.preview_incoming_request(),
+    )
 }
 
 #[tauri::command]
 pub fn respond_incoming_request(
     app: AppHandle,
     state: State<Arc<AppState>>,
+    request_id: String,
     allow: bool,
 ) -> Result<ShellSnapshot, String> {
-    snapshot_command(&app, state, "RESPOND_INCOMING_REQUEST_FAILED", move |app_state| {
-        app_state.respond_incoming_request(allow)
-    })
+    snapshot_command(
+        &app,
+        state,
+        "RESPOND_INCOMING_REQUEST_FAILED",
+        move |app_state| app_state.respond_incoming_request(&request_id, allow),
+    )
 }
 
 #[tauri::command]

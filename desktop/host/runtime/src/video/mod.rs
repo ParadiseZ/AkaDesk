@@ -2,11 +2,11 @@ use crate::generated::v1::{
     CodecImplementation, SessionIntent, SessionSnapshot, VideoCodec, VideoPreference,
     VideoSessionSpec,
 };
-use crate::session::SharedSessionRegistry;
 use crate::pairing::now_ms;
+use crate::session::SharedSessionRegistry;
 use std::collections::VecDeque;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
@@ -70,9 +70,15 @@ pub struct VideoStreamSnapshot {
 pub struct VideoStreamState {
     active_session_id: Option<String>,
     recent_packets: VecDeque<EncodedVideoPacket>,
-    subscribers: Vec<Sender<EncodedVideoPacket>>,
+    subscribers: Vec<PacketSubscriber>,
     keyframe_requested: bool,
     snapshot: VideoStreamSnapshot,
+}
+
+#[derive(Debug)]
+struct PacketSubscriber {
+    sender: SyncSender<EncodedVideoPacket>,
+    waiting_for_keyframe: bool,
 }
 
 pub type SharedVideoStreamState = Arc<Mutex<VideoStreamState>>;
@@ -83,6 +89,36 @@ const DEFAULT_H264_FPS: u32 = 30;
 const DEFAULT_H264_BITRATE_KBPS: u32 = 2_500;
 const RECENT_PACKET_LIMIT: usize = 90;
 const MAX_CONSECUTIVE_RUNTIME_FRAME_ERRORS: usize = 30;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn slow_receiver_has_bounded_queue_and_resumes_at_a_keyframe() {
+        let mut state = VideoStreamState::default();
+        state.begin_session("session".into());
+        let receiver = state.subscribe_packets("session").unwrap();
+        let packet = |keyframe| EncodedVideoPacket {
+            session_id: "session".into(),
+            bytes: vec![1],
+            packet_len: 1,
+            is_keyframe: keyframe,
+            frame_source_label: "test".into(),
+            created_at_ms: 1,
+        };
+        for _ in 0..(RECENT_PACKET_LIMIT + 5) {
+            state.push_packet(packet(false));
+        }
+        assert!(state.take_keyframe_request("session"));
+        assert_eq!(receiver.try_iter().count(), RECENT_PACKET_LIMIT);
+        state.push_packet(packet(false));
+        assert!(receiver.try_recv().is_err());
+        state.push_packet(packet(true));
+        assert!(receiver.try_recv().unwrap().is_keyframe);
+        state.push_packet(packet(false));
+        assert!(!receiver.try_recv().unwrap().is_keyframe);
+    }
+}
 
 #[cfg(windows)]
 pub fn detect_runtime_video_support() -> VideoRuntimeSupport {
@@ -123,24 +159,28 @@ pub fn prepare_h264_session(intent: &SessionIntent) -> Result<PreparedVideoSessi
         bitrate_kbps: non_zero_or(video.bitrate_kbps, DEFAULT_H264_BITRATE_KBPS),
         allow_software_fallback: allow_software_fallback(&video),
     };
-    let capture = host_windows::cap::capture_primary_display_bgra();
-    let (encoded, frame_source_label) = match capture {
-        Ok(frame) => match host_windows::ffmpeg::encode_h264_bgra_frame(
-            &request,
-            Some(frame.bytes.as_slice()),
-            frame.stride,
-        ) {
-            Ok(encoded) => (encoded, "primary-display".to_string()),
-            Err(_) => (
-                host_windows::ffmpeg::encode_h264_test_pattern(&request)?,
-                "synthetic-test-pattern".to_string(),
-            ),
-        },
-        Err(_) => (
-            host_windows::ffmpeg::encode_h264_test_pattern(&request)?,
-            "synthetic-test-pattern".to_string(),
-        ),
-    };
+    if request.width < 2
+        || request.height < 2
+        || request.width > 3840
+        || request.height > 2160
+        || request.width % 2 != 0
+        || request.height % 2 != 0
+        || request.fps > 120
+        || request.bitrate_kbps > 50_000
+    {
+        return Err(
+            "Requested video dimensions, frame rate or bitrate are unsupported.".to_string(),
+        );
+    }
+    let frame = host_windows::cap::capture_primary_display_bgra()?;
+    let encoded = host_windows::ffmpeg::encode_h264_bgra_frame(
+        &request,
+        Some(&frame.bytes),
+        frame.stride,
+        frame.width,
+        frame.height,
+    )?;
+    let frame_source_label = "primary-display".to_string();
     let host_encoder = match encoded.prepared.implementation {
         host_windows::ffmpeg::PreparedEncoderImplementation::Hardware => {
             CodecImplementation::Hardware as i32
@@ -181,8 +221,7 @@ pub fn spawn_h264_streaming_loop(
     spec: VideoSessionSpec,
 ) -> Result<Receiver<Result<StreamingStartupResult, String>>, String> {
     let request = request_from_spec(&spec);
-    let frame_interval =
-        Duration::from_millis((1_000u64 / (request.fps.max(1) as u64)).max(1));
+    let frame_interval = Duration::from_millis((1_000u64 / (request.fps.max(1) as u64)).max(1));
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     if let Ok(mut stream_state) = video_streams.lock() {
         stream_state.begin_session(session_id.clone());
@@ -205,6 +244,7 @@ pub fn spawn_h264_streaming_loop(
         let mut startup_sent = false;
         let mut consecutive_runtime_frame_errors = 0usize;
         loop {
+            let frame_started = std::time::Instant::now();
             let keep_running = sessions
                 .lock()
                 .map(|registry| registry.should_keep_running(&session_id))
@@ -225,7 +265,7 @@ pub fn spawn_h264_streaming_loop(
                 }
             }
 
-            match encode_runtime_frame(&mut encoder, !startup_sent) {
+            match encode_runtime_frame(&mut encoder) {
                 Ok((encoded, frame_source_label)) => {
                     consecutive_runtime_frame_errors = 0;
                     if let Ok(mut stream_state) = video_streams.lock() {
@@ -242,7 +282,12 @@ pub fn spawn_h264_streaming_loop(
                         let snapshot = sessions
                             .lock()
                             .ok()
-                            .and_then(|mut registry| registry.mark_streaming(&session_id));
+                            .and_then(|registry| {
+                                registry.active_snapshot_for_controller(
+                                    &registry.active.as_ref()?.controller_device_id,
+                                )
+                            })
+                            .filter(|snapshot| snapshot.session_id == session_id);
                         match snapshot {
                             Some(snapshot) => {
                                 let rtp_fmtp_line = encoder.rtp_fmtp_line();
@@ -300,7 +345,7 @@ pub fn spawn_h264_streaming_loop(
                 }
             }
 
-            thread::sleep(frame_interval);
+            thread::sleep(frame_interval.saturating_sub(frame_started.elapsed()));
         }
         if let Ok(mut stream_state) = video_streams.lock() {
             stream_state.finish_session(&session_id);
@@ -348,32 +393,13 @@ fn request_from_spec(spec: &VideoSessionSpec) -> host_windows::ffmpeg::H264Encod
 #[cfg(windows)]
 fn encode_runtime_frame(
     encoder: &mut host_windows::ffmpeg::StreamingH264EncoderSession,
-    allow_synthetic_fallback: bool,
 ) -> Result<(host_windows::ffmpeg::EncodedH264Packet, String), String> {
-    let capture = host_windows::cap::capture_primary_display_bgra();
-    match capture {
-        Ok(frame) => match encoder.encode_frame(Some(frame.bytes.as_slice()), frame.stride) {
-            Ok(encoded) => Ok((encoded, "primary-display".to_string())),
-            Err(err) if allow_synthetic_fallback => {
-                let encoded = encoder.encode_frame(None, 0).map_err(|fallback_err| {
-                    format!(
-                        "failed to encode captured BGRA frame ({err}); fallback test-pattern encode failed: {fallback_err}"
-                    )
-                })?;
-                Ok((encoded, "synthetic-test-pattern".to_string()))
-            }
-            Err(err) => Err(format!("failed to encode captured BGRA frame: {err}")),
-        },
-        Err(err) if allow_synthetic_fallback => {
-            let encoded = encoder.encode_frame(None, 0).map_err(|fallback_err| {
-                format!(
-                    "failed to capture primary display ({err}); fallback test-pattern encode failed: {fallback_err}"
-                )
-            })?;
-            Ok((encoded, "synthetic-test-pattern".to_string()))
-        }
-        Err(err) => Err(format!("failed to capture primary display: {err}")),
-    }
+    let frame = host_windows::cap::capture_primary_display_bgra()
+        .map_err(|err| format!("failed to capture primary display: {err}"))?;
+    let encoded = encoder
+        .encode_frame(Some(&frame.bytes), frame.stride, frame.width, frame.height)
+        .map_err(|err| format!("failed to encode captured BGRA frame: {err}"))?;
+    Ok((encoded, "primary-display".to_string()))
 }
 
 impl VideoStreamState {
@@ -410,8 +436,25 @@ impl VideoStreamState {
         self.snapshot.latest_error.clear();
         self.snapshot.updated_at_ms = packet.created_at_ms;
         self.recent_packets.push_back(packet.clone());
-        self.subscribers
-            .retain(|subscriber| subscriber.send(packet.clone()).is_ok());
+        let mut needs_keyframe = false;
+        self.subscribers.retain_mut(|subscriber| {
+            if subscriber.waiting_for_keyframe && !packet.is_keyframe {
+                return true;
+            }
+            match subscriber.sender.try_send(packet.clone()) {
+                Ok(()) => {
+                    subscriber.waiting_for_keyframe = false;
+                    true
+                }
+                Err(TrySendError::Full(_)) => {
+                    subscriber.waiting_for_keyframe = true;
+                    needs_keyframe = true;
+                    true
+                }
+                Err(TrySendError::Disconnected(_)) => false,
+            }
+        });
+        self.keyframe_requested |= needs_keyframe;
     }
 
     pub fn request_keyframe(&mut self, session_id: &str) -> bool {
@@ -460,26 +503,27 @@ impl VideoStreamState {
 
     pub fn latest_decodable_window_packets(&self) -> Vec<EncodedVideoPacket> {
         let packets = self.recent_packets.iter().cloned().collect::<Vec<_>>();
-        let Some(latest_keyframe_index) = packets.iter().rposition(|packet| packet.is_keyframe) else {
+        let Some(latest_keyframe_index) = packets.iter().rposition(|packet| packet.is_keyframe)
+        else {
             return packets;
         };
         packets.into_iter().skip(latest_keyframe_index).collect()
     }
 
-    pub fn subscribe_packets(
-        &mut self,
-        session_id: &str,
-    ) -> Option<Receiver<EncodedVideoPacket>> {
+    pub fn subscribe_packets(&mut self, session_id: &str) -> Option<Receiver<EncodedVideoPacket>> {
         if self.active_session_id.as_deref() != Some(session_id) {
             return None;
         }
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(RECENT_PACKET_LIMIT);
         for packet in self.latest_decodable_window_packets() {
             if sender.send(packet.clone()).is_err() {
                 return None;
             }
         }
-        self.subscribers.push(sender);
+        self.subscribers.push(PacketSubscriber {
+            sender,
+            waiting_for_keyframe: false,
+        });
         Some(receiver)
     }
 }

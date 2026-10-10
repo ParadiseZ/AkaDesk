@@ -3,15 +3,15 @@ use crate::types::{
     CapabilitySnapshotChanged, CapabilitySnapshotResponse, DiagnosticsResponse,
     GetCapabilitySnapshotRequest, GetDiagnosticsRequest, GetHostOverviewRequest,
     GetRuntimeStatusRequest, HostOverviewResponse, IpcEnvelope, IpcMessageKind,
-    RespondPendingRemoteRequestRequest, RespondPendingRemoteRequestResponse,
     RefreshTemporaryVerificationCodeRequest, RefreshTemporaryVerificationCodeResponse,
-    RuntimeStatusChanged, RuntimeStatusResponse, UpdateHostSettingsRequest,
-    UpdateHostSettingsResponse, CAPABILITY_SNAPSHOT_CHANGED, CAPABILITY_SNAPSHOT_RESPONSE,
-    DIAGNOSTICS_RESPONSE, GET_CAPABILITY_SNAPSHOT, GET_DIAGNOSTICS, GET_HOST_OVERVIEW,
-    GET_RUNTIME_STATUS, HOST_OVERVIEW_RESPONSE, REFRESH_TEMPORARY_VERIFICATION_CODE,
-    REFRESH_TEMPORARY_VERIFICATION_CODE_RESPONSE, RUNTIME_STATUS_CHANGED,
-    RESPOND_PENDING_REMOTE_REQUEST, RESPOND_PENDING_REMOTE_REQUEST_RESPONSE,
-    RUNTIME_STATUS_RESPONSE, UPDATE_HOST_SETTINGS, UPDATE_HOST_SETTINGS_RESPONSE,
+    RespondPendingRemoteRequestRequest, RespondPendingRemoteRequestResponse, RuntimeStatusChanged,
+    RuntimeStatusResponse, UpdateHostSettingsRequest, UpdateHostSettingsResponse,
+    CAPABILITY_SNAPSHOT_CHANGED, CAPABILITY_SNAPSHOT_RESPONSE, DIAGNOSTICS_RESPONSE,
+    GET_CAPABILITY_SNAPSHOT, GET_DIAGNOSTICS, GET_HOST_OVERVIEW, GET_RUNTIME_STATUS,
+    HOST_OVERVIEW_RESPONSE, REFRESH_TEMPORARY_VERIFICATION_CODE,
+    REFRESH_TEMPORARY_VERIFICATION_CODE_RESPONSE, RESPOND_PENDING_REMOTE_REQUEST,
+    RESPOND_PENDING_REMOTE_REQUEST_RESPONSE, RUNTIME_STATUS_CHANGED, RUNTIME_STATUS_RESPONSE,
+    UPDATE_HOST_SETTINGS, UPDATE_HOST_SETTINGS_RESPONSE,
 };
 use interprocess::local_socket::{prelude::*, GenericFilePath, GenericNamespaced, Stream};
 use prost::Message;
@@ -58,33 +58,32 @@ impl IpcClient {
     }
 
     pub fn recv_runtime_status_changed(&mut self) -> io::Result<RuntimeStatusChanged> {
-        let envelope = read_envelope(&mut self.stream)?;
-        if envelope.message_type != RUNTIME_STATUS_CHANGED {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "expected {RUNTIME_STATUS_CHANGED}, got {}",
-                    envelope.message_type
-                ),
-            ));
+        loop {
+            let envelope = self.recv_event()?;
+            if envelope.message_type == RUNTIME_STATUS_CHANGED {
+                return RuntimeStatusChanged::decode(&envelope.payload[..])
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()));
+            }
         }
-        RuntimeStatusChanged::decode(&envelope.payload[..])
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
     }
 
     pub fn recv_capability_snapshot_changed(&mut self) -> io::Result<CapabilitySnapshotChanged> {
-        let envelope = read_envelope(&mut self.stream)?;
-        if envelope.message_type != CAPABILITY_SNAPSHOT_CHANGED {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "expected {CAPABILITY_SNAPSHOT_CHANGED}, got {}",
-                    envelope.message_type
-                ),
-            ));
+        loop {
+            let envelope = self.recv_event()?;
+            if envelope.message_type == CAPABILITY_SNAPSHOT_CHANGED {
+                return CapabilitySnapshotChanged::decode(&envelope.payload[..])
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()));
+            }
         }
-        CapabilitySnapshotChanged::decode(&envelope.payload[..])
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+    }
+
+    pub fn recv_event(&mut self) -> io::Result<IpcEnvelope> {
+        loop {
+            let envelope = read_envelope(&mut self.stream)?;
+            if envelope.kind == IpcMessageKind::Event as i32 {
+                return Ok(envelope);
+            }
+        }
     }
 
     pub fn get_runtime_status(&mut self) -> io::Result<RuntimeStatusResponse> {
@@ -130,12 +129,24 @@ impl IpcClient {
 
     pub fn respond_pending_remote_request(
         &mut self,
+        request_id: String,
         allow: bool,
     ) -> io::Result<RespondPendingRemoteRequestResponse> {
         self.request_response(
             RESPOND_PENDING_REMOTE_REQUEST,
             RESPOND_PENDING_REMOTE_REQUEST_RESPONSE,
-            RespondPendingRemoteRequestRequest { allow },
+            RespondPendingRemoteRequestRequest { allow, request_id },
+        )
+    }
+
+    pub fn stop_session(
+        &mut self,
+        session_id: String,
+    ) -> io::Result<crate::types::StopSessionResponse> {
+        self.request_response(
+            crate::types::STOP_SESSION,
+            crate::types::STOP_SESSION_RESPONSE,
+            crate::types::StopSessionRequest { session_id },
         )
     }
 
@@ -168,7 +179,10 @@ impl IpcClient {
         write_envelope(&mut self.stream, &envelope)?;
         loop {
             let response = read_envelope(&mut self.stream)?;
-            if response.message_type == response_type {
+            if response.message_type == response_type
+                && response.request_id == envelope.request_id
+                && response.kind == IpcMessageKind::Response as i32
+            {
                 return Res::decode(&response.payload[..])
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()));
             }

@@ -9,22 +9,23 @@ class HostDiscoveryClient(
     context: Context,
     private val onHostResolved: (ControlledHostSummary) -> Unit,
     private val onError: (String) -> Unit,
+    private val onHostLost: (String) -> Unit,
 ) {
     private val appContext = context.applicationContext
     private val nsdManager = appContext.getSystemService(Context.NSD_SERVICE) as NsdManager
     private var discoveryListener: NsdManager.DiscoveryListener? = null
 
     fun start() {
-        if (discoveryListener != null) {
-            return
-        }
+        stop()
         val listener = object : NsdManager.DiscoveryListener {
             override fun onStartDiscoveryFailed(serviceType: String?, errorCode: Int) {
+                if (discoveryListener !== this) return
+                discoveryListener = null
                 onError("mDNS discovery failed to start: $errorCode")
             }
 
             override fun onStopDiscoveryFailed(serviceType: String?, errorCode: Int) {
-                onError("mDNS discovery failed to stop: $errorCode")
+                if (discoveryListener === this) onError("mDNS discovery failed to stop: $errorCode")
             }
 
             override fun onDiscoveryStarted(serviceType: String?) = Unit
@@ -32,10 +33,12 @@ class HostDiscoveryClient(
             override fun onDiscoveryStopped(serviceType: String?) = Unit
 
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-                resolve(serviceInfo)
+                if (discoveryListener === this) resolve(serviceInfo, this)
             }
 
-            override fun onServiceLost(serviceInfo: NsdServiceInfo) = Unit
+            override fun onServiceLost(serviceInfo: NsdServiceInfo) {
+                if (discoveryListener === this) onHostLost(serviceInfo.serviceName)
+            }
         }
         discoveryListener = listener
         nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
@@ -48,18 +51,18 @@ class HostDiscoveryClient(
         discoveryListener = null
     }
 
-    private fun resolve(serviceInfo: NsdServiceInfo) {
+    private fun resolve(serviceInfo: NsdServiceInfo, owner: NsdManager.DiscoveryListener) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             nsdManager.resolveService(
                 serviceInfo,
                 appContext.mainExecutor,
                 object : NsdManager.ResolveListener {
                     override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                        onError("mDNS resolve failed: $errorCode")
+                        if (discoveryListener === owner) onError("mDNS resolve failed: $errorCode")
                     }
 
                     override fun onServiceResolved(resolvedServiceInfo: NsdServiceInfo) {
-                        onHostResolved(resolvedServiceInfo.toControlledHostSummary())
+                        if (discoveryListener === owner) onHostResolved(resolvedServiceInfo.toControlledHostSummary())
                     }
                 }
             )
@@ -69,11 +72,11 @@ class HostDiscoveryClient(
                 serviceInfo,
                 object : NsdManager.ResolveListener {
                     override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                        onError("mDNS resolve failed: $errorCode")
+                        if (discoveryListener === owner) onError("mDNS resolve failed: $errorCode")
                     }
 
                     override fun onServiceResolved(resolvedServiceInfo: NsdServiceInfo) {
-                        onHostResolved(resolvedServiceInfo.toControlledHostSummary())
+                        if (discoveryListener === owner) onHostResolved(resolvedServiceInfo.toControlledHostSummary())
                     }
                 }
             )

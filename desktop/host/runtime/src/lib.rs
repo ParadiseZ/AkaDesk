@@ -1,8 +1,10 @@
 pub mod approval;
 pub mod audio;
+pub mod auth;
 pub mod control;
 pub mod diagnostics;
 pub mod discovery;
+pub mod events;
 pub mod generated;
 pub mod orchestration;
 pub mod pairing;

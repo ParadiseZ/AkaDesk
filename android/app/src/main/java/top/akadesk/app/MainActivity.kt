@@ -1,27 +1,49 @@
 package top.akadesk.app
 
 import android.os.Bundle
+import android.content.pm.ActivityInfo
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.remember
-import top.akadesk.app.controller.ControllerCoordinator
+import androidx.lifecycle.ViewModelProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import top.akadesk.app.controller.ControllerViewModel
 import top.akadesk.app.ui.home.ControllerHomeApp
 import top.akadesk.app.ui.theme.AkaDeskTheme
 
 class MainActivity : ComponentActivity() {
+    private var originalOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        originalOrientation = savedInstanceState?.getInt("normal_orientation") ?: requestedOrientation
         enableEdgeToEdge()
+        val coordinator = ViewModelProvider(this)[ControllerViewModel::class.java].coordinator
         setContent {
-            AkaDeskTheme {
-                val coordinator = remember { ControllerCoordinator(this) }
-                DisposableEffect(Unit) {
-                    onDispose { coordinator.stopDiscovery() }
+            val viewing = coordinator.activeSession != null
+            LaunchedEffect(viewing) {
+                requestedOrientation = if (viewing) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else originalOrientation
+                val bars = WindowCompat.getInsetsController(window, window.decorView)
+                if (viewing) {
+                    bars.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    bars.hide(WindowInsetsCompat.Type.systemBars())
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                } else {
+                    bars.show(WindowInsetsCompat.Type.systemBars())
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 }
+            }
+            AkaDeskTheme {
                 ControllerHomeApp(coordinator = coordinator)
             }
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putInt("normal_orientation", originalOrientation)
+        super.onSaveInstanceState(outState)
     }
 }

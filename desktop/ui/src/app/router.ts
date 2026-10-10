@@ -14,6 +14,7 @@ const routes = [
       {
         path: "/file-transfer",
         component: () => import('@/pages/PlaceholderPage.vue'),
+        props: { title: '文件传输', description: '当前版本尚未开放文件传输。' },
         icon: Files,
         title:'文件传输',
       },
@@ -30,5 +31,5 @@ export const router = createRouter({
 });
 
 export const routerAndIcon = routes
-    .filter(r=>r.icon)
+    .filter(r=>r.icon && r.path !== '/file-transfer')
     .map(r => ({path: r.path,title: r.title, icon:r.icon}));

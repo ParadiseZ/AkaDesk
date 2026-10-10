@@ -3,18 +3,14 @@ use crate::generated::v1::{
     CapabilityFlags, ControlEnvelope, ControlHello, ControlHelloAck, ControlMessageKind,
     DeviceIdentity, DevicePresence, DeviceSnapshot, DeviceSnapshotResponse, ErrorInfo,
     GetDeviceSnapshot, HeartbeatPing, HeartbeatPong, HostTransportStatusEvent,
-    HostVideoStreamEvent, PairingChallenge, PairingChallengeType, PairingConfirm, PairingRequest,
-    PairingResult, PlatformKind, SessionChangedEvent, SessionClosedEvent, SessionState,
-    StartSessionAccepted, StartSessionRejected, StartSessionRequest, WebRtcAnswer, IceCandidate,
+    HostVideoStreamEvent, IceCandidate, PairingChallenge, PairingChallengeType, PairingConfirm,
+    PairingRequest, PairingResult, PlatformKind, SessionChangedEvent, SessionClosedEvent,
+    SessionState, StartSessionAccepted, StartSessionRejected, StartSessionRequest, WebRtcAnswer,
 };
-use crate::pairing::{
-    generate_pair_token, now_ms, PendingChallenge, SharedPairingStore,
-};
+use crate::pairing::{generate_pair_token, now_ms, PendingChallenge, SharedPairingStore};
 use crate::session::SharedSessionRegistry;
-use crate::signaling::{
-    RemoteAnswerStoreResult, RemoteCandidateStoreResult, SharedSignalingState,
-};
 use crate::settings::{ConnectionMethod, HostSettingsStore};
+use crate::signaling::{RemoteAnswerStoreResult, RemoteCandidateStoreResult, SharedSignalingState};
 use crate::transport::SharedTransportStatusState;
 use crate::video::SharedVideoStreamState;
 use host_ipc::types::StopSessionRequest;
@@ -22,15 +18,258 @@ use prost::Message as ProstMessage;
 use std::io;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
-use tungstenite::{accept, Error as WsError, Message as WsMessage, WebSocket};
+use tungstenite::{accept, Error as WsError, Message as WsMessage};
 
 pub const DEFAULT_CONTROL_PORT: u16 = 46661;
 
-type SharedControlWebSocket = Arc<Mutex<WebSocket<TcpStream>>>;
+pub fn reap_finished_session(state: &ControlPlaneState) -> io::Result<()> {
+    let sessions = state.sessions.lock().map_err(session_lock_err)?;
+    let Some(snapshot) = sessions
+        .active
+        .as_ref()
+        .filter(|session| session.closed_at_ms > 0)
+        .map(|session| session.snapshot())
+    else {
+        return Ok(());
+    };
+    state
+        .video_streams
+        .lock()
+        .map_err(video_stream_lock_err)?
+        .finish_session(&snapshot.session_id);
+    state
+        .signaling
+        .lock()
+        .map_err(signaling_lock_err)?
+        .finish_session(&snapshot.session_id);
+    state
+        .transport_status
+        .lock()
+        .map_err(transport_status_lock_err)?
+        .finish_session(&snapshot.session_id);
+    state
+        .settings
+        .lock()
+        .map_err(settings_lock_err)?
+        .refresh_after_session_end(&snapshot.session_id)
+}
+
+type SharedControlWebSocket = Arc<SyncSender<WsMessage>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::RuntimeService;
+    use tungstenite::connect;
+
+    fn fixture() -> (std::path::PathBuf, Arc<ControlPlaneState>) {
+        let directory =
+            std::env::temp_dir().join(format!("akadesk-control-{}", generate_pair_token()));
+        let service = RuntimeService::new_in(&directory).unwrap();
+        let state = Arc::new(service.control_state().clone());
+        (directory, state)
+    }
+
+    #[test]
+    fn consent_wait_keeps_heartbeats_alive_and_connection_close_joins_workers() {
+        let (directory, state) = fixture();
+        let mut settings = state.settings.lock().unwrap();
+        let mut snapshot = settings.snapshot();
+        snapshot.connection_method = "TRUST_ONLY".into();
+        settings.update(snapshot).unwrap();
+        drop(settings);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = Arc::clone(&state);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            done_tx
+                .send(handle_connection(stream, server_state))
+                .unwrap();
+        });
+        let (mut socket, _) = connect(format!("ws://{address}")).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+        }
+        let send =
+            |socket: &mut tungstenite::WebSocket<_>, message_type: &str, payload: Vec<u8>| {
+                socket
+                    .send(WsMessage::Binary(
+                        ControlEnvelope {
+                            request_id: "test".into(),
+                            kind: ControlMessageKind::Request as i32,
+                            r#type: message_type.into(),
+                            payload,
+                            timestamp_ms: now_ms(),
+                        }
+                        .encode_to_vec(),
+                    ))
+                    .unwrap();
+            };
+        send(
+            &mut socket,
+            "PairingRequest",
+            PairingRequest {
+                request_id: "pair".into(),
+                controller_device_id: "phone".into(),
+                controller_display_name: "Phone".into(),
+                version: None,
+            }
+            .encode_to_vec(),
+        );
+        let challenge = socket.read().unwrap();
+        assert!(matches!(challenge, WsMessage::Binary(_)));
+        let id = state
+            .pending_remote_requests
+            .lock()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .request_id;
+        assert!(!state
+            .pending_remote_requests
+            .lock()
+            .unwrap()
+            .respond("old-popup", true));
+        for index in 0..8 {
+            thread::sleep(Duration::from_secs(1));
+            send(
+                &mut socket,
+                "HeartbeatPing",
+                HeartbeatPing {
+                    request_id: format!("ping-{index}"),
+                    timestamp_ms: index,
+                }
+                .encode_to_vec(),
+            );
+            let WsMessage::Binary(frame) = socket.read().unwrap() else {
+                panic!("missing heartbeat response")
+            };
+            assert_eq!(
+                ControlEnvelope::decode(&frame[..]).unwrap().r#type,
+                "HeartbeatPong"
+            );
+        }
+        assert!(state
+            .pending_remote_requests
+            .lock()
+            .unwrap()
+            .respond(&id, true));
+        let WsMessage::Binary(frame) = socket.read().unwrap() else {
+            panic!("missing pairing result")
+        };
+        let result = ControlEnvelope::decode(&frame[..]).unwrap();
+        assert!(PairingResult::decode(&result.payload[..]).unwrap().accepted);
+        socket.close(None).unwrap();
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_ok());
+        worker.join().unwrap();
+        assert!(state
+            .pending_remote_requests
+            .lock()
+            .unwrap()
+            .snapshot()
+            .is_none());
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn signaling_rejects_other_controllers_and_expired_challenges() {
+        let (directory, state) = fixture();
+        let active = state
+            .sessions
+            .lock()
+            .unwrap()
+            .activate_preparing(
+                String::new(),
+                "owner".into(),
+                "host".into(),
+                String::new(),
+                Default::default(),
+            )
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let outbound = Arc::new(tx);
+        let mut session = ConnectionSession {
+            peer: "127.0.0.1".into(),
+            authenticated_controller_device_id: Some("intruder".into()),
+            ..Default::default()
+        };
+        let envelope = ControlEnvelope {
+            request_id: "answer".into(),
+            kind: ControlMessageKind::Request as i32,
+            r#type: "WebRtcAnswer".into(),
+            payload: WebRtcAnswer {
+                session_id: active.session_id,
+                sdp: "unauthorized".into(),
+            }
+            .encode_to_vec(),
+            timestamp_ms: now_ms(),
+        };
+        assert_eq!(
+            handle_envelope(
+                &outbound,
+                &state,
+                &mut session,
+                &Arc::new(Mutex::new(None)),
+                envelope
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        session.pending_challenge = Some(PendingChallenge {
+            request_id: "pair".into(),
+            controller_device_id: "phone".into(),
+            controller_display_name: "Phone".into(),
+            challenge_id: "expired".into(),
+            expires_at_ms: now_ms() - 1,
+        });
+        let confirm = PairingConfirm {
+            request_id: "confirm".into(),
+            challenge_id: "expired".into(),
+            verification_code: state
+                .settings
+                .lock()
+                .unwrap()
+                .current()
+                .temporary_verification_code,
+        };
+        handle_envelope(
+            &outbound,
+            &state,
+            &mut session,
+            &Arc::new(Mutex::new(None)),
+            ControlEnvelope {
+                request_id: "confirm".into(),
+                kind: ControlMessageKind::Request as i32,
+                r#type: "PairingConfirm".into(),
+                payload: confirm.encode_to_vec(),
+                timestamp_ms: now_ms(),
+            },
+        )
+        .unwrap();
+        let WsMessage::Binary(frame) = rx.recv().unwrap() else {
+            panic!("missing rejection")
+        };
+        let result = ControlEnvelope::decode(&frame[..]).unwrap();
+        assert!(!PairingResult::decode(&result.payload[..]).unwrap().accepted);
+        assert_eq!(state.pairing_store.lock().unwrap().count(), 0);
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
 type SharedActiveSessionId = Arc<Mutex<Option<String>>>;
 type SharedTerminalSessionState = Arc<Mutex<Option<(String, i32)>>>;
 type SharedVideoStreamEventState = Arc<Mutex<Option<SentVideoStreamEventState>>>;
@@ -72,6 +311,7 @@ pub struct ControlPlaneState {
     pub video_streams: SharedVideoStreamState,
     pub signaling: SharedSignalingState,
     pub transport_status: SharedTransportStatusState,
+    pub pairing_attempts: Arc<Mutex<crate::auth::PairingAttemptLimiter>>,
 }
 
 pub fn spawn_control_server(
@@ -96,75 +336,102 @@ pub fn spawn_control_server(
 }
 
 fn handle_connection(stream: TcpStream, state: Arc<ControlPlaneState>) -> io::Result<()> {
+    let peer = stream.peer_addr()?.ip().to_string();
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut websocket =
         accept(stream).map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
     websocket
         .get_mut()
         .set_read_timeout(Some(Duration::from_millis(150)))?;
-    let websocket: SharedControlWebSocket = Arc::new(Mutex::new(websocket));
+    let (outbound_tx, outbound_rx) = std::sync::mpsc::sync_channel(64);
+    let outbound = Arc::new(outbound_tx);
     let active_session_id: SharedActiveSessionId = Arc::new(Mutex::new(None));
+    let stopping = Arc::new(AtomicBool::new(false));
     let signaling_pump = spawn_signaling_pump(
-        Arc::clone(&websocket),
+        Arc::clone(&outbound),
         Arc::clone(&active_session_id),
         Arc::clone(&state),
+        Arc::clone(&stopping),
     );
     let terminal_session_state: SharedTerminalSessionState = Arc::new(Mutex::new(None));
     let terminal_session_pump = spawn_terminal_session_pump(
-        Arc::clone(&websocket),
+        Arc::clone(&outbound),
         Arc::clone(&active_session_id),
         Arc::clone(&terminal_session_state),
         Arc::clone(&state),
+        Arc::clone(&stopping),
     );
     let video_stream_event_state: SharedVideoStreamEventState = Arc::new(Mutex::new(None));
     let video_stream_pump = spawn_video_stream_event_pump(
-        Arc::clone(&websocket),
+        Arc::clone(&outbound),
         Arc::clone(&active_session_id),
         Arc::clone(&video_stream_event_state),
         Arc::clone(&state),
+        Arc::clone(&stopping),
     );
     let transport_event_state: SharedTransportEventState = Arc::new(Mutex::new(None));
     let transport_status_pump = spawn_transport_status_event_pump(
-        Arc::clone(&websocket),
+        Arc::clone(&outbound),
         Arc::clone(&active_session_id),
         Arc::clone(&transport_event_state),
         Arc::clone(&state),
+        Arc::clone(&stopping),
     );
-    let mut session = ConnectionSession::default();
-    let loop_result = loop {
-        let frame = {
-            let mut websocket = websocket.lock().map_err(ws_lock_err)?;
-            match websocket.read() {
-                Ok(frame) => Some(frame),
-                Err(WsError::Io(err))
-                    if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-                {
-                    None
-                }
-                Err(err) => break Err(ws_err(err)),
-            }
-        };
-        let Some(frame) = frame else {
-            continue;
-        };
-        match frame {
-            WsMessage::Binary(bytes) => {
-                let envelope = ControlEnvelope::decode(&bytes[..]).map_err(decode_err)?;
-                handle_envelope(
-                    &websocket,
-                    &state,
-                    &mut session,
-                    &active_session_id,
-                    envelope,
-                )?
-            }
-            WsMessage::Close(_) => break Ok(()),
-            WsMessage::Ping(payload) => {
-                let mut websocket = websocket.lock().map_err(ws_lock_err)?;
-                websocket.send(WsMessage::Pong(payload)).map_err(ws_err)?
-            }
-            _ => {}
-        }
+    let mut session = ConnectionSession {
+        peer,
+        ..ConnectionSession::default()
     };
+    // Always run cleanup, including decode errors and rejected messages.
+    let loop_result = (|| -> io::Result<()> {
+        loop {
+            poll_local_confirmation(&outbound, &state, &mut session)?;
+            for _ in 0..64 {
+                match outbound_rx.try_recv() {
+                    Ok(message) => websocket.send(message).map_err(ws_err)?,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return Ok(()),
+                }
+            }
+            let frame = {
+                match websocket.read() {
+                    Ok(frame) => Some(frame),
+                    Err(WsError::Io(err))
+                        if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                    {
+                        None
+                    }
+                    Err(err) => break Err(ws_err(err)),
+                }
+            };
+            let Some(frame) = frame else {
+                continue;
+            };
+            match frame {
+                WsMessage::Binary(bytes) => {
+                    let envelope = ControlEnvelope::decode(&bytes[..]).map_err(decode_err)?;
+                    handle_envelope(
+                        &outbound,
+                        &state,
+                        &mut session,
+                        &active_session_id,
+                        envelope,
+                    )?
+                }
+                WsMessage::Close(_) => break Ok(()),
+                WsMessage::Ping(payload) => {
+                    websocket.send(WsMessage::Pong(payload)).map_err(ws_err)?
+                }
+                _ => {}
+            }
+        }
+    })();
+    stopping.store(true, Ordering::Relaxed);
+    if let Some(pending) = session.pending_confirmation.take() {
+        if let Ok(mut requests) = state.pending_remote_requests.lock() {
+            requests.cancel(&pending.request_id);
+        }
+    }
     if let Ok(mut session_id) = active_session_id.lock() {
         *session_id = None;
     }
@@ -177,8 +444,23 @@ fn handle_connection(stream: TcpStream, state: Arc<ControlPlaneState>) -> io::Re
 
 #[derive(Debug, Default)]
 struct ConnectionSession {
+    peer: String,
     authenticated_controller_device_id: Option<String>,
     pending_challenge: Option<PendingChallenge>,
+    pending_confirmation: Option<PendingLocalConfirmation>,
+}
+
+#[derive(Debug)]
+struct PendingLocalConfirmation {
+    request_id: String,
+    response_rx: Receiver<bool>,
+    envelope_request_id: String,
+    result_request_id: String,
+    controller_device_id: String,
+    controller_display_name: String,
+    connection_method: ConnectionMethod,
+    after_access_code: bool,
+    expires_at_ms: i64,
 }
 
 fn handle_envelope(
@@ -191,30 +473,44 @@ fn handle_envelope(
     match envelope.r#type.as_str() {
         "ControlHello" => {
             let hello = ControlHello::decode(&envelope.payload[..]).map_err(decode_err)?;
-            let host_settings = state
-                .settings
-                .lock()
-                .map_err(settings_lock_err)?
-                .current();
+            let host_settings = state.settings.lock().map_err(settings_lock_err)?.current();
             let has_active_session_for_controller = state
                 .sessions
                 .lock()
                 .map_err(session_lock_err)?
                 .active_snapshot_for_controller(&hello.controller_device_id)
                 .is_some();
-            let accepted = if hello.pair_token.is_empty() {
+            let mut invalid_token = false;
+            let accepted = if !host_settings.allow_remote_assistance
+                || hello.pair_token.is_empty()
+                || !state
+                    .pairing_attempts
+                    .lock()
+                    .map_err(lock_err)?
+                    .permits(&session.peer, now_ms())
+            {
                 false
             } else if host_settings.connection_method() != ConnectionMethod::AccessCode
                 && !has_active_session_for_controller
             {
                 false
             } else {
-                state
+                let valid = state
                     .pairing_store
                     .lock()
                     .map_err(lock_err)?
-                    .verify_pair_token(&hello.controller_device_id, &hello.pair_token)?
+                    .verify_pair_token(&hello.controller_device_id, &hello.pair_token)?;
+                invalid_token = !valid;
+                valid
             };
+            if invalid_token {
+                state
+                    .pairing_attempts
+                    .lock()
+                    .map_err(lock_err)?
+                    .record_failure(&session.peer, now_ms());
+            }
+            session.authenticated_controller_device_id = None;
             if accepted {
                 let controller_device_id = hello.controller_device_id;
                 session.authenticated_controller_device_id = Some(controller_device_id.clone());
@@ -241,11 +537,30 @@ fn handle_envelope(
         }
         "PairingRequest" => {
             let request = PairingRequest::decode(&envelope.payload[..]).map_err(decode_err)?;
-            let host_settings = state
-                .settings
+            if session.pending_confirmation.is_some() {
+                return send_pairing_error(
+                    websocket,
+                    &envelope.request_id,
+                    &request.request_id,
+                    "AUTH_REQUEST_PENDING",
+                    "A local confirmation request is already pending.",
+                );
+            }
+            if !state
+                .pairing_attempts
                 .lock()
-                .map_err(settings_lock_err)?
-                .current();
+                .map_err(lock_err)?
+                .permits(&session.peer, now_ms())
+            {
+                return send_pairing_error(
+                    websocket,
+                    &envelope.request_id,
+                    &request.request_id,
+                    "AUTH_RATE_LIMITED",
+                    "Too many failed attempts. Please retry in one minute.",
+                );
+            }
+            let host_settings = state.settings.lock().map_err(settings_lock_err)?.current();
             if !host_settings.allow_remote_assistance {
                 let result = PairingResult {
                     request_id: request.request_id,
@@ -274,7 +589,10 @@ fn handle_envelope(
                         request.request_id,
                         request.controller_device_id,
                         request.controller_display_name,
-                        host_settings.connection_method().as_wire_value().to_string(),
+                        host_settings
+                            .connection_method()
+                            .as_wire_value()
+                            .to_string(),
                         false,
                         None,
                     );
@@ -285,6 +603,7 @@ fn handle_envelope(
                 controller_device_id: request.controller_device_id.clone(),
                 controller_display_name: request.controller_display_name.clone(),
                 challenge_id: format!("challenge-{}", crate::pairing::generate_pair_token()),
+                expires_at_ms: now_ms() + 60_000,
             };
             session.pending_challenge = Some(challenge.clone());
             let message = PairingChallenge {
@@ -303,6 +622,30 @@ fn handle_envelope(
         }
         "PairingConfirm" => {
             let confirm = PairingConfirm::decode(&envelope.payload[..]).map_err(decode_err)?;
+            if session.pending_confirmation.is_some() {
+                return send_pairing_error(
+                    websocket,
+                    &envelope.request_id,
+                    &confirm.request_id,
+                    "AUTH_REQUEST_PENDING",
+                    "A local confirmation request is already pending.",
+                );
+            }
+            if !state
+                .pairing_attempts
+                .lock()
+                .map_err(lock_err)?
+                .permits(&session.peer, now_ms())
+            {
+                session.pending_challenge = None;
+                return send_pairing_error(
+                    websocket,
+                    &envelope.request_id,
+                    &confirm.request_id,
+                    "AUTH_RATE_LIMITED",
+                    "Too many failed attempts. Please retry in one minute.",
+                );
+            }
             let Some(challenge) = session.pending_challenge.as_ref() else {
                 let result = PairingResult {
                     request_id: confirm.request_id,
@@ -322,7 +665,8 @@ fn handle_envelope(
                 );
             };
 
-            if challenge.challenge_id != confirm.challenge_id {
+            if challenge.challenge_id != confirm.challenge_id || challenge.expires_at_ms <= now_ms()
+            {
                 let result = PairingResult {
                     request_id: confirm.request_id,
                     accepted: false,
@@ -341,12 +685,23 @@ fn handle_envelope(
                 );
             }
 
-            let host_settings = state
-                .settings
-                .lock()
-                .map_err(settings_lock_err)?
-                .current();
+            let host_settings = state.settings.lock().map_err(settings_lock_err)?.current();
+            if !host_settings.allow_remote_assistance {
+                session.pending_challenge = None;
+                return send_pairing_error(
+                    websocket,
+                    &envelope.request_id,
+                    &confirm.request_id,
+                    "AUTH_REMOTE_ASSISTANCE_DISABLED",
+                    "Remote assistance is currently disabled.",
+                );
+            }
             if !host_settings.accepts_access_code(&confirm.verification_code) {
+                state
+                    .pairing_attempts
+                    .lock()
+                    .map_err(lock_err)?
+                    .record_failure(&session.peer, now_ms());
                 let result = PairingResult {
                     request_id: confirm.request_id,
                     accepted: false,
@@ -374,7 +729,10 @@ fn handle_envelope(
                     confirm.request_id,
                     challenge.controller_device_id.clone(),
                     challenge.controller_display_name.clone(),
-                    host_settings.connection_method().as_wire_value().to_string(),
+                    host_settings
+                        .connection_method()
+                        .as_wire_value()
+                        .to_string(),
                     true,
                     Some(challenge.challenge_id.clone()),
                 );
@@ -430,11 +788,7 @@ fn handle_envelope(
         "GetDeviceSnapshot" => {
             let request = GetDeviceSnapshot::decode(&envelope.payload[..]).map_err(decode_err)?;
             if session.authenticated_controller_device_id.is_none() {
-                let host_settings = state
-                    .settings
-                    .lock()
-                    .map_err(settings_lock_err)?
-                    .current();
+                let host_settings = state.settings.lock().map_err(settings_lock_err)?.current();
                 let response = DeviceSnapshotResponse {
                     request_id: request.request_id,
                     snapshot: None,
@@ -483,11 +837,7 @@ fn handle_envelope(
         }
         "StartSessionRequest" => {
             if session.authenticated_controller_device_id.is_none() {
-                let host_settings = state
-                    .settings
-                    .lock()
-                    .map_err(settings_lock_err)?
-                    .current();
+                let host_settings = state.settings.lock().map_err(settings_lock_err)?.current();
                 return send_start_session_rejected(
                     websocket,
                     &envelope.request_id,
@@ -497,11 +847,7 @@ fn handle_envelope(
             }
 
             let request = StartSessionRequest::decode(&envelope.payload[..]).map_err(decode_err)?;
-            let host_settings = state
-                .settings
-                .lock()
-                .map_err(settings_lock_err)?
-                .current();
+            let host_settings = state.settings.lock().map_err(settings_lock_err)?.current();
             if !host_settings.allow_remote_assistance {
                 return send_start_session_rejected(
                     websocket,
@@ -547,7 +893,49 @@ fn handle_envelope(
             if intent.controlled_device_id.trim().is_empty() {
                 intent.controlled_device_id = state.host_identity.device_id.clone();
             }
+            if intent.controlled_device_id != state.host_identity.device_id {
+                return send_start_session_rejected(
+                    websocket,
+                    &envelope.request_id,
+                    intent.session_id,
+                    simple_error(
+                        "AUTH_HOST_ID_MISMATCH",
+                        "The requested host does not match this device.",
+                    ),
+                );
+            }
 
+            if intent.enable_input || intent.audio.is_some() || !intent.target_display_id.is_empty()
+            {
+                return send_start_session_rejected(
+                    websocket,
+                    &envelope.request_id,
+                    intent.session_id,
+                    simple_error(
+                        "SESSION_FEATURE_UNSUPPORTED",
+                        "This version supports viewing the primary display only.",
+                    ),
+                );
+            }
+            reap_finished_session(state)?;
+            if state
+                .sessions
+                .lock()
+                .map_err(session_lock_err)?
+                .active
+                .as_ref()
+                .is_some_and(|s| s.closed_at_ms == 0)
+            {
+                return send_start_session_rejected(
+                    websocket,
+                    &envelope.request_id,
+                    intent.session_id,
+                    simple_error(
+                        "SESSION_HOST_BUSY",
+                        "Another remote assistance session is active.",
+                    ),
+                );
+            }
             let prepared = match crate::video::prepare_h264_session(&intent) {
                 Ok(prepared) => prepared,
                 Err(err) => {
@@ -580,6 +968,17 @@ fn handle_envelope(
                     intent.target_display_id,
                     prepared_spec.clone(),
                 );
+            let Some(snapshot) = snapshot else {
+                return send_start_session_rejected(
+                    websocket,
+                    &envelope.request_id,
+                    String::new(),
+                    simple_error(
+                        "SESSION_HOST_BUSY",
+                        "Another remote assistance session is active.",
+                    ),
+                );
+            };
             state
                 .signaling
                 .lock()
@@ -685,7 +1084,11 @@ fn handle_envelope(
                 Arc::clone(&state.signaling),
                 Arc::clone(&state.transport_status),
                 snapshot.session_id.clone(),
-                snapshot.video.as_ref().map(|video| video.fps).unwrap_or_default(),
+                snapshot
+                    .video
+                    .as_ref()
+                    .map(|video| video.fps)
+                    .unwrap_or_default(),
                 streaming.rtp_fmtp_line.clone(),
             )
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
@@ -794,12 +1197,7 @@ fn handle_envelope(
                     snapshot: Some(streaming.snapshot.clone()),
                 },
             )?;
-            flush_local_signaling_events(
-                websocket,
-                &envelope.request_id,
-                state,
-                &session_id,
-            )?;
+            flush_local_signaling_events(websocket, &envelope.request_id, state, &session_id)?;
 
             if let Ok(mut active) = active_session_id.lock() {
                 *active = Some(session_id);
@@ -814,6 +1212,7 @@ fn handle_envelope(
                     "WebRtcAnswer received before control channel authentication",
                 ));
             }
+            require_session_owner(state, session, &answer.session_id)?;
             let store_result = state
                 .signaling
                 .lock()
@@ -862,6 +1261,7 @@ fn handle_envelope(
                     "IceCandidate received before control channel authentication",
                 ));
             }
+            require_session_owner(state, session, &candidate.session_id)?;
             let store_result = state
                 .signaling
                 .lock()
@@ -897,7 +1297,8 @@ fn handle_envelope(
         }
         "StopSessionRequest" => {
             let request = StopSessionRequest::decode(&envelope.payload[..]).map_err(decode_err)?;
-            let Some(controller_device_id) = session.authenticated_controller_device_id.as_deref() else {
+            let Some(controller_device_id) = session.authenticated_controller_device_id.as_deref()
+            else {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "StopSessionRequest received before control channel authentication",
@@ -942,6 +1343,11 @@ fn handle_envelope(
                 .lock()
                 .map_err(transport_status_lock_err)?
                 .finish_session(&request.session_id);
+            state
+                .settings
+                .lock()
+                .map_err(settings_lock_err)?
+                .refresh_after_session_end(&request.session_id)?;
             send_payload_shared(
                 websocket,
                 &envelope.request_id,
@@ -966,8 +1372,12 @@ fn spawn_signaling_pump(
     websocket: SharedControlWebSocket,
     active_session_id: SharedActiveSessionId,
     state: Arc<ControlPlaneState>,
+    stopping: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || loop {
+        if stopping.load(Ordering::Relaxed) {
+            break;
+        }
         let maybe_session_id = match active_session_id.lock() {
             Ok(active) => active.clone(),
             Err(_) => break,
@@ -997,8 +1407,12 @@ fn spawn_terminal_session_pump(
     active_session_id: SharedActiveSessionId,
     terminal_session_state: SharedTerminalSessionState,
     state: Arc<ControlPlaneState>,
+    stopping: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || loop {
+        if stopping.load(Ordering::Relaxed) {
+            break;
+        }
         let maybe_session_id = match active_session_id.lock() {
             Ok(active) => active.clone(),
             Err(_) => break,
@@ -1016,10 +1430,9 @@ fn spawn_terminal_session_pump(
                 Ok(registry) => registry,
                 Err(_) => break,
             };
-            registry
-                .active
-                .as_ref()
-                .and_then(|session| (session.session_id.0 == session_id).then(|| session.snapshot()))
+            registry.active.as_ref().and_then(|session| {
+                (session.session_id.0 == session_id).then(|| session.snapshot())
+            })
         };
 
         let Some(snapshot) = snapshot else {
@@ -1029,20 +1442,6 @@ fn spawn_terminal_session_pump(
             thread::sleep(Duration::from_millis(100));
             continue;
         };
-
-        if !is_terminal_session_state(snapshot.state) {
-            if let Ok(mut sent_terminal) = terminal_session_state.lock() {
-                let should_clear = sent_terminal
-                    .as_ref()
-                    .map(|(sent_session_id, _)| sent_session_id == &snapshot.session_id)
-                    .unwrap_or(false);
-                if should_clear {
-                    sent_terminal.take();
-                }
-            }
-            thread::sleep(Duration::from_millis(100));
-            continue;
-        }
 
         let should_send = match terminal_session_state.lock() {
             Ok(sent_terminal) => sent_terminal
@@ -1098,19 +1497,17 @@ fn spawn_terminal_session_pump(
     })
 }
 
-fn is_terminal_session_state(state: i32) -> bool {
-    state == SessionState::Failed as i32
-        || state == SessionState::Disconnecting as i32
-        || state == SessionState::Disconnected as i32
-}
-
 fn spawn_video_stream_event_pump(
     websocket: SharedControlWebSocket,
     active_session_id: SharedActiveSessionId,
     sent_state: SharedVideoStreamEventState,
     state: Arc<ControlPlaneState>,
+    stopping: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || loop {
+        if stopping.load(Ordering::Relaxed) {
+            break;
+        }
         let maybe_session_id = match active_session_id.lock() {
             Ok(active) => active.clone(),
             Err(_) => break,
@@ -1211,8 +1608,12 @@ fn spawn_transport_status_event_pump(
     active_session_id: SharedActiveSessionId,
     sent_state: SharedTransportEventState,
     state: Arc<ControlPlaneState>,
+    stopping: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || loop {
+        if stopping.load(Ordering::Relaxed) {
+            break;
+        }
         let maybe_session_id = match active_session_id.lock() {
             Ok(active) => active.clone(),
             Err(_) => break,
@@ -1314,8 +1715,8 @@ fn spawn_transport_status_event_pump(
     })
 }
 
-fn send_payload<T: ProstMessage>(
-    websocket: &mut WebSocket<TcpStream>,
+fn send_payload_shared<T: ProstMessage>(
+    websocket: &SharedControlWebSocket,
     request_id: &str,
     kind: ControlMessageKind,
     message_type: &str,
@@ -1329,19 +1730,15 @@ fn send_payload<T: ProstMessage>(
         timestamp_ms: now_ms(),
     };
     websocket
-        .send(WsMessage::Binary(envelope.encode_to_vec()))
-        .map_err(ws_err)
-}
-
-fn send_payload_shared<T: ProstMessage>(
-    websocket: &SharedControlWebSocket,
-    request_id: &str,
-    kind: ControlMessageKind,
-    message_type: &str,
-    payload: T,
-) -> io::Result<()> {
-    let mut websocket = websocket.lock().map_err(ws_lock_err)?;
-    send_payload(&mut websocket, request_id, kind, message_type, payload)
+        .try_send(WsMessage::Binary(envelope.encode_to_vec()))
+        .map_err(|err| match err {
+            std::sync::mpsc::TrySendError::Full(_) => {
+                io::Error::new(io::ErrorKind::WouldBlock, "control event queue full")
+            }
+            std::sync::mpsc::TrySendError::Disconnected(_) => {
+                io::Error::new(io::ErrorKind::BrokenPipe, "control connection closed")
+            }
+        })
 }
 
 fn pairing_required_error(settings: &crate::settings::HostSettings) -> ErrorInfo {
@@ -1389,11 +1786,13 @@ fn simple_error(code: &str, message: &str) -> ErrorInfo {
 }
 
 fn ws_err(err: WsError) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, err.to_string())
-}
-
-fn ws_lock_err<T>(_: std::sync::PoisonError<T>) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, "control websocket lock poisoned")
+    match err {
+        WsError::Io(err) => err,
+        WsError::ConnectionClosed | WsError::AlreadyClosed => {
+            io::Error::new(io::ErrorKind::BrokenPipe, "control connection closed")
+        }
+        err => io::Error::new(io::ErrorKind::Other, err.to_string()),
+    }
 }
 
 fn decode_err(err: prost::DecodeError) -> io::Error {
@@ -1430,7 +1829,7 @@ fn restore_active_session_for_controller(
         .lock()
         .map_err(signaling_lock_err)?
         .restore_replayable_local_signaling(&snapshot.session_id);
-    let mut active = active_session_id.lock().map_err(ws_lock_err)?;
+    let mut active = active_session_id.lock().map_err(lock_err)?;
     *active = Some(snapshot.session_id);
     Ok(())
 }
@@ -1448,93 +1847,171 @@ fn wait_for_local_confirmation(
     after_access_code: bool,
     challenge_id: Option<String>,
 ) -> io::Result<()> {
-    let response_rx = state
+    let pending = state
         .pending_remote_requests
         .lock()
         .map_err(pending_request_lock_err)?
         .begin_request(
             controller_device_id.clone(),
             controller_display_name.clone(),
-            connection_method,
+            connection_method.clone(),
         );
+    let Some((request_id, response_rx)) = pending else {
+        return send_pairing_error(
+            websocket,
+            envelope_request_id,
+            &result_request_id,
+            "AUTH_HOST_BUSY",
+            "Another local confirmation request is pending.",
+        );
+    };
+    session.pending_confirmation = Some(PendingLocalConfirmation {
+        request_id,
+        response_rx,
+        envelope_request_id: envelope_request_id.to_owned(),
+        result_request_id: result_request_id.clone(),
+        controller_device_id,
+        controller_display_name,
+        connection_method: ConnectionMethod::from_wire_value(connection_method),
+        after_access_code,
+        expires_at_ms: now_ms() + 39_000,
+    });
     send_payload_shared(
         websocket,
         envelope_request_id,
         ControlMessageKind::Response,
         "PairingChallenge",
         PairingChallenge {
-            request_id: result_request_id.clone(),
-            challenge_id: challenge_id.unwrap_or_else(|| format!("local-confirm-{}", now_ms())),
+            request_id: result_request_id,
+            challenge_id: challenge_id
+                .unwrap_or_else(|| format!("local-confirm-{}", generate_pair_token())),
             challenge_type: PairingChallengeType::LocalConfirm as i32,
             verification_code: String::new(),
         },
-    )?;
+    )
+}
 
-    match response_rx.recv_timeout(Duration::from_secs(39)) {
-        Ok(true) => {
-            let pair_token = generate_pair_token();
+fn poll_local_confirmation(
+    websocket: &SharedControlWebSocket,
+    state: &ControlPlaneState,
+    session: &mut ConnectionSession,
+) -> io::Result<()> {
+    let Some(pending) = session.pending_confirmation.as_ref() else {
+        return Ok(());
+    };
+    let expired = now_ms() >= pending.expires_at_ms;
+    let allowed = match pending.response_rx.try_recv() {
+        Ok(allow) if !expired => allow,
+        Err(TryRecvError::Empty) if !expired => return Ok(()),
+        _ => false,
+    };
+    let pending = session
+        .pending_confirmation
+        .take()
+        .expect("pending confirmation exists");
+    state
+        .pending_remote_requests
+        .lock()
+        .map_err(pending_request_lock_err)?
+        .cancel(&pending.request_id);
+    session.pending_challenge = None;
+    let settings = state.settings.lock().map_err(settings_lock_err)?.current();
+    if !settings.allow_remote_assistance
+        || settings.connection_method() != pending.connection_method
+    {
+        return send_pairing_error(
+            websocket,
+            &pending.envelope_request_id,
+            &pending.result_request_id,
+            "AUTH_POLICY_CHANGED",
+            "Remote assistance settings changed while awaiting approval.",
+        );
+    }
+    if !allowed {
+        let code = if expired {
+            "AUTH_LOCAL_CONSENT_TIMEOUT"
+        } else if pending.after_access_code {
+            "AUTH_LOCAL_CONSENT_REJECTED_AFTER_ACCESS_CODE"
+        } else {
+            "AUTH_LOCAL_CONSENT_REJECTED"
+        };
+        return send_pairing_error(
+            websocket,
+            &pending.envelope_request_id,
+            &pending.result_request_id,
+            code,
+            "The remote assistance request was rejected or expired.",
+        );
+    }
+    let pair_token = generate_pair_token();
+    state
+        .pairing_store
+        .lock()
+        .map_err(lock_err)?
+        .upsert_pairing(
+            &pending.controller_device_id,
+            &pending.controller_display_name,
+            &pair_token,
+        )?;
+    session.authenticated_controller_device_id = Some(pending.controller_device_id);
+    send_payload_shared(
+        websocket,
+        &pending.envelope_request_id,
+        ControlMessageKind::Response,
+        "PairingResult",
+        PairingResult {
+            request_id: pending.result_request_id,
+            accepted: true,
+            pair_token,
+            error: None,
+        },
+    )
+}
+
+fn send_pairing_error(
+    websocket: &SharedControlWebSocket,
+    envelope_id: &str,
+    request_id: &str,
+    code: &str,
+    message: &str,
+) -> io::Result<()> {
+    send_payload_shared(
+        websocket,
+        envelope_id,
+        ControlMessageKind::Response,
+        "PairingResult",
+        PairingResult {
+            request_id: request_id.to_owned(),
+            accepted: false,
+            pair_token: String::new(),
+            error: Some(simple_error(code, message)),
+        },
+    )
+}
+
+fn require_session_owner(
+    state: &ControlPlaneState,
+    connection: &ConnectionSession,
+    session_id: &str,
+) -> io::Result<()> {
+    let owned = connection
+        .authenticated_controller_device_id
+        .as_deref()
+        .and_then(|id| {
             state
-                .pairing_store
+                .sessions
                 .lock()
-                .map_err(lock_err)?
-                .upsert_pairing(
-                    &controller_device_id,
-                    &controller_display_name,
-                    &pair_token,
-                )?;
-            session.authenticated_controller_device_id = Some(controller_device_id);
-            session.pending_challenge = None;
-            send_payload_shared(
-                websocket,
-                envelope_request_id,
-                ControlMessageKind::Response,
-                "PairingResult",
-                PairingResult {
-                    request_id: result_request_id,
-                    accepted: true,
-                    pair_token,
-                    error: None,
-                },
-            )
-        }
-        Ok(false) => send_payload_shared(
-            websocket,
-            envelope_request_id,
-            ControlMessageKind::Response,
-            "PairingResult",
-            PairingResult {
-                request_id: result_request_id,
-                accepted: false,
-                pair_token: String::new(),
-                error: Some(simple_error(
-                    if after_access_code {
-                        "AUTH_LOCAL_CONSENT_REJECTED_AFTER_ACCESS_CODE"
-                    } else {
-                        "AUTH_LOCAL_CONSENT_REJECTED"
-                    },
-                    "The desktop user rejected this remote assistance request.",
-                )),
-            },
-        ),
-        Err(RecvTimeoutError::Timeout) => send_payload_shared(
-            websocket,
-            envelope_request_id,
-            ControlMessageKind::Response,
-            "PairingResult",
-            PairingResult {
-                request_id: result_request_id,
-                accepted: false,
-                pair_token: String::new(),
-                error: Some(simple_error(
-                    "AUTH_LOCAL_CONSENT_TIMEOUT",
-                    "Timed out waiting for the desktop user to approve this remote assistance request.",
-                )),
-            },
-        ),
-        Err(RecvTimeoutError::Disconnected) => Err(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "pending remote request response channel disconnected",
-        )),
+                .ok()?
+                .active_snapshot_for_controller(id)
+        })
+        .is_some_and(|snapshot| snapshot.session_id == session_id);
+    if owned {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "signaling does not belong to this controller",
+        ))
     }
 }
 
@@ -1567,10 +2044,9 @@ fn flush_local_signaling_events(
             signaling.local_candidates_snapshot(session_id),
         )
     };
-    let mut websocket = websocket.lock().map_err(ws_lock_err)?;
     if let Some(offer) = offer {
-        send_payload(
-            &mut websocket,
+        send_payload_shared(
+            websocket,
             request_id,
             ControlMessageKind::Event,
             "WebRtcOffer",
@@ -1583,12 +2059,12 @@ fn flush_local_signaling_events(
             .clear_local_offer(session_id, &offer);
     }
     for candidate in candidates {
-        send_payload(
-            &mut websocket,
+        send_payload_shared(
+            websocket,
             request_id,
             ControlMessageKind::Event,
             "IceCandidate",
-            candidate,
+            candidate.clone(),
         )?;
         state
             .signaling
@@ -1603,7 +2079,7 @@ pub fn default_capability_flags() -> CapabilityFlags {
     let video_support = crate::video::detect_runtime_video_support();
     CapabilityFlags {
         supports_audio: false,
-        supports_input: true,
+        supports_input: false,
         supports_display_control: false,
         supports_hardware_encode: video_support.has_h264_hardware_encoder,
         supports_hardware_decode: false,

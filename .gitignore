@@ -21,3 +21,4 @@ third_party/vcpkg/
 third_party/vcpkg-probe/
 .codegraph/
 .codex_tmp/
+desktop/src-tauri/resources/host/

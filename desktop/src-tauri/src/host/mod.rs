@@ -1,9 +1,8 @@
 use host_ipc::client::IpcClient;
 use host_ipc::types::{
-    CapabilitySnapshotResponse, DiagnosticsResponse, HostOverviewResponse,
-    HostSettingsSnapshot, RefreshTemporaryVerificationCodeResponse,
-    RespondPendingRemoteRequestResponse, RuntimeStatusResponse, UpdateHostSettingsRequest,
-    UpdateHostSettingsResponse,
+    CapabilitySnapshotResponse, DiagnosticsResponse, HostOverviewResponse, HostSettingsSnapshot,
+    RefreshTemporaryVerificationCodeResponse, RespondPendingRemoteRequestResponse,
+    RuntimeStatusResponse, UpdateHostSettingsRequest, UpdateHostSettingsResponse,
 };
 use std::ffi::OsString;
 use std::io;
@@ -24,9 +23,18 @@ pub struct HostSupervisor {
     pub ready: bool,
     pub ipc_name: String,
     child: Option<Child>,
+    resource_dir: Option<PathBuf>,
 }
 
 impl HostSupervisor {
+    pub fn with_resources(resource_dir: PathBuf) -> Self {
+        Self {
+            ready: false,
+            ipc_name: String::new(),
+            child: None,
+            resource_dir: Some(resource_dir),
+        }
+    }
     pub fn ensure_started(&mut self) -> io::Result<()> {
         if self.is_running()? {
             self.ready = true;
@@ -34,8 +42,8 @@ impl HostSupervisor {
         }
 
         self.ipc_name = format!("akadesk.desktop.{}", std::process::id());
-        let host_runtime_bin = resolve_host_runtime_bin()?;
-        let ffmpeg_bin_dir = resolve_local_ffmpeg_bin_dir()?;
+        let host_runtime_bin = resolve_host_runtime_bin(self.resource_dir.as_deref())?;
+        let ffmpeg_bin_dir = resolve_local_ffmpeg_bin_dir(&host_runtime_bin)?;
 
         let mut command = Command::new(host_runtime_bin);
         command
@@ -85,11 +93,26 @@ impl HostSupervisor {
 
     pub fn respond_pending_remote_request(
         &mut self,
+        request_id: String,
         allow: bool,
     ) -> io::Result<RespondPendingRemoteRequestResponse> {
         self.ensure_started()?;
         let mut client = self.connect_client(Duration::from_secs(2))?;
-        client.respond_pending_remote_request(allow)
+        client.respond_pending_remote_request(request_id, allow)
+    }
+
+    pub fn stop_session(
+        &mut self,
+        session_id: String,
+    ) -> io::Result<host_ipc::types::StopSessionResponse> {
+        self.ensure_started()?;
+        self.connect_client(Duration::from_secs(2))?
+            .stop_session(session_id)
+    }
+
+    pub fn connect_event_client(&mut self, timeout: Duration) -> io::Result<IpcClient> {
+        self.ensure_started()?;
+        self.connect_client(timeout)
     }
 
     pub fn stop(&mut self) {
@@ -125,11 +148,23 @@ impl Drop for HostSupervisor {
     }
 }
 
-fn resolve_host_runtime_bin() -> io::Result<PathBuf> {
+fn resolve_host_runtime_bin(resource_dir: Option<&Path>) -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("AKADESK_HOST_RUNTIME_BIN") {
         return Ok(PathBuf::from(path));
     }
 
+    if let Some(dir) = resource_dir {
+        let candidate = dir.join("host").join(host_runtime_executable_name());
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    if !cfg!(debug_assertions) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "打包资源缺少 Host runtime",
+        ));
+    }
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut candidate = manifest_dir
         .parent()
@@ -178,7 +213,7 @@ fn host_runtime_executable_name() -> OsString {
     name
 }
 
-fn resolve_local_ffmpeg_bin_dir() -> io::Result<PathBuf> {
+fn resolve_local_ffmpeg_bin_dir(runtime_bin: &Path) -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("AKADESK_FFMPEG_BIN") {
         let candidate = PathBuf::from(path);
         if candidate.exists() {
@@ -190,6 +225,17 @@ fn resolve_local_ffmpeg_bin_dir() -> io::Result<PathBuf> {
         ));
     }
 
+    if let Some(dir) = runtime_bin.parent() {
+        if dir.join("avcodec-62.dll").is_file() && dir.join("avutil-60.dll").is_file() {
+            return Ok(dir.to_path_buf());
+        }
+    }
+    if !cfg!(debug_assertions) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "打包资源缺少 FFmpeg DLL",
+        ));
+    }
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let candidate = manifest_dir
         .parent()

@@ -2,3 +2,5 @@ pub mod client;
 pub mod codec;
 pub mod server;
 pub mod types;
+
+pub mod storage;

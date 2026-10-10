@@ -1,17 +1,54 @@
 package top.akadesk.app.controller
 
 import android.content.Context
-import java.util.UUID
 
 class ControllerPairingStore(context: Context) {
     private val prefs = context.getSharedPreferences("akadesk-controller", Context.MODE_PRIVATE)
 
+    init {
+        migrateDeviceIds()
+    }
+
+    private fun migrateDeviceIds() {
+        val stored = prefs.all
+        val editor = prefs.edit()
+        var changed = false
+        for (listKey in listOf(KEY_PAIRED_DEVICE_IDS, KEY_FAVORITE_DEVICE_IDS, KEY_HISTORY_DEVICE_IDS)) {
+            val ids = prefs.getStringSet(listKey, emptySet()).orEmpty()
+            val migrated = ids.map(NumericDeviceId::migrate).toSet()
+            check(migrated.size == ids.size) { "Device ID migration collision" }
+            for (oldId in ids) {
+                val numericId = NumericDeviceId.migrate(oldId)
+                if (numericId == oldId) continue
+                changed = true
+                val prefix = when (listKey) {
+                    KEY_PAIRED_DEVICE_IDS -> "pair_"
+                    KEY_FAVORITE_DEVICE_IDS -> "favorite_"
+                    else -> "history_"
+                }
+                for ((key, value) in stored) {
+                    if (!key.startsWith(prefix) || !key.endsWith("_$oldId")) continue
+                    val migratedKey = key.removeSuffix(oldId) + numericId
+                    when (value) {
+                        is String -> editor.putString(migratedKey, value)
+                        is Long -> editor.putLong(migratedKey, value)
+                    }
+                    editor.remove(key)
+                }
+            }
+            if (migrated != ids) editor.putStringSet(listKey, migrated)
+        }
+        if (changed) check(editor.commit()) { "Unable to persist device ID migration" }
+    }
+
     fun controllerDeviceId(): String {
         val existing = prefs.getString(KEY_CONTROLLER_DEVICE_ID, null)
         if (!existing.isNullOrBlank()) {
-            return existing
+            val numericId = NumericDeviceId.migrate(existing)
+            if (numericId != existing) check(prefs.edit().putString(KEY_CONTROLLER_DEVICE_ID, numericId).commit())
+            return numericId
         }
-        val created = "android-${UUID.randomUUID()}"
+        val created = NumericDeviceId.create()
         prefs.edit().putString(KEY_CONTROLLER_DEVICE_ID, created).apply()
         return created
     }

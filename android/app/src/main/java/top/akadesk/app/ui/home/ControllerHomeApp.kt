@@ -9,8 +9,10 @@ import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -61,7 +63,9 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.runtime.DisposableEffect
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -88,6 +92,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.webrtc.SurfaceViewRenderer
+import top.akadesk.app.controller.NumericDeviceId
 import top.akadesk.app.controller.ActiveRemoteSession
 import top.akadesk.app.controller.ControlledHostSummary
 import top.akadesk.app.controller.ControllerCoordinator
@@ -112,7 +117,7 @@ fun ControllerHomeApp(
         modifier = modifier
             .fillMaxSize()
             .background(Color(0xFFF4F7FB))
-            .statusBarsPadding(),
+            .then(if (coordinator.activeSession == null) Modifier.statusBarsPadding() else Modifier),
     ) {
         when {
             coordinator.activeSession != null -> RemoteStreamScreen(
@@ -279,9 +284,11 @@ private fun ConnectPage(
             ) {
                 OutlinedTextField(
                     value = coordinator.remoteAssistDeviceId,
-                    onValueChange = { coordinator.remoteAssistDeviceId = it },
+                    onValueChange = { coordinator.remoteAssistDeviceId = it.filter { c -> c in '0'..'9' }.take(9) },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    visualTransformation = DeviceIdVisualTransformation,
                     modifier = Modifier.weight(1f),
-                    placeholder = { Text("远程ID") },
+                    placeholder = { Text("9 位设备 ID") },
                     singleLine = true,
                     shape = RoundedCornerShape(14.dp),
                 )
@@ -496,7 +503,7 @@ private fun CompactDeviceRow(
                     .clickable(onClick = onConnect),
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
-                Text(host.deviceId.ifBlank { "--" }, fontWeight = FontWeight.SemiBold)
+                Text(NumericDeviceId.display(host.deviceId).ifBlank { "--" }, fontWeight = FontWeight.SemiBold)
                 Text(
                     host.displayName.ifBlank { "未命名设备" },
                     color = Color(0xFF7A8699),
@@ -620,8 +627,8 @@ private fun HostActionSheet(
                 .fillMaxWidth()
                 .padding(horizontal = 20.dp, vertical = 8.dp),
         ) {
-            Text(host.displayName.ifBlank { host.deviceId }, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            Text(host.deviceId, color = Color(0xFF7A8699), modifier = Modifier.padding(top = 4.dp, bottom = 14.dp))
+            Text(host.displayName.ifBlank { NumericDeviceId.display(host.deviceId) }, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(NumericDeviceId.display(host.deviceId), color = Color(0xFF7A8699), modifier = Modifier.padding(top = 4.dp, bottom = 14.dp))
             if (hasTrustedPair) {
                 SheetActionRow(label = "记住后免密连接", onClick = onTrustedConnect)
                 HorizontalDivider()
@@ -661,17 +668,18 @@ private fun VerificationCodeSheet(
                 Text("输入设备验证码", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 TextButton(onClick = onDismiss) { Text("取消") }
             }
-            Text(host.deviceId, color = Color(0xFF7A8699))
+            Text(NumericDeviceId.display(host.deviceId), color = Color(0xFF7A8699))
             OutlinedTextField(
                 value = verificationCode,
-                onValueChange = onVerificationChange,
+                onValueChange = { value -> onVerificationChange(value.uppercase().filter { it in 'A'..'Z' || it in '0'..'9' }.take(8)) },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
                 modifier = Modifier.fillMaxWidth(),
                 placeholder = { Text("请输入设备验证码") },
                 singleLine = true,
                 shape = RoundedCornerShape(14.dp),
             )
             OutlinedButton(onClick = onConfirm, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
-                Text("开始远控")
+                Text("查看屏幕")
             }
             Spacer(modifier = Modifier.height(8.dp))
         }
@@ -715,206 +723,70 @@ private fun RemoteStreamScreen(
     val now = rememberTickerMillis()
     val videoReady = coordinator.hasActiveRemoteVideoTrack(session.sessionId)
     val videoStalled = coordinator.isActiveRemoteVideoStalled(session.sessionId)
-    val remoteVideoDiagnosis = coordinator.activeRemoteVideoDiagnosis(session.sessionId)
-    val hostVideoStatus = coordinator.activeHostVideoStatus(session.sessionId)
-    val hostVideoStalled = coordinator.isActiveHostVideoStalled(session.sessionId)
-    val hostTransportStatus = coordinator.activeHostTransportStatus(session.sessionId)
-    val hostTransportStalled = coordinator.isActiveHostTransportStalled(session.sessionId)
-    Row(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF04070C))
-            .navigationBarsPadding(),
+    var controlsVisible by rememberSaveable(session.sessionId) { mutableStateOf(true) }
+    BackHandler(onBack = onDisconnect)
+    LaunchedEffect(controlsVisible, videoReady) {
+        if (controlsVisible && videoReady) { delay(3_000); controlsVisible = false }
+    }
+    Box(
+        Modifier.fillMaxSize().background(Color.Black).clickable(
+            interactionSource = remember { MutableInteractionSource() },
+            indication = null,
+        ) { controlsVisible = !controlsVisible },
     ) {
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxHeight()
-                .padding(14.dp)
-                .clip(RoundedCornerShape(20.dp))
-                .background(Color.Black),
-        ) {
+        BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            val aspect = coordinator.activeVideoAspectRatio
+            val videoWidth = minOf(maxWidth, maxHeight * aspect)
+            val videoHeight = videoWidth / aspect
             key(session.sessionId ?: session.host.deviceId) {
-                var renderer by remember { mutableStateOf<SurfaceViewRenderer?>(null) }
                 AndroidView(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier.width(videoWidth).height(videoHeight),
                     factory = { context ->
-                        SurfaceViewRenderer(context).also { created ->
-                            renderer = created
-                            coordinator.bindActiveVideoRenderer(created)
-                        }
+                        SurfaceViewRenderer(context).also(coordinator::bindActiveVideoRenderer)
                     },
-                    update = { bound ->
-                        renderer = bound
-                        coordinator.bindActiveVideoRenderer(bound)
-                    },
-                )
-                DisposableEffect(renderer) {
-                    onDispose {
-                        renderer?.let(coordinator::releaseActiveVideoRenderer)
-                    }
-                }
-            }
-            if (!videoReady) {
-                Box(
-                    modifier = Modifier
-                        .matchParentSize()
-                        .background(
-                            Brush.linearGradient(
-                                listOf(Color(0xFF7FB0FF), Color(0xFF2D58CF), Color(0xFF0A1020)),
-                            ),
-                        ),
+                    update = coordinator::bindActiveVideoRenderer,
+                    onReset = null,
+                    onRelease = coordinator::releaseActiveVideoRenderer,
                 )
             }
-            Column(
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+        }
+        if (controlsVisible) Surface(
+            modifier = Modifier.align(Alignment.TopStart).padding(16.dp),
+            color = Color(0x99000000),
+            shape = RoundedCornerShape(12.dp),
+        ) {
+            Column(Modifier.padding(12.dp)) {
+                Text(session.host.displayName.ifBlank { "Windows" }, color = Color.White, fontWeight = FontWeight.Bold)
+                Text(formatDuration(now - session.startedAtMs), color = Color.LightGray)
+            }
+        }
+        if (!videoReady || videoStalled) {
+            Surface(
+                modifier = Modifier.align(Alignment.Center),
+                color = Color(0xBB000000),
+                shape = RoundedCornerShape(12.dp),
             ) {
-                Text(session.host.displayName.ifBlank { "Windows" }, color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                Text(formatDuration(now - session.startedAtMs), color = Color(0xFFD7E3FF))
-                remoteVideoDiagnosis?.let { diagnosis ->
-                    RemoteVideoDiagnosisCard(diagnosis = diagnosis)
-                }
-            }
-            if (!videoReady) {
-                Column(
-                    modifier = Modifier.align(Alignment.Center),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    CircularProgressIndicator(color = Color.White, strokeWidth = 4.dp)
+                Column(Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = Color.White, strokeWidth = 3.dp)
                     Text(
-                        if (session.stateLabel == "STREAMING") "等待远端首帧" else "启动画面传输",
+                        if (videoStalled) "画面暂时中断，正在等待恢复" else "正在连接电脑画面…",
+                        modifier = Modifier.padding(top = 12.dp),
                         color = Color.White,
-                        style = MaterialTheme.typography.headlineSmall,
-                        fontWeight = FontWeight.Bold,
                     )
-                    Text(
-                        session.summary,
-                        color = Color(0xFFD7E3FF),
-                        style = MaterialTheme.typography.bodyMedium,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(horizontal = 24.dp),
-                    )
-                }
-            } else {
-                if (videoStalled) {
-                    Surface(
-                        modifier = Modifier
-                            .align(Alignment.TopCenter)
-                            .padding(top = 18.dp),
-                        shape = RoundedCornerShape(999.dp),
-                        color = Color(0xCC8C2F02),
-                    ) {
-                        Text(
-                            "视频流疑似停滞",
-                            color = Color.White,
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                        )
-                    }
-                }
-                if (hostVideoStalled) {
-                    Surface(
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(top = 18.dp, end = 18.dp),
-                        shape = RoundedCornerShape(999.dp),
-                        color = Color(0xCC6B1223),
-                    ) {
-                        Text(
-                            "Host 出包异常",
-                            color = Color.White,
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                        )
-                    }
-                }
-                if (hostTransportStalled) {
-                    Surface(
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(top = 64.dp, end = 18.dp),
-                        shape = RoundedCornerShape(999.dp),
-                        color = Color(0xCC5C1F8A),
-                    ) {
-                        Text(
-                            "Transport 发送异常",
-                            color = Color.White,
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                        )
-                    }
-                }
-                Surface(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(20.dp),
-                    shape = RoundedCornerShape(14.dp),
-                    color = Color(0x99040A14),
-                ) {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        Text(
-                            session.summary,
-                            color = Color.White,
-                            style = MaterialTheme.typography.bodyMedium,
-                            textAlign = TextAlign.Center,
-                        )
-                        hostVideoStatus?.let { status ->
-                            Text(
-                                status,
-                                color = if (hostVideoStalled) Color(0xFFFFC9D2) else Color(0xFFD7E3FF),
-                                style = MaterialTheme.typography.bodySmall,
-                                textAlign = TextAlign.Center,
-                            )
-                        }
-                        hostTransportStatus?.let { status ->
-                            Text(
-                                status,
-                                color = if (hostTransportStalled) Color(0xFFE6C9FF) else Color(0xFFCFE0FF),
-                                style = MaterialTheme.typography.bodySmall,
-                                textAlign = TextAlign.Center,
-                            )
-                        }
-                    }
                 }
             }
         }
-        Surface(
-            modifier = Modifier
-                .width(92.dp)
-                .fillMaxHeight(),
-            color = Color.Black,
+        if (controlsVisible) Surface(
+            modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth(),
+            color = Color(0xCC000000),
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxHeight()
-                    .padding(vertical = 18.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(20.dp),
+            Row(
+                Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                StreamAction(Icons.Outlined.Settings, "设置")
-                StreamAction(Icons.Outlined.Keyboard, "键盘")
-                StreamAction(Icons.Outlined.Tv, "显示桌面")
-                Spacer(modifier = Modifier.weight(1f))
-                OutlinedButton(
-                    onClick = onDisconnect,
-                    modifier = Modifier
-                        .padding(horizontal = 10.dp)
-                        .fillMaxWidth(),
-                    shape = RoundedCornerShape(14.dp),
-                ) {
-                    Text("断开")
-                }
+                Text("仅查看屏幕", color = Color.LightGray)
+                OutlinedButton(onClick = onDisconnect) { Text("断开", color = Color.White) }
             }
         }
     }

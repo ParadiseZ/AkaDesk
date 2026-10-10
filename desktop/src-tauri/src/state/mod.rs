@@ -2,36 +2,46 @@ use crate::diagnostics::ShellDiagnosticState;
 use crate::host::HostSupervisor;
 use host_ipc::types::{
     CapabilitySnapshot, DiagnosticEntry, HostIdentitySnapshot, HostOverviewSnapshot,
-    HostSettingsSnapshot, PendingRemoteRequestSnapshot, RuntimeStatusSnapshot,
-    VideoStreamSnapshot,
+    HostSettingsSnapshot, PendingRemoteRequestSnapshot, RuntimeStatusSnapshot, VideoStreamSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 pub struct AppState {
+    shutting_down: AtomicBool,
     shell_store: Mutex<ShellStore>,
     supervisor: Mutex<HostSupervisor>,
     shell_messages: Mutex<Vec<ShellMessage>>,
-    incoming_request: Mutex<Option<IncomingRequestPreview>>,
-    active_session: Mutex<Option<ActiveSessionPresentation>>,
     diagnostics: Mutex<ShellDiagnosticState>,
 }
 
 impl AppState {
-    pub fn load(app_data_dir: PathBuf) -> io::Result<Self> {
+    pub fn load(app_data_dir: PathBuf, resource_dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&app_data_dir)?;
+        // Keep existing preferences when correcting the previously invalid bundle identifier.
+        let settings_path = app_data_dir.join("desktop-shell.json");
+        if !settings_path.exists() {
+            if let Some(parent) = app_data_dir.parent() {
+                let legacy_path = parent
+                    .join("com.akadesk.desktop_shell")
+                    .join("desktop-shell.json");
+                if legacy_path.is_file() {
+                    fs::copy(legacy_path, &settings_path)?;
+                }
+            }
+        }
         let shell_store = ShellStore::load(app_data_dir.join("desktop-shell.json"))?;
         let state = Self {
+            shutting_down: AtomicBool::new(false),
             shell_store: Mutex::new(shell_store),
-            supervisor: Mutex::new(HostSupervisor::default()),
+            supervisor: Mutex::new(HostSupervisor::with_resources(resource_dir)),
             shell_messages: Mutex::new(Vec::new()),
-            incoming_request: Mutex::new(None),
-            active_session: Mutex::new(None),
             diagnostics: Mutex::new(ShellDiagnosticState::new(app_data_dir)?),
         };
         let _ = state.push_shell_message(ShellMessage::info(
@@ -39,6 +49,13 @@ impl AppState {
             "Desktop shell command bridge initialized.",
         ));
         Ok(state)
+    }
+
+    pub fn shutdown_host(&self) {
+        self.shutting_down.store(true, Ordering::Relaxed);
+        if let Ok(mut supervisor) = self.supervisor.lock() {
+            supervisor.stop();
+        }
     }
 
     pub fn ensure_host_started(&self) -> Result<(), String> {
@@ -50,6 +67,9 @@ impl AppState {
     }
 
     pub fn bootstrap_snapshot(&self) -> Result<ShellSnapshot, String> {
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return Err("应用正在退出".to_string());
+        }
         let host_bundle = self
             .supervisor
             .lock()
@@ -57,13 +77,6 @@ impl AppState {
             .fetch_snapshot()
             .map_err(|err| err.to_string())?;
         let shell_settings = self.shell_store.lock().map_err(lock_err)?.settings.clone();
-        let preview_request = self
-            .incoming_request
-            .lock()
-            .map_err(lock_err)?
-            .clone()
-            .filter(|request| request.expires_at_ms > now_ms());
-        let active_session = self.active_session.lock().map_err(lock_err)?.clone();
         let mut messages = host_bundle
             .diagnostics
             .entries
@@ -88,8 +101,31 @@ impl AppState {
         let incoming_request = host_overview
             .pending_remote_request
             .clone()
-            .map(IncomingRequestPreview::from)
-            .or(preview_request);
+            .map(IncomingRequestPreview::from);
+        let active_session = runtime_status
+            .active_session_id
+            .as_ref()
+            .filter(|_| {
+                matches!(
+                    runtime_status.state_label.as_str(),
+                    "SESSION_PREPARING" | "STREAMING" | "STOPPING"
+                )
+            })
+            .map(|session_id| ActiveSessionPresentation {
+                session_id: session_id.clone(),
+                role: "controlled_host".to_string(),
+                peer_name: host_overview
+                    .active_controller_display_name
+                    .clone()
+                    .unwrap_or_else(|| "远程设备".to_string()),
+                peer_subtitle: if runtime_status.state_label == "STREAMING" {
+                    "正在共享屏幕"
+                } else {
+                    "正在建立屏幕共享"
+                }
+                .to_string(),
+                started_at_ms: runtime_status.active_started_at_ms,
+            });
         let desktop_ui_state = if active_session.is_some() {
             "SESSION_ACTIVE_VIEW".to_string()
         } else {
@@ -143,20 +179,28 @@ impl AppState {
             refresh_temporary_code_after_controlled_end: next
                 .refresh_temporary_code_after_controlled_end,
         };
-        self.supervisor
+        let response = self
+            .supervisor
             .lock()
             .map_err(lock_err)?
             .update_host_settings(snapshot)
             .map_err(|err| err.to_string())?;
+        if let Some(error) = response.error {
+            return Err(error.message);
+        }
         self.bootstrap_snapshot()
     }
 
     pub fn refresh_temporary_verification_code(&self) -> Result<ShellSnapshot, String> {
-        self.supervisor
+        let response = self
+            .supervisor
             .lock()
             .map_err(lock_err)?
             .refresh_temporary_verification_code()
             .map_err(|err| err.to_string())?;
+        if let Some(error) = response.error {
+            return Err(error.message);
+        }
         self.push_shell_message(ShellMessage::info(
             "HOST_TEMP_CODE_REFRESHED",
             "Temporary verification code refreshed by host runtime.",
@@ -166,151 +210,48 @@ impl AppState {
 
     pub fn queue_remote_connect(
         &self,
-        request: RemoteConnectRequest,
+        _request: RemoteConnectRequest,
     ) -> Result<ShellActionReceipt, String> {
-        {
-            let mut store = self.shell_store.lock().map_err(lock_err)?;
-            store.settings.last_remote_device_id = request.remote_device_id.clone();
-            store.settings.last_access_code = request.access_code.clone();
-            store.persist().map_err(|err| err.to_string())?;
-        }
-        self.push_shell_message(ShellMessage::info(
-            "REMOTE_CONNECT_QUEUED",
-            format!(
-                "Queued remote assist request for device {}. Control-plane session wiring stays on the M3/M4 path.",
-                request.remote_device_id
-            ),
-        ))?;
-        *self.active_session.lock().map_err(lock_err)? = Some(ActiveSessionPresentation {
-            role: "controller".to_string(),
-            peer_name: if request.remote_device_id.trim().is_empty() {
-                "Remote Device".to_string()
-            } else {
-                request.remote_device_id.clone()
-            },
-            peer_subtitle: if request.access_code.trim().is_empty() {
-                "正在建立远程控制连接".to_string()
-            } else {
-                format!("验证码 {}", request.access_code)
-            },
-            started_at_ms: now_ms(),
-        });
-        Ok(ShellActionReceipt {
-            accepted: true,
-            message: "连接请求已记录，主窗口已切到主控视图。".to_string(),
-            created_at_ms: now_ms(),
-        })
+        Err("当前版本仅支持由 Android 连接此电脑，桌面主控尚未开放".to_string())
     }
 
     pub fn preview_incoming_request(&self) -> Result<ShellSnapshot, String> {
-        let request = IncomingRequestPreview {
-            controller_name: "Android Controller".to_string(),
-            device_label: "Pixel 04".to_string(),
-            expires_at_ms: now_ms() + 39_000,
-        };
-        *self.incoming_request.lock().map_err(lock_err)? = Some(request);
-        self.push_shell_message(ShellMessage::warning(
-            "REMOTE_ASSIST_REQUEST_PREVIEW",
-            "Incoming remote assist request preview emitted to the desktop shell.",
-        ))?;
-        self.bootstrap_snapshot()
+        Err("请从 Android 发起真实远控申请".to_string())
     }
 
-    pub fn respond_incoming_request(&self, allow: bool) -> Result<ShellSnapshot, String> {
-        let pending_request = self
+    pub fn respond_incoming_request(
+        &self,
+        request_id: &str,
+        allow: bool,
+    ) -> Result<ShellSnapshot, String> {
+        let response = self
             .supervisor
             .lock()
             .map_err(lock_err)?
-            .fetch_snapshot()
-            .ok()
-            .and_then(|bundle| bundle.host_overview.overview)
-            .and_then(|overview| overview.pending_remote_request);
-        *self.incoming_request.lock().map_err(lock_err)? = None;
-        if pending_request.is_some() {
-            self.supervisor
-                .lock()
-                .map_err(lock_err)?
-                .respond_pending_remote_request(allow)
-                .map_err(|err| err.to_string())?;
-        }
-        if allow {
-            let (peer_name, peer_subtitle) = pending_request
-                .as_ref()
-                .map(|request| {
-                    (
-                        request.controller_display_name.clone(),
-                        format!("{} 正在等待并已获准控制此电脑", request.controller_device_id),
-                    )
-                })
-                .unwrap_or_else(|| {
-                    (
-                        "Android Controller".to_string(),
-                        "1 台设备正在控制此电脑".to_string(),
-                    )
-                });
-            *self.active_session.lock().map_err(lock_err)? = Some(ActiveSessionPresentation {
-                role: "controlled_host".to_string(),
-                peer_name,
-                peer_subtitle,
-                started_at_ms: now_ms(),
-            });
-            self.push_shell_message(ShellMessage::info(
-                "REMOTE_ASSIST_REQUEST_ALLOWED",
-                "Incoming remote assist request marked as allowed.",
-            ))?;
-        } else {
-            self.push_shell_message(ShellMessage::warning(
-                "REMOTE_ASSIST_REQUEST_REJECTED",
-                "Incoming remote assist request marked as rejected.",
-            ))?;
+            .respond_pending_remote_request(request_id.to_owned(), allow)
+            .map_err(|err| err.to_string())?;
+        if let Some(error) = response.error {
+            return Err(error.message);
         }
         self.bootstrap_snapshot()
     }
 
     pub fn disconnect_session(&self) -> Result<ShellSnapshot, String> {
-        let active_role = self
-            .active_session
-            .lock()
-            .map_err(lock_err)?
-            .as_ref()
-            .map(|session| session.role.clone());
-        *self.active_session.lock().map_err(lock_err)? = None;
-        if active_role.as_deref() == Some("controlled_host") {
-            let refresh_after_end = self
-                .supervisor
-                .lock()
-                .map_err(lock_err)?
-                .fetch_snapshot()
-                .ok()
-                .and_then(|bundle| bundle.host_overview.overview)
-                .and_then(|overview| overview.settings)
-                .map(|settings| settings.refresh_temporary_code_after_controlled_end)
-                .unwrap_or(false);
-            if refresh_after_end {
-                match self
-                    .supervisor
-                    .lock()
-                    .map_err(lock_err)?
-                    .refresh_temporary_verification_code()
-                {
-                    Ok(_) => {
-                        let _ = self.push_shell_message(ShellMessage::info(
-                            "HOST_TEMP_CODE_REFRESHED_AFTER_SESSION",
-                            "Temporary verification code refreshed after controlled session ended.",
-                        ));
-                    }
-                    Err(err) => {
-                        let _ = self.push_shell_message(ShellMessage::warning(
-                            "HOST_TEMP_CODE_REFRESH_FAILED",
-                            format!(
-                                "Controlled session ended, but temporary verification code refresh failed: {}",
-                                err
-                            ),
-                        ));
-                    }
-                }
+        let mut supervisor = self.supervisor.lock().map_err(lock_err)?;
+        let status = supervisor
+            .fetch_snapshot()
+            .map_err(|err| err.to_string())?
+            .runtime_status
+            .status;
+        if let Some(session_id) = status.and_then(|status| status.active_session_id) {
+            let response = supervisor
+                .stop_session(session_id)
+                .map_err(|err| err.to_string())?;
+            if let Some(error) = response.error {
+                return Err(error.message);
             }
         }
+        drop(supervisor);
         self.bootstrap_snapshot()
     }
 
@@ -353,8 +294,8 @@ impl Default for ShellSettings {
     fn default() -> Self {
         Self {
             launch_on_startup: false,
-            minimize_to_tray: true,
-            notifications_enabled: true,
+            minimize_to_tray: false,
+            notifications_enabled: false,
             last_route: "/remote".to_string(),
             last_remote_device_id: String::new(),
             last_access_code: String::new(),
@@ -379,16 +320,32 @@ impl ShellStore {
             write_json(&path, &settings)?;
             settings
         };
+        let mut settings = settings;
+        settings.launch_on_startup = false;
+        settings.minimize_to_tray = false;
+        settings.notifications_enabled = false;
+        settings.last_access_code.clear();
+        if !matches!(settings.last_route.as_str(), "/remote" | "/settings") {
+            settings.last_route = "/remote".to_string();
+        }
         Ok(Self { path, settings })
     }
 
     fn update(&mut self, next: ShellSettings) -> io::Result<()> {
+        if next.launch_on_startup || next.minimize_to_tray || next.notifications_enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "开机自启、托盘和系统通知尚未实现",
+            ));
+        }
+        if !matches!(next.last_route.as_str(), "/remote" | "/settings") {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "无效的启动页"));
+        }
+        let mut next = next;
+        next.last_access_code.clear();
+        write_json(&self.path, &next)?;
         self.settings = next;
-        self.persist()
-    }
-
-    fn persist(&self) -> io::Result<()> {
-        write_json(&self.path, &self.settings)
+        Ok(())
     }
 }
 
@@ -656,6 +613,7 @@ impl ShellMessage {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IncomingRequestPreview {
+    pub request_id: String,
     pub controller_name: String,
     pub device_label: String,
     pub expires_at_ms: i64,
@@ -664,6 +622,7 @@ pub struct IncomingRequestPreview {
 impl From<PendingRemoteRequestSnapshot> for IncomingRequestPreview {
     fn from(value: PendingRemoteRequestSnapshot) -> Self {
         Self {
+            request_id: value.request_id,
             controller_name: value.controller_display_name,
             device_label: value.controller_device_id,
             expires_at_ms: value.expires_at_ms,
@@ -674,6 +633,7 @@ impl From<PendingRemoteRequestSnapshot> for IncomingRequestPreview {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveSessionPresentation {
+    pub session_id: String,
     pub role: String,
     pub peer_name: String,
     pub peer_subtitle: String,
@@ -698,7 +658,7 @@ pub struct ShellActionReceipt {
 fn write_json(path: &Path, value: &ShellSettings) -> io::Result<()> {
     let text = serde_json::to_string_pretty(value)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-    fs::write(path, text)
+    host_ipc::storage::atomic_write(path, text.as_bytes())
 }
 
 fn map_desktop_ui_state(runtime_state_label: &str) -> String {

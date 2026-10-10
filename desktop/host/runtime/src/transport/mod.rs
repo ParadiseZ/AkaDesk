@@ -3,7 +3,7 @@ use crate::pairing::now_ms;
 use crate::session::SharedSessionRegistry;
 use crate::signaling::SharedSignalingState;
 use crate::video::SharedVideoStreamState;
-use bytes::Bytes;
+use prost::bytes::Bytes;
 use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use std::collections::VecDeque;
@@ -23,13 +23,12 @@ use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::{
-    RTCRtpCodecCapability, RTCRtpCodecParameters,
+    RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
 };
 use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
-use webrtc::rtp_transceiver::{RTCPFeedback, RTCRtpTransceiverInit, RTPCodecType};
+use webrtc::rtp_transceiver::{RTCPFeedback, RTCRtpTransceiverInit};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
@@ -102,8 +101,9 @@ pub fn spawn_h264_webrtc_transport_loop(
         let startup_result = runtime.block_on(async {
             let mut media_engine = build_h264_media_engine(&h264_fmtp_line)
                 .map_err(|err| format!("build_h264_media_engine failed: {err}"))?;
-            let interceptor_registry = register_default_interceptors(Registry::new(), &mut media_engine)
-                .map_err(|err| format!("register_default_interceptors failed: {err}"))?;
+            let interceptor_registry =
+                register_default_interceptors(Registry::new(), &mut media_engine)
+                    .map_err(|err| format!("register_default_interceptors failed: {err}"))?;
             let api = APIBuilder::new()
                 .with_media_engine(media_engine)
                 .with_interceptor_registry(interceptor_registry)
@@ -120,19 +120,25 @@ pub fn spawn_h264_webrtc_transport_loop(
 
             let signaling_for_candidates = Arc::clone(&signaling);
             let session_id_for_candidates = session_id.clone();
+            let local_media_mid = Arc::new(Mutex::new(None::<String>));
+            let local_media_mid_for_candidates = Arc::clone(&local_media_mid);
             peer_connection.on_ice_candidate(Box::new(move |candidate| {
                 let signaling = Arc::clone(&signaling_for_candidates);
                 let session_id = session_id_for_candidates.clone();
                 let gather_done = Arc::clone(&gather_done);
+                let local_media_mid = Arc::clone(&local_media_mid_for_candidates);
                 Box::pin(async move {
                     if let Some(candidate) = candidate {
                         match candidate.to_json() {
-                            Ok(init) => {
+                            Ok(mut init) => {
+                                // This host has one video m-line. webrtc-rs candidates omit
+                                // its MID, so attach the actual MID from our local offer.
+                                init.sdp_mid =
+                                    local_media_mid.lock().ok().and_then(|mid| mid.clone());
+                                init.sdp_mline_index = Some(0);
                                 if let Ok(mut state) = signaling.lock() {
-                                    let _ = state.push_local_candidate(proto_candidate(
-                                        &session_id,
-                                        &init,
-                                    ));
+                                    let _ = state
+                                        .push_local_candidate(proto_candidate(&session_id, &init));
                                 }
                             }
                             Err(err) => {
@@ -169,8 +175,7 @@ pub fn spawn_h264_webrtc_transport_loop(
                     }
                     if matches!(
                         state,
-                        RTCPeerConnectionState::Failed
-                            | RTCPeerConnectionState::Closed
+                        RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
                     ) {
                         if let Ok(mut registry) = sessions.lock() {
                             let _ = registry.mark_failed(&session_id);
@@ -234,6 +239,15 @@ pub fn spawn_h264_webrtc_transport_loop(
                 .create_offer(None)
                 .await
                 .map_err(|err| format!("create_offer failed: {err}"))?;
+            let mid = offer
+                .sdp
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("a=mid:").map(str::to_owned))
+                .filter(|mid| !mid.is_empty())
+                .ok_or_else(|| "local offer has no video media MID".to_string())?;
+            *local_media_mid
+                .lock()
+                .map_err(|_| "media MID lock poisoned")? = Some(mid);
             peer_connection
                 .set_local_description(offer)
                 .await
@@ -251,13 +265,18 @@ pub fn spawn_h264_webrtc_transport_loop(
                 });
             }
 
-            Ok::<_, String>((peer_connection, video_track, media_send_ready, TransportStartupResult {
-                local_offer_sdp_len: local_description.sdp.len(),
-                local_candidate_count: signaling
-                    .lock()
-                    .map(|state| state.local_candidate_count(&session_id))
-                    .unwrap_or(0),
-            }))
+            Ok::<_, String>((
+                peer_connection,
+                video_track,
+                media_send_ready,
+                TransportStartupResult {
+                    local_offer_sdp_len: local_description.sdp.len(),
+                    local_candidate_count: signaling
+                        .lock()
+                        .map(|state| state.local_candidate_count(&session_id))
+                        .unwrap_or(0),
+                },
+            ))
         });
 
         let (peer_connection, video_track, media_send_ready) = match startup_result {
@@ -278,7 +297,6 @@ pub fn spawn_h264_webrtc_transport_loop(
         let mut remote_answer_applied = false;
         let mut processed_remote_candidate_count = 0usize;
         let mut applied_remote_candidate_count = 0usize;
-        let mut transport_failed = false;
         let mut packet_timestamp = 0u32;
         let timestamp_step = ((90_000u64 / fps.max(1) as u64).max(1)) as u32;
         let sample_time_origin = SystemTime::now();
@@ -286,6 +304,9 @@ pub fn spawn_h264_webrtc_transport_loop(
         let mut pending_pre_answer_packets = VecDeque::new();
         let mut deferred_remote_candidates: VecDeque<(IceCandidate, u8)> = VecDeque::new();
         let mut media_stream_started = false;
+        let negotiation_started = std::time::Instant::now();
+        let mut last_connected = negotiation_started;
+        let mut ever_connected = false;
         let mut keyframe_request_inflight = false;
         let mut keyframe_request_updated_at_ms = 0i64;
         let mut post_start_keyframe_pending = false;
@@ -295,10 +316,24 @@ pub fn spawn_h264_webrtc_transport_loop(
                 .lock()
                 .map(|registry| registry.should_keep_running(&session_id))
                 .unwrap_or(false);
-            if !keep_running || transport_failed {
+            if !keep_running {
                 break;
             }
             let media_send_ready_now = media_send_ready.load(Ordering::Relaxed);
+            if media_send_ready_now {
+                last_connected = std::time::Instant::now();
+                ever_connected = true;
+            } else if (!ever_connected && negotiation_started.elapsed() > Duration::from_secs(20))
+                || (ever_connected && last_connected.elapsed() > Duration::from_secs(15))
+            {
+                if let Ok(mut status) = transport_status.lock() {
+                    status.record_error(&session_id, "WebRTC connection timed out".to_string());
+                }
+                if let Ok(mut registry) = sessions.lock() {
+                    registry.mark_failed(&session_id);
+                }
+                break;
+            }
             if !media_send_ready_now {
                 media_stream_started = false;
                 keyframe_request_inflight = false;
@@ -313,12 +348,13 @@ pub fn spawn_h264_webrtc_transport_loop(
                     .ok()
                     .and_then(|state| state.remote_answer());
                 if let Some(answer) = remote_answer {
-                    let result = runtime.block_on(peer_connection.set_remote_description(
-                        RTCSessionDescription {
-                            sdp_type: RTCSdpType::Answer,
-                            sdp: answer.sdp,
-                        },
-                    ));
+                    let result = RTCSessionDescription::answer(answer.sdp)
+                        .map_err(|err| err.to_string())
+                        .and_then(|description| {
+                            runtime
+                                .block_on(peer_connection.set_remote_description(description))
+                                .map_err(|err| err.to_string())
+                        });
                     match result {
                         Ok(()) => {
                             if let Ok(mut status) = transport_status.lock() {
@@ -352,7 +388,6 @@ pub fn spawn_h264_webrtc_transport_loop(
                             if let Ok(mut registry) = sessions.lock() {
                                 let _ = registry.mark_failed(&session_id);
                             }
-                            transport_failed = true;
                             break;
                         }
                     }
@@ -397,7 +432,6 @@ pub fn spawn_h264_webrtc_transport_loop(
                         if let Ok(mut registry) = sessions.lock() {
                             let _ = registry.mark_failed(&session_id);
                         }
-                        transport_failed = true;
                         break;
                     }
                     media_stream_started = true;
@@ -432,7 +466,8 @@ pub fn spawn_h264_webrtc_transport_loop(
                         &session_id,
                         post_start_keyframe_pending,
                         post_start_keyframe_request_updated_at_ms,
-                    ) {
+                    )
+                {
                     post_start_keyframe_pending = true;
                     post_start_keyframe_request_updated_at_ms = crate::pairing::now_ms();
                 }
@@ -440,9 +475,7 @@ pub fn spawn_h264_webrtc_transport_loop(
 
             match packet_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(packet)
-                    if remote_answer_applied
-                        && media_send_ready_now
-                        && media_stream_started =>
+                    if remote_answer_applied && media_send_ready_now && media_stream_started =>
                 {
                     if packet.is_keyframe {
                         post_start_keyframe_pending = false;
@@ -460,21 +493,15 @@ pub fn spawn_h264_webrtc_transport_loop(
                         &transport_status,
                     ) {
                         if let Ok(mut stream_state) = video_streams.lock() {
-                            stream_state.record_error(
-                                &session_id,
-                                format!("write_sample failed: {err}"),
-                            );
+                            stream_state
+                                .record_error(&session_id, format!("write_sample failed: {err}"));
                         }
                         if let Ok(mut status) = transport_status.lock() {
-                            status.record_error(
-                                &session_id,
-                                format!("write_sample failed: {err}"),
-                            );
+                            status.record_error(&session_id, format!("write_sample failed: {err}"));
                         }
                         if let Ok(mut registry) = sessions.lock() {
                             let _ = registry.mark_failed(&session_id);
                         }
-                        transport_failed = true;
                         break;
                     }
                 }
@@ -508,7 +535,6 @@ pub fn spawn_h264_webrtc_transport_loop(
                             if let Ok(mut registry) = sessions.lock() {
                                 let _ = registry.mark_failed(&session_id);
                             }
-                            transport_failed = true;
                             break;
                         }
                         media_stream_started = true;
@@ -581,9 +607,7 @@ fn request_post_start_keyframe(
     post_start_keyframe_request_updated_at_ms: i64,
 ) -> bool {
     if post_start_keyframe_pending
-        && crate::pairing::now_ms()
-            .saturating_sub(post_start_keyframe_request_updated_at_ms)
-            < 500
+        && crate::pairing::now_ms().saturating_sub(post_start_keyframe_request_updated_at_ms) < 500
     {
         return false;
     }
@@ -593,12 +617,9 @@ fn request_post_start_keyframe(
     false
 }
 
-fn rtcp_requests_keyframe(
-    packets: &[Box<dyn rtcp::packet::Packet + Send + Sync>],
-) -> bool {
+fn rtcp_requests_keyframe(packets: &[Box<dyn rtcp::packet::Packet + Send + Sync>]) -> bool {
     packets.iter().any(|packet| {
-        packet.as_any().is::<PictureLossIndication>()
-            || packet.as_any().is::<FullIntraRequest>()
+        packet.as_any().is::<PictureLossIndication>() || packet.as_any().is::<FullIntraRequest>()
     })
 }
 
@@ -631,7 +652,7 @@ fn flush_pending_packets(
         .map_err(|err| format!("flush buffered H.264 packet failed: {err}"))?;
     }
     if let Ok(mut registry) = sessions.lock() {
-        let _ = registry.touch_active(session_id);
+        let _ = registry.mark_streaming(session_id);
     }
     if let Ok(mut stream_state) = video_streams.lock() {
         stream_state.record_error(session_id, String::new());
@@ -668,14 +689,12 @@ fn apply_remote_candidates(
         .cloned()
     {
         *processed_remote_candidate_count += 1;
-        let add_result = runtime.block_on(peer_connection.add_ice_candidate(
-            RTCIceCandidateInit {
-                candidate: candidate.candidate,
-                sdp_mid: (!candidate.sdp_mid.is_empty()).then_some(candidate.sdp_mid),
-                sdp_mline_index: Some(candidate.sdp_mline_index as u16),
-                username_fragment: None,
-            },
-        ));
+        let add_result = runtime.block_on(peer_connection.add_ice_candidate(RTCIceCandidateInit {
+            candidate: candidate.candidate.clone(),
+            sdp_mid: (!candidate.sdp_mid.is_empty()).then_some(candidate.sdp_mid.clone()),
+            sdp_mline_index: Some(candidate.sdp_mline_index as u16),
+            username_fragment: None,
+        }));
         match add_result {
             Ok(()) => {
                 *applied_remote_candidate_count += 1;
@@ -690,7 +709,9 @@ fn apply_remote_candidates(
                 if let Ok(mut status) = transport_status.lock() {
                     status.record_error(
                         session_id,
-                        format!("deferring remote ICE candidate after add_ice_candidate failed: {err}"),
+                        format!(
+                            "deferring remote ICE candidate after add_ice_candidate failed: {err}"
+                        ),
                     );
                 }
                 deferred_remote_candidates.push_back((candidate, 1));
@@ -712,14 +733,12 @@ fn retry_deferred_remote_candidates(
         let Some((candidate, attempts)) = deferred_remote_candidates.pop_front() else {
             break;
         };
-        let add_result = runtime.block_on(peer_connection.add_ice_candidate(
-            RTCIceCandidateInit {
-                candidate: candidate.candidate.clone(),
-                sdp_mid: (!candidate.sdp_mid.is_empty()).then_some(candidate.sdp_mid.clone()),
-                sdp_mline_index: Some(candidate.sdp_mline_index as u16),
-                username_fragment: None,
-            },
-        ));
+        let add_result = runtime.block_on(peer_connection.add_ice_candidate(RTCIceCandidateInit {
+            candidate: candidate.candidate.clone(),
+            sdp_mid: (!candidate.sdp_mid.is_empty()).then_some(candidate.sdp_mid.clone()),
+            sdp_mline_index: Some(candidate.sdp_mline_index as u16),
+            username_fragment: None,
+        }));
         match add_result {
             Ok(()) => {
                 *applied_remote_candidate_count += 1;

@@ -6,9 +6,8 @@ option java_multiple_files = true;
 option java_package = "akadesk.v1";
 
 import "common.proto";
-import "device.proto";
-import "session.proto";
 
+// Shell <-> Host IPC. These definitions generate the Rust wire types.
 enum IpcMessageKind {
   IPC_MESSAGE_KIND_UNSPECIFIED = 0;
   IPC_MESSAGE_KIND_REQUEST = 1;
@@ -19,16 +18,16 @@ enum IpcMessageKind {
 message IpcEnvelope {
   string request_id = 1;
   IpcMessageKind kind = 2;
-  string type = 3;
+  string message_type = 3;
   bytes payload = 4;
   int64 timestamp_ms = 5;
 }
 
 message RuntimeStatusSnapshot {
-  RuntimeState state = 1;
-  SessionSnapshot active_session = 2;
-  ErrorInfo last_error = 3;
-  int64 updated_at_ms = 4;
+  string state_label = 1;
+  optional string active_session_id = 2;
+  int64 updated_at_ms = 3;
+  int64 active_started_at_ms = 4;
 }
 
 message InputCapabilitySnapshot {
@@ -38,33 +37,131 @@ message InputCapabilitySnapshot {
 }
 
 message CapabilitySnapshot {
-  CapabilityFlags capability_flags = 1;
-  repeated DisplayInfo displays = 2;
-  repeated AudioDeviceInfo audio_devices = 3;
-  InputCapabilitySnapshot input = 4;
+  bool supports_audio = 1;
+  bool supports_input = 2;
+  bool supports_display_control = 3;
+  optional InputCapabilitySnapshot input = 4;
   int64 updated_at_ms = 5;
 }
 
-message GetRuntimeStatusRequest {}
+message GetRuntimeStatusRequest {
+}
 
 message RuntimeStatusResponse {
-  RuntimeStatusSnapshot status = 1;
-  ErrorInfo error = 2;
+  optional RuntimeStatusSnapshot status = 1;
+  optional ErrorInfo error = 2;
 }
 
 message RuntimeStatusChanged {
-  RuntimeStatusSnapshot status = 1;
+  optional RuntimeStatusSnapshot status = 1;
 }
 
-message GetCapabilitySnapshotRequest {}
+message GetCapabilitySnapshotRequest {
+}
 
 message CapabilitySnapshotResponse {
-  CapabilitySnapshot snapshot = 1;
-  ErrorInfo error = 2;
+  optional CapabilitySnapshot snapshot = 1;
+  optional ErrorInfo error = 2;
 }
 
 message CapabilitySnapshotChanged {
-  CapabilitySnapshot snapshot = 1;
+  optional CapabilitySnapshot snapshot = 1;
+}
+
+message HostIdentitySnapshot {
+  string device_id = 1;
+  string display_name = 2;
+  string hostname = 3;
+  string app_version = 4;
+  string platform = 5;
+}
+
+message HostSettingsSnapshot {
+  bool allow_remote_assistance = 1;
+  string verification_mode = 2;
+  string connection_method = 3;
+  bool notify_on_incoming_request = 4;
+  bool auto_accept_trusted_controller = 5;
+  int64 updated_at_ms = 6;
+  string temporary_verification_code = 7;
+  string custom_verification_code = 8;
+  bool refresh_temporary_code_after_controlled_end = 9;
+}
+
+message HostOverviewSnapshot {
+  optional HostIdentitySnapshot identity = 1;
+  optional HostSettingsSnapshot settings = 2;
+  uint32 paired_controller_count = 3;
+  uint32 control_port = 4;
+  optional string active_controller_display_name = 5;
+  int64 updated_at_ms = 6;
+  optional PendingRemoteRequestSnapshot pending_remote_request = 7;
+  optional VideoStreamSnapshot video_stream = 8;
+}
+
+message PendingRemoteRequestSnapshot {
+  string request_id = 1;
+  string controller_device_id = 2;
+  string controller_display_name = 3;
+  string connection_method = 4;
+  int64 requested_at_ms = 5;
+  int64 expires_at_ms = 6;
+}
+
+message VideoStreamSnapshot {
+  string session_id = 1;
+  uint64 packet_count = 2;
+  uint64 keyframe_count = 3;
+  uint64 latest_packet_len = 4;
+  string latest_frame_source_label = 5;
+  string latest_error = 6;
+  int64 updated_at_ms = 7;
+}
+
+message DiagnosticEntry {
+  string level = 1;
+  string code = 2;
+  string message = 3;
+  int64 created_at_ms = 4;
+}
+
+message GetHostOverviewRequest {
+}
+
+message HostOverviewResponse {
+  optional HostOverviewSnapshot overview = 1;
+  optional ErrorInfo error = 2;
+}
+
+message HostOverviewChanged {
+  optional HostOverviewSnapshot overview = 1;
+}
+
+message UpdateHostSettingsRequest {
+  optional HostSettingsSnapshot settings = 1;
+}
+
+message UpdateHostSettingsResponse {
+  optional HostOverviewSnapshot overview = 1;
+  optional ErrorInfo error = 2;
+}
+
+message RefreshTemporaryVerificationCodeRequest {
+}
+
+message RefreshTemporaryVerificationCodeResponse {
+  optional HostOverviewSnapshot overview = 1;
+  optional ErrorInfo error = 2;
+}
+
+message RespondPendingRemoteRequestRequest {
+  bool allow = 1;
+  string request_id = 2;
+}
+
+message RespondPendingRemoteRequestResponse {
+  optional HostOverviewSnapshot overview = 1;
+  optional ErrorInfo error = 2;
 }
 
 message StopSessionRequest {
@@ -73,20 +170,18 @@ message StopSessionRequest {
 
 message StopSessionResponse {
   string session_id = 1;
-  SessionState state = 2;
-  ErrorInfo error = 3;
+  bool stopped = 2;
+  optional ErrorInfo error = 3;
 }
 
-message DiagnosticEvent {
-  string code = 1;
-  string level = 2;
-  string message = 3;
-  int64 timestamp_ms = 4;
+message GetDiagnosticsRequest {
 }
-
-message GetDiagnosticsRequest {}
 
 message DiagnosticsResponse {
-  repeated DiagnosticEvent events = 1;
-  ErrorInfo error = 2;
+  repeated DiagnosticEntry entries = 1;
+  optional ErrorInfo error = 2;
+}
+
+message DiagnosticsChanged {
+  repeated DiagnosticEntry entries = 1;
 }

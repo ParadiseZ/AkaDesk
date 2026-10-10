@@ -33,7 +33,7 @@ const activePath = computed(() => route.path);
     </nav>
 
     <div class="mt-auto border-t border-slate-300 px-5 py-4 text-xs leading-6 text-slate-500">
-      错误与操作已改为日志输出。
+      支持 Android 连接本机查看屏幕。
     </div>
   </aside>
 </template>

@@ -14,7 +14,7 @@ defineProps<{
 
     <div class="px-6 py-6">
       <div class="border border-slate-300 bg-slate-50 px-5 py-4 text-sm text-slate-500">
-        当前页面只保留结构占位，不展示调试内容。
+        此功能尚未开放。
       </div>
     </div>
   </section>

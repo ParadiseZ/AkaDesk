@@ -35,8 +35,8 @@ const connectionMethodOptions = [
 
 const shellForm = reactive({
   launchOnStartup: false,
-  minimizeToTray: true,
-  notificationsEnabled: true,
+  minimizeToTray: false,
+  notificationsEnabled: false,
   lastRoute: "/remote",
   lastRemoteDeviceId: "",
   lastAccessCode: "",
@@ -78,15 +78,15 @@ watch(
   (value) => {
     if (!value) return;
     selectedSecurityMethod.value = (value.connectionMethod as ConnectionMethod) ?? "ACCESS_CODE";
-    customCodeDraft.value = value.customVerificationCode;
+    if (!customCodeDialogOpen.value) customCodeDraft.value = value.customVerificationCode;
   },
   { immediate: true },
 );
 
 function securityDescription(method: ConnectionMethod) {
   if (method === "TRUST_ONLY") return "不需验证码，同意后即可连接。";
-  if (method === "ACCESS_CODE_AND_CONSENT") return "设备 id + 验证码 + 同意可连接。";
-  return "设备 id + 验证码连接，文档方案是这种。";
+  if (method === "ACCESS_CODE_AND_CONSENT") return "输入设备验证码后，还需本机同意。";
+  return "输入设备验证码后即可连接。";
 }
 
 function formatDeviceId(value: string) {
@@ -111,10 +111,7 @@ async function persistShellSettings(patch: Partial<typeof shellForm>) {
 
 async function persistHostSettings(patch: Record<string, unknown>) {
   if (!hostSettings.value) return;
-  await store.updateHostSettings({
-    ...hostSettings.value,
-    ...patch,
-  });
+  return store.updateHostSettings(patch);
 }
 
 function onLaunchOnStartupChange(checked: boolean) {
@@ -150,8 +147,8 @@ function refreshTemporaryCode() {
 }
 
 async function saveCustomCode() {
-  await persistHostSettings({ customVerificationCode: customCodeDraft.value });
-  customCodeDialogOpen.value = false;
+  if (!/^(?=.*[A-Z])(?=.*[0-9])[A-Z0-9]{6,8}$/.test(customCodeDraft.value)) { store.errorMessage = "自定义验证码须为 6–8 位字母和数字组合"; return; }
+  if (await persistHostSettings({ customVerificationCode: customCodeDraft.value })) customCodeDialogOpen.value = false;
 }
 </script>
 
@@ -171,8 +168,8 @@ async function saveCustomCode() {
         <TabsContent value="general" class="mt-0">
           <div class="border border-slate-300 bg-white">
             <div class="border-b border-slate-300 px-5 py-4">
-              <h3 class="text-lg font-medium">桌面壳偏好</h3>
-              <p class="mt-1 text-sm text-slate-500">此处修改直接异步保存到桌面壳本地设置。</p>
+              <h3 class="text-lg font-medium">应用偏好</h3>
+              <p class="mt-1 text-sm text-slate-500">启动页自动保存；尚未实现的选项已禁用。</p>
             </div>
             <div class="grid gap-4 px-5 py-4">
               <div class="max-w-[220px]">
@@ -192,36 +189,36 @@ async function saveCustomCode() {
               <label class="flex items-center justify-between border border-slate-300 px-4 py-3">
                 <div>
                   <div class="text-sm font-medium">开机自启</div>
-                  <div class="mt-1 text-xs text-slate-500">后续可直接挂到系统级启动项管理。</div>
+                  <div class="mt-1 text-xs text-slate-500">尚未实现，当前不可用。</div>
                 </div>
                 <Switch
-                  :checked="shellForm.launchOnStartup"
+                  :model-value="false" disabled
                   class="data-[state=unchecked]:border-slate-400 data-[state=unchecked]:bg-slate-300 data-[state=checked]:border-sky-500 data-[state=checked]:bg-sky-500"
-                  @update:checked="onLaunchOnStartupChange"
+                  @update:model-value="onLaunchOnStartupChange"
                 />
               </label>
 
               <div class="flex items-center justify-between border border-slate-300 px-4 py-3">
                 <div>
                   <div class="text-sm font-medium">最小化到托盘</div>
-                  <div class="mt-1 text-xs text-slate-500">关闭窗口时保留宿主壳常驻。</div>
+                  <div class="mt-1 text-xs text-slate-500">尚未实现，关闭窗口会退出应用。</div>
                 </div>
                 <Switch
-                  :checked="shellForm.minimizeToTray"
+                  :model-value="false" disabled
                   class="data-[state=unchecked]:border-slate-400 data-[state=unchecked]:bg-slate-300 data-[state=checked]:border-sky-500 data-[state=checked]:bg-sky-500"
-                  @update:checked="onMinimizeToTrayChange"
+                  @update:model-value="onMinimizeToTrayChange"
                 />
               </div>
 
               <label class="flex items-center justify-between border border-slate-300 px-4 py-3">
                 <div>
                   <div class="text-sm font-medium">启用桌面通知</div>
-                  <div class="mt-1 text-xs text-slate-500">决定是否显示协助申请和关键事件弹层。</div>
+                  <div class="mt-1 text-xs text-slate-500">系统通知尚未实现；连接申请仍需在应用内确认。</div>
                 </div>
                 <Switch
-                  :checked="shellForm.notificationsEnabled"
+                  :model-value="false" disabled
                   class="data-[state=unchecked]:border-slate-400 data-[state=unchecked]:bg-slate-300 data-[state=checked]:border-sky-500 data-[state=checked]:bg-sky-500"
-                  @update:checked="onNotificationsEnabledChange"
+                  @update:model-value="onNotificationsEnabledChange"
                 />
               </label>
             </div>
@@ -235,10 +232,10 @@ async function saveCustomCode() {
               <p class="mt-1 text-sm text-slate-500">{{ securityDescription(selectedSecurityMethod) }}</p>
             </div>
             <section class="border-b border-slate-300 px-5 py-4">
-              <div class="grid gap-3 md:grid-cols-[160px_160px_120px_minmax(0,1fr)] md:items-end">
-                <div class="max-w-[160px]">
+              <div class="grid gap-3 xl:grid-cols-[minmax(220px,1.5fr)_160px_100px_minmax(140px,1fr)] xl:items-end">
+                <div class="min-w-0">
                   <div class="text-xs text-slate-500">本设备 ID</div>
-                  <div class="mt-2 text-2xl font-semibold tracking-[0.08em]">{{ formattedLocalDeviceId || "--" }}</div>
+                  <div class="mt-2 break-all font-mono text-base font-semibold">{{ formattedLocalDeviceId || "--" }}</div>
                 </div>
 
                 <div class="max-w-[160px]">
@@ -317,7 +314,7 @@ async function saveCustomCode() {
               :model-value="customCodeDraft"
               class="mt-2 rounded-none border-slate-300"
               maxlength="8"
-              placeholder="输入 8 位以内数字或字母"
+              placeholder="输入 6–8 位字母和数字组合"
               @update:model-value="onCustomCodeInput"
               @keydown.enter="saveCustomCode"
             />

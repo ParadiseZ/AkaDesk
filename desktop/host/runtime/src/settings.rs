@@ -1,4 +1,5 @@
-use crate::pairing::now_ms;
+use crate::events::SharedStateSignal;
+use crate::pairing::{generate_verification_code, is_mixed_verification_code, now_ms};
 use host_ipc::types::HostSettingsSnapshot;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -60,7 +61,7 @@ impl Default for HostSettings {
             notify_on_incoming_request: true,
             auto_accept_trusted_controller: false,
             temporary_verification_code: generate_temporary_verification_code(),
-            custom_verification_code: "AKADESK".to_string(),
+            custom_verification_code: String::new(),
             refresh_temporary_code_after_controlled_end: true,
             updated_at_ms: now_ms(),
         }
@@ -124,13 +125,15 @@ impl HostSettings {
 pub struct HostSettingsStore {
     path: PathBuf,
     settings: HostSettings,
+    signal: Option<SharedStateSignal>,
+    last_finished_session_id: Option<String>,
 }
 
 impl HostSettingsStore {
     pub fn load(base_dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(base_dir)?;
         let path = base_dir.join("host_settings.json");
-        let settings = if path.exists() {
+        let mut settings: HostSettings = if path.exists() {
             let text = fs::read_to_string(&path)?;
             serde_json::from_str(&text)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?
@@ -139,7 +142,31 @@ impl HostSettingsStore {
             write_json(&path, &settings)?;
             settings
         };
-        Ok(Self { path, settings })
+        let temporary = normalize_temporary_code(settings.temporary_verification_code.clone());
+        let custom = normalize_custom_code(settings.custom_verification_code.clone());
+        let custom = if !custom.is_empty() && !is_mixed_verification_code(&custom) {
+            generate_verification_code()
+        } else {
+            custom
+        };
+        if temporary != settings.temporary_verification_code
+            || custom != settings.custom_verification_code
+        {
+            settings.temporary_verification_code = temporary;
+            settings.custom_verification_code = custom;
+            settings.updated_at_ms = now_ms();
+            write_json(&path, &settings)?;
+        }
+        Ok(Self {
+            path,
+            settings,
+            signal: None,
+            last_finished_session_id: None,
+        })
+    }
+
+    pub fn set_signal(&mut self, signal: SharedStateSignal) {
+        self.signal = Some(signal);
     }
 
     pub fn snapshot(&self) -> HostSettingsSnapshot {
@@ -151,23 +178,61 @@ impl HostSettingsStore {
     }
 
     pub fn update(&mut self, snapshot: HostSettingsSnapshot) -> io::Result<HostSettingsSnapshot> {
-        self.settings = HostSettings::from_snapshot(snapshot);
-        write_json(&self.path, &self.settings)?;
+        let settings = HostSettings::from_snapshot(snapshot);
+        if !settings.custom_verification_code.is_empty()
+            && !is_mixed_verification_code(&settings.custom_verification_code)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "自定义验证码须为 6–8 位字母和数字组合",
+            ));
+        }
+        if matches!(
+            settings.verification_mode.as_str(),
+            "CUSTOM_CODE" | "BOTH_CODES"
+        ) && settings.custom_verification_code.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "请先设置自定义验证码",
+            ));
+        }
+        write_json(&self.path, &settings)?;
+        self.settings = settings;
+        if let Some(signal) = self.signal.as_ref() {
+            signal.notify();
+        }
         Ok(self.snapshot())
     }
 
     pub fn refresh_temporary_code(&mut self) -> io::Result<HostSettingsSnapshot> {
-        self.settings.temporary_verification_code = generate_temporary_verification_code();
-        self.settings.updated_at_ms = now_ms();
-        write_json(&self.path, &self.settings)?;
+        let mut settings = self.settings.clone();
+        settings.temporary_verification_code = generate_temporary_verification_code();
+        settings.updated_at_ms = now_ms();
+        write_json(&self.path, &settings)?;
+        self.settings = settings;
+        if let Some(signal) = self.signal.as_ref() {
+            signal.notify();
+        }
         Ok(self.snapshot())
+    }
+
+    pub fn refresh_after_session_end(&mut self, session_id: &str) -> io::Result<()> {
+        if self.last_finished_session_id.as_deref() == Some(session_id) {
+            return Ok(());
+        }
+        if self.settings.refresh_temporary_code_after_controlled_end {
+            self.refresh_temporary_code()?;
+        }
+        self.last_finished_session_id = Some(session_id.to_owned());
+        Ok(())
     }
 }
 
 fn write_json(path: &Path, value: &HostSettings) -> io::Result<()> {
     let text = serde_json::to_string_pretty(value)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-    fs::write(path, text)
+    host_ipc::storage::atomic_write(path, text.as_bytes())
 }
 
 fn default_verification_mode() -> String {
@@ -185,8 +250,8 @@ fn normalize_verification_mode(value: String) -> String {
 }
 
 fn normalize_temporary_code(value: String) -> String {
-    let normalized = value.trim().to_string();
-    if normalized.is_empty() {
+    let normalized = value.trim().to_ascii_uppercase();
+    if !is_mixed_verification_code(&normalized) {
         generate_temporary_verification_code()
     } else {
         normalized
@@ -196,7 +261,7 @@ fn normalize_temporary_code(value: String) -> String {
 fn normalize_custom_code(value: String) -> String {
     let normalized = value.trim().to_ascii_uppercase();
     if normalized.is_empty() {
-        "AKADESK".to_string()
+        String::new()
     } else {
         normalized
     }
@@ -207,5 +272,56 @@ fn normalize_submitted_code(value: &str) -> String {
 }
 
 fn generate_temporary_verification_code() -> String {
-    format!("{:06}", now_ms().unsigned_abs() % 1_000_000)
+    generate_verification_code()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn old_codes_migrate_once_and_invalid_custom_updates_do_not_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "akadesk-code-migration-{}",
+            crate::pairing::random_string(16)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mut original = HostSettings::default();
+        original.temporary_verification_code = "123456".into();
+        original.custom_verification_code = "AKADESK".into();
+        original.verification_mode = "BOTH_CODES".into();
+        write_json(&dir.join("host_settings.json"), &original).unwrap();
+        let mut store = HostSettingsStore::load(&dir).unwrap();
+        let settings = store.current();
+        assert!(is_mixed_verification_code(
+            &settings.temporary_verification_code
+        ));
+        assert!(is_mixed_verification_code(
+            &settings.custom_verification_code
+        ));
+        assert_eq!(
+            HostSettingsStore::load(&dir)
+                .unwrap()
+                .current()
+                .temporary_verification_code,
+            settings.temporary_verification_code
+        );
+        assert!(settings
+            .accepts_access_code(&settings.temporary_verification_code.to_ascii_lowercase()));
+        let mut input = store.snapshot();
+        input.custom_verification_code = "12345678".into();
+        assert!(store.update(input).is_err());
+        assert_eq!(
+            store.current().custom_verification_code,
+            settings.custom_verification_code
+        );
+        assert_eq!(
+            HostSettingsStore::load(&dir)
+                .unwrap()
+                .current()
+                .custom_verification_code,
+            settings.custom_verification_code
+        );
+        fs::remove_file(dir.join("host_settings.json")).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
 }

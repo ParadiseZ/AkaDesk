@@ -1,4 +1,5 @@
 use rand::distributions::{Alphanumeric, DistString};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -23,15 +24,23 @@ impl HostIdentity {
         let path = base_dir.join("host_identity.json");
         if path.exists() {
             let text = fs::read_to_string(&path)?;
-            return serde_json::from_str(&text)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()));
+            let mut identity: Self = serde_json::from_str(&text)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+            let numeric_id = numeric_device_id(&identity.device_id);
+            if identity.device_id != numeric_id {
+                identity.device_id = numeric_id;
+                write_json(&path, &identity)?;
+            }
+            return Ok(identity);
         }
 
         let hostname = std::env::var("COMPUTERNAME")
             .or_else(|_| std::env::var("HOSTNAME"))
             .unwrap_or_else(|_| "AkaDesk-Host".to_string());
         let identity = Self {
-            device_id: random_string(24),
+            device_id: rand::thread_rng()
+                .gen_range(100_000_000u64..1_000_000_000)
+                .to_string(),
             display_name: hostname.clone(),
             hostname,
             app_version: "0.1.0-m3".to_string(),
@@ -51,7 +60,7 @@ pub struct PairingRecord {
     pub last_used_at_ms: i64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PairingStoreFile {
     records: BTreeMap<String, PairingRecord>,
 }
@@ -66,14 +75,33 @@ impl PairingStore {
     pub fn load(base_dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(base_dir)?;
         let path = base_dir.join("pairings.json");
-        let file = if path.exists() {
+        let file: PairingStoreFile = if path.exists() {
             let text = fs::read_to_string(&path)?;
             serde_json::from_str(&text)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?
         } else {
             PairingStoreFile::default()
         };
-        Ok(Self { path, file })
+        let mut migrated = PairingStoreFile::default();
+        let mut changed = false;
+        for (id, mut record) in file.records {
+            let numeric_id = numeric_device_id(&id);
+            changed |= numeric_id != id;
+            record.controller_device_id = numeric_id.clone();
+            if migrated.records.insert(numeric_id, record).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "device ID migration collision",
+                ));
+            }
+        }
+        if changed {
+            write_json(&path, &migrated)?;
+        }
+        Ok(Self {
+            path,
+            file: migrated,
+        })
     }
 
     pub fn upsert_pairing(
@@ -83,7 +111,8 @@ impl PairingStore {
         pair_token: &str,
     ) -> io::Result<()> {
         let now = now_ms();
-        self.file.records.insert(
+        let mut file = self.file.clone();
+        file.records.insert(
             controller_device_id.to_string(),
             PairingRecord {
                 controller_device_id: controller_device_id.to_string(),
@@ -93,7 +122,9 @@ impl PairingStore {
                 last_used_at_ms: now,
             },
         );
-        self.persist()
+        write_json(&self.path, &file)?;
+        self.file = file;
+        Ok(())
     }
 
     pub fn verify_pair_token(
@@ -120,6 +151,13 @@ impl PairingStore {
         self.file.records.len()
     }
 
+    pub fn controller_display_name(&self, device_id: &str) -> Option<String> {
+        self.file
+            .records
+            .get(device_id)
+            .map(|record| record.controller_display_name.clone())
+    }
+
     fn persist(&self) -> io::Result<()> {
         write_json(&self.path, &self.file)
     }
@@ -131,6 +169,7 @@ pub struct PendingChallenge {
     pub controller_device_id: String,
     pub controller_display_name: String,
     pub challenge_id: String,
+    pub expires_at_ms: i64,
 }
 
 pub type SharedPairingStore = Arc<Mutex<PairingStore>>;
@@ -153,7 +192,35 @@ pub fn generate_pair_token() -> String {
 }
 
 pub fn generate_verification_code() -> String {
-    random_string(8).to_uppercase()
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut rng = rand::thread_rng();
+    loop {
+        let code: String = (0..8)
+            .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+            .collect();
+        if is_mixed_verification_code(&code) {
+            return code;
+        }
+    }
+}
+
+pub fn is_mixed_verification_code(code: &str) -> bool {
+    (6..=8).contains(&code.len())
+        && code
+            .bytes()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && code.bytes().any(|c| c.is_ascii_uppercase())
+        && code.bytes().any(|c| c.is_ascii_digit())
+}
+
+/// Shared with Android migration: SHA-256, first 8 bytes big endian, 9 decimal digits.
+pub fn numeric_device_id(old_id: &str) -> String {
+    if old_id.len() == 9 && old_id.bytes().all(|c| c.is_ascii_digit()) {
+        return old_id.to_owned();
+    }
+    let digest = Sha256::digest(old_id.as_bytes());
+    let value = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"));
+    (100_000_000 + value % 900_000_000).to_string()
 }
 
 pub fn now_ms() -> i64 {
@@ -171,5 +238,65 @@ fn hash_token(token: &str) -> String {
 fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let text = serde_json::to_string_pretty(value)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-    fs::write(path, text)
+    host_ipc::storage::atomic_write(path, text.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numeric_identity_migration_matches_android_and_preserves_pairing() {
+        assert_eq!(numeric_device_id("fqeUEkVCScqa53y7Ytv47t88"), "453414118");
+        assert_eq!(
+            numeric_device_id("android-12345678-1234-1234-1234-123456789012"),
+            "916537989"
+        );
+        assert_eq!(numeric_device_id("012345678"), "012345678");
+        let dir = std::env::temp_dir().join(format!("akadesk-id-migration-{}", random_string(16)));
+        fs::create_dir_all(&dir).unwrap();
+        let identity = HostIdentity {
+            device_id: "fqeUEkVCScqa53y7Ytv47t88".into(),
+            display_name: "original name".into(),
+            hostname: "pc".into(),
+            app_version: "test".into(),
+            platform: "windows".into(),
+        };
+        write_json(&dir.join("host_identity.json"), &identity).unwrap();
+        let migrated = HostIdentity::load_or_create(&dir).unwrap();
+        assert_eq!(migrated.device_id, "453414118");
+        assert_eq!(migrated.display_name, "original name");
+        assert_eq!(
+            HostIdentity::load_or_create(&dir).unwrap().device_id,
+            migrated.device_id
+        );
+        let mut pairings = PairingStore::load(&dir).unwrap();
+        pairings
+            .upsert_pairing(
+                "android-12345678-1234-1234-1234-123456789012",
+                "phone",
+                "secret-token",
+            )
+            .unwrap();
+        let mut migrated = PairingStore::load(&dir).unwrap();
+        assert_eq!(migrated.count(), 1);
+        assert!(migrated
+            .verify_pair_token("916537989", "secret-token")
+            .unwrap());
+        fs::remove_file(dir.join("host_identity.json")).unwrap();
+        fs::remove_file(dir.join("pairings.json")).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn generated_codes_always_mix_letters_and_digits() {
+        for _ in 0..100 {
+            let code = generate_verification_code();
+            assert_eq!(code.len(), 8);
+            assert!(is_mixed_verification_code(&code));
+        }
+        assert!(!is_mixed_verification_code("12345678"));
+        assert!(!is_mixed_verification_code("ABCDEFGH"));
+        assert!(!is_mixed_verification_code("ABC12!"));
+    }
 }

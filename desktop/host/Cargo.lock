@@ -869,6 +869,7 @@ version = "0.1.0"
 dependencies = [
  "interprocess",
  "prost",
+ "prost-build",
 ]
 
 [[package]]
@@ -889,6 +890,7 @@ dependencies = [
  "prost",
  "prost-build",
  "rand 0.8.6",
+ "rtcp",
  "serde",
  "serde_json",
  "sha2",
@@ -901,6 +903,7 @@ dependencies = [
 name = "host-windows"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "ffmpeg-sys-next",
  "host-contracts",
 ]

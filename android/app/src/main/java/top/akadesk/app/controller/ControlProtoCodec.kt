@@ -114,7 +114,7 @@ object ControlProtoCodec {
                 SessionIntent.newBuilder()
                     .setControllerDeviceId(controllerDeviceId)
                     .setControlledDeviceId(controlledDeviceId)
-                    .setEnableInput(true)
+                    .setEnableInput(false)
                     .setVideo(videoPreference)
             )
             .build()

@@ -9,14 +9,16 @@ use std::time::Duration;
 use tauri::{Emitter, Manager};
 
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
             let app_data_dir = app
                 .path()
                 .app_data_dir()
                 .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
-            let state = Arc::new(AppState::load(app_data_dir)?);
-            state.ensure_host_started().map_err(into_boxed_error)?;
+            let state = Arc::new(AppState::load(app_data_dir, app.path().resource_dir()?)?);
+            if let Err(err) = state.ensure_host_started() {
+                state.log_command_error("HOST_START_FAILED", &err);
+            }
             app.manage(Arc::clone(&state));
             start_sync_loop(app.handle().clone(), state);
             Ok(())
@@ -32,19 +34,25 @@ pub fn run() {
             commands::respond_incoming_request,
             commands::disconnect_session
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run AkaDesk desktop shell");
+        .build(tauri::generate_context!())
+        .expect("failed to build AkaDesk desktop shell");
+    app.run(|handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            handle.state::<Arc<AppState>>().shutdown_host();
+        }
+    });
 }
 
 fn start_sync_loop(app: tauri::AppHandle, state: Arc<AppState>) {
     std::thread::spawn(move || loop {
-        if let Ok(snapshot) = state.bootstrap_snapshot() {
-            let _ = app.emit("shell://state", snapshot);
+        match state.bootstrap_snapshot() {
+            Ok(snapshot) => {
+                let _ = app.emit("shell://state", snapshot);
+            }
+            Err(error) => {
+                let _ = app.emit("shell://error", error);
+            }
         }
         std::thread::sleep(Duration::from_secs(2));
     });
-}
-
-fn into_boxed_error(message: String) -> Box<dyn std::error::Error> {
-    Box::new(std::io::Error::new(std::io::ErrorKind::Other, message))
 }

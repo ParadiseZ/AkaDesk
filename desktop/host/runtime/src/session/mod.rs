@@ -1,3 +1,4 @@
+use crate::events::SharedStateSignal;
 use crate::generated::v1::{AudioSessionSpec, SessionSnapshot, SessionState, VideoSessionSpec};
 use crate::pairing::{generate_pair_token, now_ms};
 use host_contracts::common::SessionId;
@@ -25,6 +26,7 @@ pub struct SessionContext {
 pub struct SessionRegistry {
     pub active: Option<SessionContext>,
     pub history_count: usize,
+    signal: Option<SharedStateSignal>,
 }
 
 pub type SharedSessionRegistry = Arc<Mutex<SessionRegistry>>;
@@ -51,11 +53,24 @@ impl SessionContext {
 }
 
 impl SessionRegistry {
+    pub fn set_signal(&mut self, signal: SharedStateSignal) {
+        self.signal = Some(signal);
+    }
+
+    fn notify(&self) {
+        if let Some(signal) = self.signal.as_ref() {
+            signal.notify();
+        }
+    }
+
     pub fn active_session_id(&self) -> Option<&SessionId> {
         self.active.as_ref().map(|session| &session.session_id)
     }
 
-    pub fn active_snapshot_for_controller(&self, controller_device_id: &str) -> Option<SessionSnapshot> {
+    pub fn active_snapshot_for_controller(
+        &self,
+        controller_device_id: &str,
+    ) -> Option<SessionSnapshot> {
         let session = self.active.as_ref()?;
         if session.controller_device_id != controller_device_id {
             return None;
@@ -76,17 +91,22 @@ impl SessionRegistry {
         controlled_device_id: String,
         target_display_id: String,
         video: VideoSessionSpec,
-    ) -> SessionSnapshot {
+    ) -> Option<SessionSnapshot> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|session| self.should_keep_running(&session.session_id.0))
+        {
+            return None;
+        }
         if self.active.is_some() {
             self.history_count += 1;
         }
 
         let now = now_ms();
-        let next_session_id = if session_id.trim().is_empty() {
-            format!("session-{}", generate_pair_token())
-        } else {
-            session_id
-        };
+        // A client-supplied ID must not revive an earlier session's late callbacks.
+        let _ = session_id;
+        let next_session_id = format!("session-{}", generate_pair_token());
         let context = SessionContext {
             session_id: SessionId(next_session_id),
             controller_device_id,
@@ -105,7 +125,8 @@ impl SessionRegistry {
         };
         let snapshot = context.snapshot();
         self.active = Some(context);
-        snapshot
+        self.notify();
+        Some(snapshot)
     }
 
     pub fn should_keep_running(&self, session_id: &str) -> bool {
@@ -121,6 +142,9 @@ impl SessionRegistry {
     }
 
     pub fn mark_streaming(&mut self, session_id: &str) -> Option<SessionSnapshot> {
+        if !self.should_keep_running(session_id) {
+            return None;
+        }
         let now = now_ms();
         let session = self.active.as_mut()?;
         if session.session_id.0 != session_id {
@@ -131,10 +155,15 @@ impl SessionRegistry {
             session.streaming_started_at_ms = now;
         }
         session.updated_at_ms = now;
-        Some(session.snapshot())
+        let snapshot = session.snapshot();
+        self.notify();
+        Some(snapshot)
     }
 
     pub fn touch_active(&mut self, session_id: &str) -> bool {
+        if !self.should_keep_running(session_id) {
+            return false;
+        }
         let Some(session) = self.active.as_mut() else {
             return false;
         };
@@ -146,6 +175,9 @@ impl SessionRegistry {
     }
 
     pub fn mark_failed(&mut self, session_id: &str) -> Option<SessionSnapshot> {
+        if !self.should_keep_running(session_id) {
+            return None;
+        }
         let now = now_ms();
         let session = self.active.as_mut()?;
         if session.session_id.0 != session_id {
@@ -154,10 +186,15 @@ impl SessionRegistry {
         session.state = SessionState::Failed as i32;
         session.updated_at_ms = now;
         session.closed_at_ms = now;
-        Some(session.snapshot())
+        let snapshot = session.snapshot();
+        self.notify();
+        Some(snapshot)
     }
 
     pub fn mark_disconnected(&mut self, session_id: &str) -> Option<SessionSnapshot> {
+        if !self.should_keep_running(session_id) {
+            return None;
+        }
         let now = now_ms();
         let session = self.active.as_mut()?;
         if session.session_id.0 != session_id {
@@ -169,6 +206,8 @@ impl SessionRegistry {
         session.state = SessionState::Disconnected as i32;
         session.updated_at_ms = now;
         session.closed_at_ms = now;
-        Some(session.snapshot())
+        let snapshot = session.snapshot();
+        self.notify();
+        Some(snapshot)
     }
 }
