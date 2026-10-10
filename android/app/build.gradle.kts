@@ -47,9 +47,6 @@ android {
             java.directories.addAll(
                 listOf("src/main/java")
             )
-            java.directories.addAll(
-                listOf("src/main/java_generated")
-            )
             proto {
                 srcDir("../../proto")
             }

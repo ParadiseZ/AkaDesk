@@ -1126,3 +1126,147 @@ mod tests {
         assert!(encoded.packet_len > 0, "expected encoded packet payload");
     }
 }
+
+#[cfg(windows)]
+pub struct StreamingOpusEncoder {
+    context: CodecContextGuard,
+    frame: FrameGuard,
+    packet: PacketGuard,
+    next_pts: i64,
+}
+
+#[cfg(windows)]
+impl StreamingOpusEncoder {
+    pub fn new(bitrate_kbps: u32) -> Result<Self, String> {
+        use ffmpeg_sys_next::*;
+        unsafe {
+            let codec = avcodec_find_encoder_by_name(c"libopus".as_ptr());
+            if codec.is_null() {
+                return Err("FFmpeg libopus encoder is unavailable".into());
+            }
+            let ptr = avcodec_alloc_context3(codec);
+            if ptr.is_null() {
+                return Err("Failed to allocate Opus context".into());
+            }
+            let context = CodecContextGuard::from_raw(ptr);
+            (*ptr).sample_rate = 48_000;
+            (*ptr).sample_fmt = AVSampleFormat::AV_SAMPLE_FMT_FLT;
+            (*ptr).bit_rate = bitrate_kbps as i64 * 1000;
+            (*ptr).time_base = AVRational {
+                num: 1,
+                den: 48_000,
+            };
+            av_channel_layout_default(&mut (*ptr).ch_layout, 2);
+            ffmpeg_status(
+                avcodec_open2(ptr, codec, std::ptr::null_mut()),
+                "Open Opus encoder",
+            )?;
+            if (*ptr).frame_size != 960 {
+                return Err("Opus encoder must use 20ms frames".into());
+            }
+            let mut frame = FrameGuard::allocate()?;
+            let frame_ptr = frame.as_mut_ptr();
+            (*frame_ptr).format = AVSampleFormat::AV_SAMPLE_FMT_FLT as i32;
+            (*frame_ptr).sample_rate = 48_000;
+            (*frame_ptr).nb_samples = 960;
+            ffmpeg_status(
+                av_channel_layout_copy(&mut (*frame_ptr).ch_layout, &(*ptr).ch_layout),
+                "Copy Opus channel layout",
+            )?;
+            ffmpeg_status(av_frame_get_buffer(frame_ptr, 0), "Allocate Opus PCM frame")?;
+            Ok(Self {
+                context,
+                frame,
+                packet: PacketGuard::allocate()?,
+                next_pts: 0,
+            })
+        }
+    }
+    pub fn encode(&mut self, samples: &[f32]) -> Result<Vec<u8>, String> {
+        use ffmpeg_sys_next::*;
+        if samples.len() != 1920 {
+            return Err("Opus needs exactly 960 stereo frames".into());
+        }
+        unsafe {
+            let frame = self.frame.as_mut_ptr();
+            ffmpeg_status(av_frame_make_writable(frame), "Make Opus PCM writable")?;
+            std::ptr::copy_nonoverlapping(
+                samples.as_ptr(),
+                (*frame).data[0] as *mut f32,
+                samples.len(),
+            );
+            (*frame).pts = self.next_pts;
+            self.next_pts += 960;
+            ffmpeg_status(
+                avcodec_send_frame(self.context.as_mut_ptr(), frame),
+                "Send Opus PCM",
+            )?;
+            let packet = self.packet.as_mut_ptr();
+            av_packet_unref(packet);
+            ffmpeg_status(
+                avcodec_receive_packet(self.context.as_mut_ptr(), packet),
+                "Receive Opus packet",
+            )?;
+            let bytes =
+                std::slice::from_raw_parts((*packet).data, (*packet).size as usize).to_vec();
+            av_packet_unref(packet);
+            Ok(bytes)
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod opus_tests {
+    use super::*;
+    use ffmpeg_sys_next::*;
+    #[test]
+    fn opus_packet_decodes_back_to_non_silent_stereo_audio() {
+        let mut encoder = StreamingOpusEncoder::new(64).unwrap();
+        let samples: Vec<f32> = (0..960)
+            .flat_map(|i| {
+                let value = (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.3;
+                [value, value]
+            })
+            .collect();
+        let bytes = encoder.encode(&samples).unwrap();
+        assert!(!bytes.is_empty());
+        unsafe {
+            let codec = avcodec_find_decoder(AVCodecID::AV_CODEC_ID_OPUS);
+            assert!(!codec.is_null());
+            let ptr = avcodec_alloc_context3(codec);
+            assert!(!ptr.is_null());
+            let mut context = CodecContextGuard::from_raw(ptr);
+            av_channel_layout_default(&mut (*ptr).ch_layout, 2);
+            (*ptr).sample_rate = 48_000;
+            ffmpeg_status(
+                avcodec_open2(ptr, codec, std::ptr::null_mut()),
+                "Open Opus decoder",
+            )
+            .unwrap();
+            let mut packet = PacketGuard::allocate().unwrap();
+            let packet_ptr = packet.as_mut_ptr();
+            assert_eq!(av_new_packet(packet_ptr, bytes.len() as i32), 0);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*packet_ptr).data, bytes.len());
+            ffmpeg_status(
+                avcodec_send_packet(context.as_mut_ptr(), packet_ptr),
+                "Decode Opus packet",
+            )
+            .unwrap();
+            let mut frame = FrameGuard::allocate().unwrap();
+            let frame_ptr = frame.as_mut_ptr();
+            ffmpeg_status(
+                avcodec_receive_frame(context.as_mut_ptr(), frame_ptr),
+                "Read Opus PCM",
+            )
+            .unwrap();
+            assert_eq!((*frame_ptr).nb_samples, 960);
+            assert_eq!((*frame_ptr).ch_layout.nb_channels, 2);
+            assert_eq!(
+                (*frame_ptr).format,
+                AVSampleFormat::AV_SAMPLE_FMT_FLTP as i32
+            );
+            let decoded = std::slice::from_raw_parts((*frame_ptr).data[0] as *const f32, 960);
+            assert!(decoded.iter().any(|value| value.abs() > 0.05));
+        }
+    }
+}

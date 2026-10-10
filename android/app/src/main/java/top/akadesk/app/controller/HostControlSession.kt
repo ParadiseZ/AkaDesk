@@ -64,6 +64,8 @@ internal class HostControlSession(
         fun onHostVideoStream(host: ControlledHostSummary, event: HostVideoStreamEvent)
         fun onHostTransportStatus(host: ControlledHostSummary, event: HostTransportStatusEvent)
         fun onSessionClosed(host: ControlledHostSummary, sessionId: String, reason: String)
+        fun onAudioState(host: ControlledHostSummary, sessionId: String, available: Boolean, muted: Boolean) {}
+        fun onAudioMuteResult(host: ControlledHostSummary, sessionId: String, muted: Boolean, error: String?) {}
         fun onFailure(host: ControlledHostSummary, message: String)
     }
 
@@ -264,6 +266,12 @@ internal class HostControlSession(
                     }
                 }
                 listener.onSessionChanged(host, snapshot.sessionId, stateLabel, summary)
+                listener.onAudioState(host, snapshot.sessionId, snapshot.hasAudio(), snapshot.muteControlledLocalPlayback)
+            }
+            "SetAudioMuteResponse" -> {
+                val result = ControlProtoCodec.decodeSetAudioMuteResponse(envelope)
+                listener.onAudioMuteResult(host, result.sessionId, result.muted,
+                    if (result.hasError()) result.error.message else null)
             }
             "SessionClosedEvent" -> {
                 val closed = ControlProtoCodec.decodeSessionClosedEvent(envelope)
@@ -286,6 +294,10 @@ internal class HostControlSession(
     }
 
     private fun nextRequestId(): String = "android-${requestCounter.incrementAndGet()}"
+
+    fun setComputerMuted(sessionId: String, muted: Boolean) {
+        send(ControlProtoCodec.buildSetAudioMuteRequest(nextRequestId(), sessionId, muted))
+    }
 
     private fun notifyFailure(message: String) {
         if (terminate()) listener.onFailure(host, message)

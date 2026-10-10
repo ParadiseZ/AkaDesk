@@ -5,6 +5,8 @@ package akadesk.v1;
 option java_multiple_files = true;
 option java_package = "akadesk.v1";
 
+import "common.proto";
+
 enum VideoCodec {
   VIDEO_CODEC_UNSPECIFIED = 0;
   VIDEO_CODEC_H264 = 1;
@@ -57,4 +59,15 @@ message AudioSessionSpec {
   uint32 sample_rate = 2;
   uint32 channels = 3;
   uint32 bitrate_kbps = 4;
+}
+
+message SetAudioMuteRequest {
+  string session_id = 1;
+  bool muted = 2;
+}
+
+message SetAudioMuteResponse {
+  string session_id = 1;
+  bool muted = 2;
+  ErrorInfo error = 3;
 }

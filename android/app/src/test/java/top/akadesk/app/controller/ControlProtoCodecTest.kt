@@ -17,7 +17,12 @@ class ControlProtoCodecTest {
         assertEquals(hostId, intent.controlledDeviceId)
         assertEquals("phone", intent.controllerDeviceId)
         assertFalse(intent.enableInput)
-        assertFalse(intent.hasAudio())
+        assertTrue(intent.hasAudio())
+        assertEquals(akadesk.v1.AudioCodec.AUDIO_CODEC_OPUS, intent.audio.codec)
+        assertEquals(48_000, intent.audio.sampleRate)
+        assertEquals(2, intent.audio.channels)
+        assertEquals(64, intent.audio.bitrateKbps)
+        assertFalse(intent.audio.muteControlledLocalPlayback)
         assertEquals(VideoCodec.VIDEO_CODEC_H264, intent.video.codec)
         assertEquals(960, intent.video.width)
         assertEquals(540, intent.video.height)
@@ -29,5 +34,14 @@ class ControlProtoCodecTest {
         assertEquals("stop-1", wire.requestId)
         assertEquals("StopSessionRequest", wire.type)
         assertEquals("session-current", StopSessionRequest.parseFrom(wire.payload).sessionId)
+    }
+
+    @Test
+    fun muteRequestChangesOnlyTheNamedSession() {
+        val wire = ControlProtoCodec.buildSetAudioMuteRequest("mute-1", "session-current", true)
+        assertEquals("SetAudioMuteRequest", wire.type)
+        val request = akadesk.v1.SetAudioMuteRequest.parseFrom(wire.payload)
+        assertEquals("session-current", request.sessionId)
+        assertTrue(request.muted)
     }
 }

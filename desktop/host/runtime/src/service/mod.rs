@@ -48,11 +48,18 @@ impl RuntimeService {
     pub fn new_in(base_dir: &std::path::Path) -> io::Result<Self> {
         let host_identity = HostIdentity::load_or_create(base_dir)?;
         let state_signal: SharedStateSignal = Arc::new(StateSignal::default());
+        let audio_streams = Arc::new(Mutex::new(crate::audio::AudioStreamState::new(base_dir)));
+        #[cfg(windows)]
+        let audio_restore_error = crate::audio::recover_audio_output(base_dir).err();
         let mut settings_store = HostSettingsStore::load(&base_dir)?;
         settings_store.set_signal(Arc::clone(&state_signal));
         let settings = Arc::new(Mutex::new(settings_store));
         let mut diagnostics_buffer = DiagnosticBuffer::default();
         diagnostics_buffer.set_signal(Arc::clone(&state_signal));
+        #[cfg(windows)]
+        if let Some(error) = audio_restore_error {
+            diagnostics_buffer.push("error", "AUDIO_OUTPUT_RESTORE_FAILED", error);
+        }
         let diagnostics: SharedDiagnosticBuffer = Arc::new(Mutex::new(diagnostics_buffer));
         let pairing_store: SharedPairingStore =
             Arc::new(Mutex::new(PairingStore::load(&base_dir)?));
@@ -93,6 +100,7 @@ impl RuntimeService {
             signaling: Arc::clone(&signaling),
             transport_status: Arc::clone(&transport_status),
             pairing_attempts: Arc::new(Mutex::new(crate::auth::PairingAttemptLimiter::default())),
+            audio_streams,
         };
         if let Ok(mut buffer) = diagnostics.lock() {
             buffer.push(
@@ -141,7 +149,13 @@ impl RuntimeService {
     }
 
     pub fn reap_finished_session(&self) -> io::Result<()> {
-        crate::control::reap_finished_session(&self.control_state)
+        let result = crate::control::reap_finished_session(&self.control_state);
+        if let Err(error) = &result {
+            if let Ok(mut diagnostics) = self.diagnostics.lock() {
+                diagnostics.push("error", "SESSION_OUTPUT_RESTORE_FAILED", error.to_string());
+            }
+        }
+        result
     }
 
     pub fn sessions(&self) -> &SharedSessionRegistry {

@@ -5,7 +5,8 @@ use crate::generated::v1::{
     GetDeviceSnapshot, HeartbeatPing, HeartbeatPong, HostTransportStatusEvent,
     HostVideoStreamEvent, IceCandidate, PairingChallenge, PairingChallengeType, PairingConfirm,
     PairingRequest, PairingResult, PlatformKind, SessionChangedEvent, SessionClosedEvent,
-    SessionState, StartSessionAccepted, StartSessionRejected, StartSessionRequest, WebRtcAnswer,
+    SessionState, SetAudioMuteRequest, SetAudioMuteResponse, StartSessionAccepted,
+    StartSessionRejected, StartSessionRequest, WebRtcAnswer,
 };
 use crate::pairing::{generate_pair_token, now_ms, PendingChallenge, SharedPairingStore};
 use crate::session::SharedSessionRegistry;
@@ -37,6 +38,8 @@ pub fn reap_finished_session(state: &ControlPlaneState) -> io::Result<()> {
     else {
         return Ok(());
     };
+    crate::audio::finish_audio_session(&state.audio_streams, &snapshot.session_id)
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
     state
         .video_streams
         .lock()
@@ -301,6 +304,7 @@ struct SentTransportEventState {
 
 #[derive(Debug, Clone)]
 pub struct ControlPlaneState {
+    pub audio_streams: crate::audio::SharedAudioStreamState,
     pub host_identity: DeviceIdentity,
     pub advertised_presence: DevicePresence,
     pub capability_flags: CapabilityFlags,
@@ -905,8 +909,7 @@ fn handle_envelope(
                 );
             }
 
-            if intent.enable_input || intent.audio.is_some() || !intent.target_display_id.is_empty()
-            {
+            if intent.enable_input || !intent.target_display_id.is_empty() {
                 return send_start_session_rejected(
                     websocket,
                     &envelope.request_id,
@@ -918,6 +921,17 @@ fn handle_envelope(
                 );
             }
             reap_finished_session(state)?;
+            if let Some(audio) = &intent.audio {
+                if let Err(error) = crate::audio::audio_spec(audio) {
+                    return send_start_session_rejected(
+                        websocket,
+                        &envelope.request_id,
+                        intent.session_id,
+                        simple_error("MEDIA_AUDIO_UNSUPPORTED", &error),
+                    );
+                }
+            }
+            let audio_preference = intent.audio.clone();
             if state
                 .sessions
                 .lock()
@@ -1078,11 +1092,49 @@ fn handle_envelope(
                 streaming.rtp_fmtp_line,
                 streaming.first_frame_source_label
             );
+            if let Some(preference) = audio_preference {
+                let audio_result = crate::audio::spawn_audio_stream(
+                    Arc::clone(&state.sessions),
+                    Arc::clone(&state.audio_streams),
+                    snapshot.session_id.clone(),
+                    preference.clone(),
+                )
+                .and_then(|ready| {
+                    ready
+                        .recv_timeout(Duration::from_secs(2))
+                        .map_err(|e| e.to_string())?
+                });
+                match audio_result {
+                    Ok(muted) => {
+                        state.sessions.lock().map_err(session_lock_err)?.set_audio(
+                            &snapshot.session_id,
+                            crate::audio::audio_spec(&preference)
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+                            muted,
+                        );
+                    }
+                    Err(error) => {
+                        state
+                            .sessions
+                            .lock()
+                            .map_err(session_lock_err)?
+                            .mark_failed(&snapshot.session_id);
+                        let _ = reap_finished_session(state);
+                        return send_start_session_rejected(
+                            websocket,
+                            &envelope.request_id,
+                            snapshot.session_id,
+                            simple_error("MEDIA_AUDIO_START_FAILED", &error),
+                        );
+                    }
+                }
+            }
             let transport_startup = crate::transport::spawn_h264_webrtc_transport_loop(
                 Arc::clone(&state.sessions),
                 Arc::clone(&state.video_streams),
                 Arc::clone(&state.signaling),
                 Arc::clone(&state.transport_status),
+                Arc::clone(&state.audio_streams),
                 snapshot.session_id.clone(),
                 snapshot
                     .video
@@ -1091,7 +1143,13 @@ fn handle_envelope(
                     .unwrap_or_default(),
                 streaming.rtp_fmtp_line.clone(),
             )
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+            .map_err(|err| {
+                if let Ok(mut registry) = state.sessions.lock() {
+                    registry.mark_failed(&snapshot.session_id);
+                }
+                let _ = reap_finished_session(state);
+                io::Error::new(io::ErrorKind::Other, err)
+            })?;
             match transport_startup.recv_timeout(Duration::from_millis(1_500)) {
                 Ok(Ok(transport)) => {
                     eprintln!(
@@ -1177,6 +1235,14 @@ fn handle_envelope(
             }
 
             let session_id = snapshot.session_id.clone();
+            let media_snapshot = state
+                .sessions
+                .lock()
+                .map_err(session_lock_err)?
+                .active
+                .as_ref()
+                .map(|session| session.snapshot())
+                .unwrap_or(snapshot);
 
             send_payload_shared(
                 websocket,
@@ -1185,7 +1251,7 @@ fn handle_envelope(
                 "StartSessionAccepted",
                 StartSessionAccepted {
                     session_id: session_id.clone(),
-                    state: streaming.snapshot.state,
+                    state: media_snapshot.state,
                 },
             )?;
             send_payload_shared(
@@ -1194,7 +1260,7 @@ fn handle_envelope(
                 ControlMessageKind::Event,
                 "SessionChangedEvent",
                 SessionChangedEvent {
-                    snapshot: Some(streaming.snapshot.clone()),
+                    snapshot: Some(media_snapshot),
                 },
             )?;
             flush_local_signaling_events(websocket, &envelope.request_id, state, &session_id)?;
@@ -1203,6 +1269,46 @@ fn handle_envelope(
                 *active = Some(session_id);
             }
             Ok(())
+        }
+        "SetAudioMuteRequest" => {
+            let request = SetAudioMuteRequest::decode(&envelope.payload[..]).map_err(decode_err)?;
+            require_session_owner(state, session, &request.session_id)?;
+            let result = crate::audio::set_controlled_muted(
+                &state.audio_streams,
+                &request.session_id,
+                request.muted,
+            );
+            let muted = match &result {
+                Ok(muted) => {
+                    state
+                        .sessions
+                        .lock()
+                        .map_err(session_lock_err)?
+                        .set_audio_muted(&request.session_id, *muted);
+                    *muted
+                }
+                Err(_) => state
+                    .sessions
+                    .lock()
+                    .map_err(session_lock_err)?
+                    .active
+                    .as_ref()
+                    .map(|s| s.mute_controlled_local_playback)
+                    .unwrap_or(false),
+            };
+            send_payload_shared(
+                websocket,
+                &envelope.request_id,
+                ControlMessageKind::Response,
+                "SetAudioMuteResponse",
+                SetAudioMuteResponse {
+                    session_id: request.session_id,
+                    muted,
+                    error: result
+                        .err()
+                        .map(|error| simple_error("MEDIA_AUDIO_MUTE_FAILED", &error)),
+                },
+            )
         }
         "WebRtcAnswer" => {
             let answer = WebRtcAnswer::decode(&envelope.payload[..]).map_err(decode_err)?;
@@ -1323,6 +1429,7 @@ fn handle_envelope(
             else {
                 return Ok(());
             };
+            reap_finished_session(state)?;
             if let Ok(mut active) = active_session_id.lock() {
                 if active.as_deref() == Some(request.session_id.as_str()) {
                     active.take();
@@ -2078,7 +2185,7 @@ fn flush_local_signaling_events(
 pub fn default_capability_flags() -> CapabilityFlags {
     let video_support = crate::video::detect_runtime_video_support();
     CapabilityFlags {
-        supports_audio: false,
+        supports_audio: cfg!(windows),
         supports_input: false,
         supports_display_control: false,
         supports_hardware_encode: video_support.has_h264_hardware_encoder,

@@ -13,6 +13,7 @@ pub struct SessionContext {
     pub state: i32,
     pub video: Option<VideoSessionSpec>,
     pub audio: Option<AudioSessionSpec>,
+    pub mute_controlled_local_playback: bool,
     pub created_at_ms: i64,
     pub negotiating_started_at_ms: i64,
     pub preparing_started_at_ms: i64,
@@ -48,6 +49,7 @@ impl SessionContext {
             disconnecting_started_at_ms: self.disconnecting_started_at_ms,
             updated_at_ms: self.updated_at_ms,
             closed_at_ms: self.closed_at_ms,
+            mute_controlled_local_playback: self.mute_controlled_local_playback,
         }
     }
 }
@@ -115,6 +117,7 @@ impl SessionRegistry {
             state: SessionState::Preparing as i32,
             video: Some(video),
             audio: None,
+            mute_controlled_local_playback: false,
             created_at_ms: now,
             negotiating_started_at_ms: now,
             preparing_started_at_ms: now,
@@ -158,6 +161,31 @@ impl SessionRegistry {
         let snapshot = session.snapshot();
         self.notify();
         Some(snapshot)
+    }
+
+    pub fn set_audio(&mut self, session_id: &str, audio: AudioSessionSpec, muted: bool) -> bool {
+        if !self.should_keep_running(session_id) {
+            return false;
+        }
+        let session = self.active.as_mut().unwrap();
+        session.audio = Some(audio);
+        session.mute_controlled_local_playback = muted;
+        session.updated_at_ms = now_ms();
+        self.notify();
+        true
+    }
+    pub fn set_audio_muted(&mut self, session_id: &str, muted: bool) -> bool {
+        if !self.should_keep_running(session_id) {
+            return false;
+        }
+        let session = self.active.as_mut().unwrap();
+        if session.audio.is_none() {
+            return false;
+        }
+        session.mute_controlled_local_playback = muted;
+        session.updated_at_ms = now_ms();
+        self.notify();
+        true
     }
 
     pub fn touch_active(&mut self, session_id: &str) -> bool {

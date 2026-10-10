@@ -7,6 +7,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import org.webrtc.DataChannel
+import org.webrtc.AudioTrack
+import org.webrtc.audio.JavaAudioDeviceModule
 import org.webrtc.DefaultVideoDecoderFactory
 import org.webrtc.DefaultVideoEncoderFactory
 import org.webrtc.EglBase
@@ -49,6 +51,7 @@ class AndroidWebRtcSession(
             sdpMlineIndex: Int,
         )
         fun onRemoteVideoTrack(sessionId: String)
+        fun onRemoteAudioTrack(sessionId: String)
         fun onRemoteVideoFirstFrame(sessionId: String, width: Int, height: Int)
         fun onRemoteVideoStalled(sessionId: String, stalledForMs: Long, frameCount: Int)
         fun onRemoteVideoFlowResumed(sessionId: String, width: Int, height: Int, frameCount: Int)
@@ -58,6 +61,7 @@ class AndroidWebRtcSession(
     private val eglBase: EglBase
     private val peerConnectionFactory: PeerConnectionFactory
     private val peerConnection: PeerConnection
+    private val audioDeviceModule: JavaAudioDeviceModule
     private val candidateLock = Any()
     private val pendingRemoteCandidates = mutableListOf<PendingRemoteCandidate>()
     private val pendingRemoteCandidateKeys = mutableSetOf<String>()
@@ -147,18 +151,46 @@ class AndroidWebRtcSession(
 
     private var renderer: SurfaceViewRenderer? = null
     private var remoteVideoTrack: VideoTrack? = null
+    private var remoteAudioTrack: AudioTrack? = null
+    private var localAudioMuted = false
+    private var audioFocusGranted = false
+    private val audioPlayoutStarted = AtomicBoolean(false)
+    private val audioOutput = RemoteAudioOutput(appContext.applicationContext) { granted ->
+        synchronized(renderLock) {
+            audioFocusGranted = granted
+            if (!closed) remoteAudioTrack?.setVolume(if (localAudioMuted || !granted) 0.0 else 1.0)
+        }
+    }
 
     init {
         ensurePeerConnectionFactoryInitialized(appContext.applicationContext)
         eglBase = EglBase.create()
+        audioDeviceModule = JavaAudioDeviceModule.builder(appContext.applicationContext)
+            .setUseStereoOutput(true)
+            .setUseHardwareAcousticEchoCanceler(false)
+            .setUseHardwareNoiseSuppressor(false)
+            .setAudioTrackStateCallback(object : JavaAudioDeviceModule.AudioTrackStateCallback {
+                override fun onWebRtcAudioTrackStart() { audioPlayoutStarted.set(true) }
+                override fun onWebRtcAudioTrackStop() { audioPlayoutStarted.set(false) }
+            })
+            .setAudioTrackErrorCallback(object : JavaAudioDeviceModule.AudioTrackErrorCallback {
+                override fun onWebRtcAudioTrackInitError(error: String) = audioFailure(error)
+                override fun onWebRtcAudioTrackStartError(code: JavaAudioDeviceModule.AudioTrackStartErrorCode, error: String) = audioFailure(error)
+                override fun onWebRtcAudioTrackError(error: String) = audioFailure(error)
+            })
+            .createAudioDeviceModule()
         peerConnectionFactory = PeerConnectionFactory.builder()
+            .setAudioDeviceModule(audioDeviceModule)
             .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
             .setVideoEncoderFactory(
                 DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true)
             )
             .createPeerConnectionFactory()
         peerConnection = createPeerConnection()
+        peerConnection.setAudioRecording(false)
         ensureVideoReceiveTransceiver()
+        requireNotNull(peerConnection.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
+            RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)))
         callbacks.onStateChanged(sessionId, "Android WebRTC 已创建，等待远端 Offer")
     }
 
@@ -305,6 +337,37 @@ class AndroidWebRtcSession(
 
     fun hasRemoteVideoTrack(): Boolean = synchronized(renderLock) { remoteVideoTrack != null }
 
+    fun setLocalAudioMuted(muted: Boolean) {
+        synchronized(renderLock) {
+            if (closed) return
+            localAudioMuted = muted
+            if (!muted && !audioFocusGranted) audioOutput.requestFocus()
+            remoteAudioTrack?.setVolume(if (muted || !audioFocusGranted) 0.0 else 1.0)
+        }
+    }
+
+    internal fun hasAudioPlayoutStarted(): Boolean = audioPlayoutStarted.get()
+    internal fun collectStats(callback: (org.webrtc.RTCStatsReport) -> Unit) {
+        if (!closed) peerConnection.getStats { report -> callback(report) }
+    }
+
+    private fun audioFailure(error: String) {
+        if (!closed) callbacks.onFailure(sessionId, "Audio playback failed: $error")
+    }
+
+    private fun attachRemoteAudioTrack(track: AudioTrack) {
+        synchronized(renderLock) {
+            if (closed || remoteAudioTrack === track) return
+            remoteAudioTrack?.setVolume(0.0)
+            remoteAudioTrack = track
+            track.setEnabled(true)
+            track.setVolume(0.0)
+            audioOutput.start()
+            track.setVolume(if (localAudioMuted || !audioFocusGranted) 0.0 else 1.0)
+        }
+        callbacks.onRemoteAudioTrack(sessionId)
+    }
+
     fun close() {
         if (closed) {
             return
@@ -321,6 +384,8 @@ class AndroidWebRtcSession(
             detachRendererLocked()
             detachRemoteVideoObserverLocked()
             remoteVideoTrack = null
+            remoteAudioTrack?.setVolume(0.0)
+            remoteAudioTrack = null
             remoteFirstFrameReported.set(false)
             remoteFrameCount.set(0)
             remoteVideoStalled.set(false)
@@ -329,6 +394,8 @@ class AndroidWebRtcSession(
         peerConnection.close()
         peerConnection.dispose()
         peerConnectionFactory.dispose()
+        audioDeviceModule.release()
+        audioOutput.close()
         eglBase.release()
     }
 
@@ -393,6 +460,7 @@ class AndroidWebRtcSession(
                     if (track is VideoTrack) {
                         attachRemoteVideoTrack(track, "已协商远端视频轨道")
                     }
+                    if (track is AudioTrack) attachRemoteAudioTrack(track)
                 }
 
                 override fun onTrack(transceiver: RtpTransceiver?) {
@@ -400,6 +468,7 @@ class AndroidWebRtcSession(
                     if (track is VideoTrack) {
                         attachRemoteVideoTrack(track, "已收到远端视频轨道")
                     }
+                    if (track is AudioTrack) attachRemoteAudioTrack(track)
                 }
             })
         ) {

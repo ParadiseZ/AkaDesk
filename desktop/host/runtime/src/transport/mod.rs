@@ -1,3 +1,4 @@
+use crate::audio::SharedAudioStreamState;
 use crate::generated::v1::{IceCandidate, WebRtcOffer};
 use crate::pairing::now_ms;
 use crate::session::SharedSessionRegistry;
@@ -16,7 +17,7 @@ use std::time::SystemTime;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio::sync::oneshot;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
+use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::interceptor::registry::Registry;
@@ -68,6 +69,7 @@ pub fn spawn_h264_webrtc_transport_loop(
     video_streams: SharedVideoStreamState,
     signaling: SharedSignalingState,
     transport_status: SharedTransportStatusState,
+    audio_streams: SharedAudioStreamState,
     session_id: String,
     fps: u32,
     h264_fmtp_line: String,
@@ -98,9 +100,27 @@ pub fn spawn_h264_webrtc_transport_loop(
             }
         };
 
+        let has_audio = sessions.lock().ok().is_some_and(|registry| {
+            registry
+                .active
+                .as_ref()
+                .is_some_and(|s| s.session_id.0 == session_id && s.audio.is_some())
+        });
         let startup_result = runtime.block_on(async {
             let mut media_engine = build_h264_media_engine(&h264_fmtp_line)
                 .map_err(|err| format!("build_h264_media_engine failed: {err}"))?;
+            if has_audio {
+                media_engine
+                    .register_codec(
+                        RTCRtpCodecParameters {
+                            capability: opus_capability(),
+                            payload_type: 111,
+                            ..Default::default()
+                        },
+                        RTPCodecType::Audio,
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
             let interceptor_registry =
                 register_default_interceptors(Registry::new(), &mut media_engine)
                     .map_err(|err| format!("register_default_interceptors failed: {err}"))?;
@@ -131,8 +151,8 @@ pub fn spawn_h264_webrtc_transport_loop(
                     if let Some(candidate) = candidate {
                         match candidate.to_json() {
                             Ok(mut init) => {
-                                // This host has one video m-line. webrtc-rs candidates omit
-                                // its MID, so attach the actual MID from our local offer.
+                                // BUNDLE uses the first (video) m-line for both media tracks.
+                                // Attach its actual MID, omitted by webrtc-rs candidates.
                                 init.sdp_mid =
                                     local_media_mid.lock().ok().and_then(|mid| mid.clone());
                                 init.sdp_mline_index = Some(0);
@@ -235,6 +255,28 @@ pub fn spawn_h264_webrtc_transport_loop(
                 }
             });
 
+            let audio_track = if has_audio {
+                let track = Arc::new(TrackLocalStaticSample::new(
+                    opus_capability(),
+                    "audio".into(),
+                    "akadesk-host".into(),
+                ));
+                let transceiver = peer_connection
+                    .add_transceiver_from_track(
+                        Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>,
+                        Some(RTCRtpTransceiverInit {
+                            direction: RTCRtpTransceiverDirection::Sendonly,
+                            send_encodings: vec![],
+                        }),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let sender = transceiver.sender().await;
+                tokio::spawn(async move { while sender.read_rtcp().await.is_ok() {} });
+                Some(track)
+            } else {
+                None
+            };
             let offer = peer_connection
                 .create_offer(None)
                 .await
@@ -268,6 +310,7 @@ pub fn spawn_h264_webrtc_transport_loop(
             Ok::<_, String>((
                 peer_connection,
                 video_track,
+                audio_track,
                 media_send_ready,
                 TransportStartupResult {
                     local_offer_sdp_len: local_description.sdp.len(),
@@ -279,14 +322,14 @@ pub fn spawn_h264_webrtc_transport_loop(
             ))
         });
 
-        let (peer_connection, video_track, media_send_ready) = match startup_result {
+        let (peer_connection, video_track, audio_track, media_send_ready) = match startup_result {
             Ok(result) => {
-                let (peer_connection, video_track, media_send_ready, startup) = result;
+                let (peer_connection, video_track, audio_track, media_send_ready, startup) = result;
                 let _ = startup_tx.send(Ok(TransportStartupResult {
                     local_offer_sdp_len: startup.local_offer_sdp_len,
                     local_candidate_count: startup.local_candidate_count,
                 }));
-                (peer_connection, video_track, media_send_ready)
+                (peer_connection, video_track, audio_track, media_send_ready)
             }
             Err(err) => {
                 let _ = startup_tx.send(Err(err));
@@ -294,6 +337,59 @@ pub fn spawn_h264_webrtc_transport_loop(
             }
         };
 
+        let audio_stop = Arc::new(AtomicBool::new(false));
+        let audio_task = audio_track.map(|track| {
+            let sessions = Arc::clone(&sessions);
+            let streams = Arc::clone(&audio_streams);
+            let ready = Arc::clone(&media_send_ready);
+            let stop = Arc::clone(&audio_stop);
+            let status = Arc::clone(&transport_status);
+            let session_id = session_id.clone();
+            runtime.spawn(async move {
+                let mut timer = tokio::time::interval(Duration::from_millis(5));
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut previous: Option<u64> = None;
+                while !stop.load(Ordering::Acquire) {
+                    timer.tick().await;
+                    let packet = streams
+                        .lock()
+                        .ok()
+                        .and_then(|mut s| s.take_next_packet(&session_id));
+                    if !ready.load(Ordering::Acquire) {
+                        previous = None;
+                        continue;
+                    }
+                    let Some(packet) = packet else {
+                        continue;
+                    };
+                    let dropped = previous
+                        .map_or(0, |p| packet.index.saturating_sub(p + 1))
+                        .min(u16::MAX as u64) as u16;
+                    previous = Some(packet.index);
+                    let sent = tokio::time::timeout(
+                        Duration::from_millis(500),
+                        track.write_sample(&Sample {
+                            data: Bytes::from(packet.bytes),
+                            duration: Duration::from_millis(20),
+                            timestamp: SystemTime::now(),
+                            prev_dropped_packets: dropped,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                    if !matches!(sent, Ok(Ok(()))) {
+                        if let Ok(mut status) = status.lock() {
+                            status
+                                .record_error(&session_id, format!("Audio send failed: {sent:?}"));
+                        }
+                        if let Ok(mut registry) = sessions.lock() {
+                            registry.mark_failed(&session_id);
+                        }
+                        break;
+                    }
+                }
+            })
+        });
         let mut remote_answer_applied = false;
         let mut processed_remote_candidate_count = 0usize;
         let mut applied_remote_candidate_count = 0usize;
@@ -556,6 +652,15 @@ pub fn spawn_h264_webrtc_transport_loop(
             }
         }
 
+        if let Ok(mut registry) = sessions.lock() {
+            if registry.should_keep_running(&session_id) {
+                registry.mark_failed(&session_id);
+            }
+        }
+        audio_stop.store(true, Ordering::Release);
+        if let Some(task) = audio_task {
+            let _ = runtime.block_on(task);
+        }
         let _ = runtime.block_on(peer_connection.close());
         if let Ok(mut status) = transport_status.lock() {
             status.record_peer_connection_state(&session_id, "Closed".to_string());
@@ -568,6 +673,77 @@ pub fn spawn_h264_webrtc_transport_loop(
         }
     });
     Ok(startup_rx)
+}
+
+fn opus_capability() -> RTCRtpCodecCapability {
+    RTCRtpCodecCapability {
+        mime_type: MIME_TYPE_OPUS.into(),
+        clock_rate: 48_000,
+        channels: 2,
+        sdp_fmtp_line: "minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1".into(),
+        ..Default::default()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod audio_tests {
+    use super::*;
+    #[test]
+    fn offer_bundles_sendonly_opus_with_existing_video() {
+        let sessions = Arc::new(Mutex::new(crate::session::SessionRegistry::default()));
+        let id = sessions
+            .lock()
+            .unwrap()
+            .activate_preparing(
+                String::new(),
+                "phone".into(),
+                "pc".into(),
+                String::new(),
+                crate::generated::v1::VideoSessionSpec::default(),
+            )
+            .unwrap()
+            .session_id;
+        sessions.lock().unwrap().set_audio(
+            &id,
+            crate::audio::audio_spec(&crate::generated::v1::AudioPreference::default()).unwrap(),
+            false,
+        );
+        let video = Arc::new(Mutex::new(crate::video::VideoStreamState::default()));
+        video.lock().unwrap().begin_session(id.clone());
+        let signaling = Arc::new(Mutex::new(crate::signaling::SignalingState::default()));
+        signaling.lock().unwrap().begin_session(id.clone());
+        let status = Arc::new(Mutex::new(TransportStatusState::default()));
+        spawn_h264_webrtc_transport_loop(
+            Arc::clone(&sessions),
+            Arc::clone(&video),
+            Arc::clone(&signaling),
+            status,
+            Arc::new(Mutex::new(crate::audio::AudioStreamState::default())),
+            id.clone(),
+            30,
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".into(),
+        )
+        .unwrap()
+        .recv_timeout(Duration::from_secs(4))
+        .unwrap()
+        .unwrap();
+        let offer = signaling.lock().unwrap().local_offer(&id).unwrap().sdp;
+        sessions.lock().unwrap().mark_disconnected(&id);
+        assert!(offer.contains("m=video "));
+        assert!(offer.contains("m=audio "));
+        assert!(offer.contains("opus/48000/2"));
+        assert!(offer.contains("stereo=1"));
+        assert_eq!(offer.matches("a=sendonly").count(), 2);
+        let bundle = offer
+            .lines()
+            .find(|line| line.starts_with("a=group:BUNDLE "))
+            .unwrap();
+        assert_eq!(bundle.split_whitespace().count(), 3);
+        for candidate in signaling.lock().unwrap().local_candidates_snapshot(&id) {
+            assert!(!candidate.sdp_mid.is_empty());
+            assert_eq!(candidate.sdp_mline_index, 0);
+        }
+    }
 }
 
 fn retain_latest_decodable_window(
@@ -805,6 +981,7 @@ pub fn spawn_h264_webrtc_transport_loop(
     _: SharedVideoStreamState,
     _: SharedSignalingState,
     _: SharedTransportStatusState,
+    _: SharedAudioStreamState,
     _: String,
     _: u32,
     _: String,

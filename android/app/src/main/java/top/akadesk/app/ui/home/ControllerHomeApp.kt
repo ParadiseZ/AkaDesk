@@ -67,6 +67,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -85,6 +86,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -724,6 +726,12 @@ private fun RemoteStreamScreen(
     val videoReady = coordinator.hasActiveRemoteVideoTrack(session.sessionId)
     val videoStalled = coordinator.isActiveRemoteVideoStalled(session.sessionId)
     var controlsVisible by rememberSaveable(session.sessionId) { mutableStateOf(true) }
+    val activity = LocalContext.current as? android.app.Activity
+    DisposableEffect(activity, session.sessionId) {
+        val previous = activity?.volumeControlStream
+        activity?.volumeControlStream = android.media.AudioManager.STREAM_VOICE_CALL
+        onDispose { if (previous != null) activity.volumeControlStream = previous }
+    }
     BackHandler(onBack = onDisconnect)
     LaunchedEffect(controlsVisible, videoReady) {
         if (controlsVisible && videoReady) { delay(3_000); controlsVisible = false }
@@ -785,8 +793,20 @@ private fun RemoteStreamScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                Text("仅查看屏幕", color = Color.LightGray)
+                TextButton(onClick = coordinator::togglePhoneAudioMute,
+                    enabled = coordinator.remoteAudioReady && session.stateLabel != "DISCONNECTING") {
+                    Text(if (coordinator.phoneAudioMuted) "手机已静音" else "手机声音", color = Color.White)
+                }
+                TextButton(onClick = coordinator::toggleComputerAudioMute,
+                    enabled = coordinator.computerAudioAvailable && !coordinator.audioMutePending && session.stateLabel != "DISCONNECTING") {
+                    Text(if (coordinator.audioMutePending) "设置中…" else if (coordinator.computerAudioMuted) "电脑已静音" else "电脑声音", color = Color.White)
+                }
                 OutlinedButton(onClick = onDisconnect) { Text("断开", color = Color.White) }
+            }
+        }
+        coordinator.audioError?.let { error ->
+            Surface(Modifier.align(Alignment.BottomCenter).padding(bottom = 76.dp), color = Color(0xCC000000)) {
+                Text(error, color = Color.White, modifier = Modifier.padding(12.dp))
             }
         }
     }

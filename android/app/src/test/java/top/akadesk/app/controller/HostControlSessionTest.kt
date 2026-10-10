@@ -116,6 +116,25 @@ class HostControlSessionTest {
         assertEquals(0, fixture.connectionCount)
     }
 
+    @Test fun audioSnapshotAndMuteFailureReachTheListenerWithoutClosingVideo() {
+        val fixture = Fixture()
+        fixture.open()
+        fixture.receive("SessionChangedEvent", SessionChangedEvent.newBuilder().setSnapshot(
+            SessionSnapshot.newBuilder().setSessionId("audio-session").setState(SessionState.SESSION_STATE_STREAMING)
+                .setAudio(AudioSessionSpec.newBuilder().setCodec(AudioCodec.AUDIO_CODEC_OPUS))
+                .setMuteControlledLocalPlayback(true)).build())
+        assertEquals(listOf("audio-session:true:true"), fixture.events.audioStates)
+        fixture.session.setComputerMuted("audio-session", false)
+        val envelope = ControlEnvelope.parseFrom(fixture.socket.messages.last().toByteArray())
+        assertEquals("SetAudioMuteRequest", envelope.type)
+        assertFalse(SetAudioMuteRequest.parseFrom(envelope.payload).muted)
+        fixture.receive("SetAudioMuteResponse", SetAudioMuteResponse.newBuilder().setSessionId("audio-session")
+            .setMuted(true).setError(ErrorInfo.newBuilder().setMessage("endpoint unavailable")).build())
+        assertEquals(listOf("audio-session:true:endpoint unavailable"), fixture.events.audioResults)
+        assertTrue(fixture.events.failures.isEmpty())
+        assertFalse(fixture.socket.cancelled)
+    }
+
     private class Fixture(address: String = "127.0.0.1", failDuringCreation: Boolean = false, port: Int = 46661) {
         val scheduler = FakeScheduler()
         val socket = FakeWebSocket()
@@ -181,6 +200,14 @@ class HostControlSessionTest {
 
     private class RecordingListener : HostControlSession.Listener {
         var authentications = 0
+        val audioStates = mutableListOf<String>()
+        val audioResults = mutableListOf<String>()
+        override fun onAudioState(host: ControlledHostSummary, sessionId: String, available: Boolean, muted: Boolean) {
+            audioStates += "$sessionId:$available:$muted"
+        }
+        override fun onAudioMuteResult(host: ControlledHostSummary, sessionId: String, muted: Boolean, error: String?) {
+            audioResults += "$sessionId:$muted:$error"
+        }
         val failures = mutableListOf<String>()
         override fun onAuthenticated(host: ControlledHostSummary) { authentications++ }
         override fun onFailure(host: ControlledHostSummary, message: String) { failures += message }

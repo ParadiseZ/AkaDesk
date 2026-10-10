@@ -206,6 +206,9 @@ fn test_control_state(port: u16) -> ControlPlaneState {
         "0.1.0-test".to_string(),
     );
     ControlPlaneState {
+        audio_streams: Arc::new(Mutex::new(host_runtime::audio::AudioStreamState::new(
+            &base_dir,
+        ))),
         host_identity: host_identity.clone(),
         advertised_presence: DevicePresence {
             identity: Some(host_identity),

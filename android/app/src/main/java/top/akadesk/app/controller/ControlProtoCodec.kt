@@ -1,6 +1,10 @@
 package top.akadesk.app.controller
 
 import akadesk.v1.ControlEnvelope
+import akadesk.v1.AudioCodec
+import akadesk.v1.AudioPreference
+import akadesk.v1.SetAudioMuteRequest
+import akadesk.v1.SetAudioMuteResponse
 import akadesk.v1.ControlHello
 import akadesk.v1.ControlHelloAck
 import akadesk.v1.ControlMessageKind
@@ -116,6 +120,8 @@ object ControlProtoCodec {
                     .setControlledDeviceId(controlledDeviceId)
                     .setEnableInput(false)
                     .setVideo(videoPreference)
+                    .setAudio(AudioPreference.newBuilder().setCodec(AudioCodec.AUDIO_CODEC_OPUS)
+                        .setSampleRate(48_000).setChannels(2).setBitrateKbps(64))
             )
             .build()
         return buildEnvelope(requestId, ControlMessageKind.CONTROL_MESSAGE_KIND_REQUEST, "StartSessionRequest", payload)
@@ -150,6 +156,13 @@ object ControlProtoCodec {
     }
 
     fun decodeEnvelope(bytes: ByteArray): ControlEnvelope = ControlEnvelope.parseFrom(bytes)
+
+    fun buildSetAudioMuteRequest(requestId: String, sessionId: String, muted: Boolean): ControlEnvelope =
+        buildEnvelope(requestId, ControlMessageKind.CONTROL_MESSAGE_KIND_REQUEST, "SetAudioMuteRequest",
+            SetAudioMuteRequest.newBuilder().setSessionId(sessionId).setMuted(muted).build())
+
+    fun decodeSetAudioMuteResponse(envelope: ControlEnvelope): SetAudioMuteResponse =
+        SetAudioMuteResponse.parseFrom(envelope.payload)
 
     fun decodeControlHelloAck(envelope: ControlEnvelope): ControlHelloAck =
         ControlHelloAck.parseFrom(envelope.payload)

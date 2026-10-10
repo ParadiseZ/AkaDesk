@@ -129,6 +129,24 @@ class ControllerCoordinator(context: Context) {
     var activeSession by mutableStateOf<ActiveRemoteSession?>(null)
     var activeVideoAspectRatio by mutableStateOf(16f / 9f)
         private set
+    var remoteAudioReady by mutableStateOf(false)
+        private set
+    var computerAudioAvailable by mutableStateOf(false)
+        private set
+    var phoneAudioMuted by mutableStateOf(false)
+        private set
+    var computerAudioMuted by mutableStateOf(false)
+        private set
+    var audioMutePending by mutableStateOf(false)
+        private set
+    var audioError by mutableStateOf<String?>(null)
+        private set
+    private val audioMuteTimeout = Runnable {
+        if (audioMutePending) {
+            audioMutePending = false
+            audioError = "未能确认电脑声音设置，请重试"
+        }
+    }
     var activeRemoteVideoReady by mutableStateOf(false)
         private set
     var activeRemoteVideoStalled by mutableStateOf(false)
@@ -614,6 +632,25 @@ class ControllerCoordinator(context: Context) {
                     }
                 }
 
+                override fun onAudioState(host: ControlledHostSummary, sessionId: String, available: Boolean, muted: Boolean) {
+                    mainHandler.post {
+                        if (generation != controlGeneration || activeSession?.sessionId != sessionId) return@post
+                        computerAudioAvailable = available
+                        computerAudioMuted = muted
+                    }
+                }
+
+                override fun onAudioMuteResult(host: ControlledHostSummary, sessionId: String, muted: Boolean, error: String?) {
+                    mainHandler.post {
+                        if (generation != controlGeneration || activeSession?.sessionId != sessionId) return@post
+                        mainHandler.removeCallbacks(audioMuteTimeout)
+                        audioMutePending = false
+                        computerAudioMuted = muted
+                        audioError = if (error == null) null else "电脑声音设置失败，请重试"
+                        if (error != null) logWarn("Computer mute failed: $error")
+                    }
+                }
+
                 override fun onWebRtcOffer(host: ControlledHostSummary, offer: WebRtcOffer) {
                     mainHandler.post {
                         if (generation != controlGeneration) return@post
@@ -794,6 +831,22 @@ class ControllerCoordinator(context: Context) {
         return activeSession?.sessionId == sessionId && activeRemoteVideoReady
     }
 
+    fun togglePhoneAudioMute() {
+        if (!remoteAudioReady || activeSession?.stateLabel == "DISCONNECTING") return
+        phoneAudioMuted = !phoneAudioMuted
+        webRtcSession?.setLocalAudioMuted(phoneAudioMuted)
+    }
+
+    fun toggleComputerAudioMute() {
+        val sessionId = activeSession?.sessionId ?: return
+        val control = controlSession ?: return
+        if (!computerAudioAvailable || audioMutePending || pendingStopSessionId != null) return
+        audioError = null
+        audioMutePending = true
+        mainHandler.postDelayed(audioMuteTimeout, 3_000)
+        control.setComputerMuted(sessionId, !computerAudioMuted)
+    }
+
     fun isActiveRemoteVideoStalled(sessionId: String?): Boolean {
         if (sessionId.isNullOrBlank()) {
             return false
@@ -952,6 +1005,15 @@ class ControllerCoordinator(context: Context) {
                     }
                 }
 
+                override fun onRemoteAudioTrack(sessionId: String) {
+                    mainHandler.post {
+                        if (generation != mediaGeneration || activeSession?.sessionId != sessionId) return@post
+                        remoteAudioReady = true
+                        webRtcSession?.setLocalAudioMuted(phoneAudioMuted)
+                        logInfo("Remote audio track negotiated session=$sessionId")
+                    }
+                }
+
                 override fun onRemoteVideoTrack(sessionId: String) {
                     mainHandler.post {
                         if (generation != mediaGeneration) return@post
@@ -1040,6 +1102,13 @@ class ControllerCoordinator(context: Context) {
         mediaGeneration++
         webRtcSession?.close()
         webRtcSession = null
+        mainHandler.removeCallbacks(audioMuteTimeout)
+        remoteAudioReady = false
+        computerAudioAvailable = false
+        phoneAudioMuted = false
+        computerAudioMuted = false
+        audioMutePending = false
+        audioError = null
         clearPendingSessionRecoveryValidation()
         if (!retainPendingStop) {
             pendingStopSessionId = null
