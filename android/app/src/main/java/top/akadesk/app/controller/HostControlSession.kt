@@ -66,6 +66,7 @@ internal class HostControlSession(
         fun onSessionClosed(host: ControlledHostSummary, sessionId: String, reason: String)
         fun onAudioState(host: ControlledHostSummary, sessionId: String, available: Boolean, muted: Boolean) {}
         fun onAudioMuteResult(host: ControlledHostSummary, sessionId: String, muted: Boolean, error: String?) {}
+        fun onDisplaySettings(host: ControlledHostSummary, requestId: String, response: akadesk.v1.DisplaySettingsResponse) {}
         fun onFailure(host: ControlledHostSummary, message: String)
     }
 
@@ -74,6 +75,8 @@ internal class HostControlSession(
     private var socket: WebSocket? = null
     private var pendingChallengeId: String? = null
     @Volatile private var supportsInput = false
+    @Volatile var supportsDisplayControl = false
+        private set
     private var snapshotLoaded = false
     private var startRequested = false
     private var pendingStartCodec: VideoCodec? = null
@@ -224,10 +227,12 @@ internal class HostControlSession(
                 }
             }
             "DeviceSnapshotResponse" -> {
+                // Keep display requests disabled until the authenticated capability snapshot.
                 val response = ControlProtoCodec.decodeDeviceSnapshotResponse(envelope)
                 if (response.hasSnapshot()) {
                     val pending = synchronized(lifecycleLock) {
                         supportsInput = response.snapshot.capabilityFlags.supportsInput
+                        supportsDisplayControl = response.snapshot.capabilityFlags.supportsDisplayControl
                         snapshotLoaded = true
                         if (startRequested && !closed) {
                             startRequested = false
@@ -241,6 +246,8 @@ internal class HostControlSession(
                     notifyFailure(message)
                 }
             }
+            "DisplaySettingsResponse" -> listener.onDisplaySettings(host, envelope.requestId,
+                akadesk.v1.DisplaySettingsResponse.parseFrom(envelope.payload))
             "HeartbeatPong" -> {
                 ControlProtoCodec.decodeHeartbeatPong(envelope)
                 lastHeartbeatPongAtMs.set(elapsedRealtimeMs())
@@ -322,6 +329,18 @@ internal class HostControlSession(
 
     private fun notifyFailure(message: String) {
         if (terminate()) listener.onFailure(host, message)
+    }
+
+    fun getDisplaySettings(sessionId: String): String {
+        val id = nextRequestId()
+        send(ControlProtoCodec.buildGetDisplaySettingsRequest(id, sessionId))
+        return id
+    }
+
+    fun setDisplaySettings(sessionId: String, displayId: String, mode: akadesk.v1.DisplayMode): String {
+        val id = nextRequestId()
+        send(ControlProtoCodec.buildSetDisplaySettingsRequest(id, sessionId, displayId, mode))
+        return id
     }
 
     private fun send(envelope: ControlEnvelope, target: WebSocket? = socket) {

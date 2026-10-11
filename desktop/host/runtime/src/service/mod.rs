@@ -49,6 +49,9 @@ impl RuntimeService {
         let host_identity = HostIdentity::load_or_create(base_dir)?;
         let state_signal: SharedStateSignal = Arc::new(StateSignal::default());
         let audio_streams = Arc::new(Mutex::new(crate::audio::AudioStreamState::new(base_dir)));
+        let mut display_state = crate::display::DisplayState::new(base_dir);
+        let display_restore_error = display_state.recover().err();
+        let display = Arc::new(Mutex::new(display_state));
         #[cfg(windows)]
         let audio_restore_error = crate::audio::recover_audio_output(base_dir).err();
         let mut settings_store = HostSettingsStore::load(&base_dir)?;
@@ -61,6 +64,12 @@ impl RuntimeService {
             diagnostics_buffer.push("error", "AUDIO_OUTPUT_RESTORE_FAILED", error);
         }
         let diagnostics: SharedDiagnosticBuffer = Arc::new(Mutex::new(diagnostics_buffer));
+        if let Some(error) = display_restore_error {
+            diagnostics
+                .lock()
+                .unwrap()
+                .push("error", "DISPLAY_RESTORE_FAILED", error);
+        }
         let pairing_store: SharedPairingStore =
             Arc::new(Mutex::new(PairingStore::load(&base_dir)?));
         let mut session_registry = SessionRegistry::default();
@@ -102,6 +111,7 @@ impl RuntimeService {
             pairing_attempts: Arc::new(Mutex::new(crate::auth::PairingAttemptLimiter::default())),
             audio_streams,
             input: Arc::new(Mutex::new(crate::input::InputState::default())),
+            display,
         };
         if let Ok(mut buffer) = diagnostics.lock() {
             buffer.push(

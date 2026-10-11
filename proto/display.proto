@@ -1,0 +1,33 @@
+syntax = "proto3";
+package akadesk.v1;
+option java_multiple_files = true;
+option java_package = "akadesk.v1";
+import "common.proto";
+import "device.proto";
+
+message DisplayMode {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint32 refresh_rate = 3;
+  uint32 scale_percent = 4;
+}
+message DisplaySettingsSnapshot {
+  DisplayInfo display = 1;
+  DisplayMode current_mode = 2;
+  DisplayMode history_display_mode = 3;
+  DisplayMode requested_display_mode = 4;
+  repeated DisplayMode supported_modes = 5;
+  repeated uint32 supported_scale_percents = 6;
+}
+message GetDisplaySettingsRequest { string session_id = 1; }
+message SetDisplaySettingsRequest {
+  string session_id = 1;
+  string display_id = 2;
+  DisplayMode requested_display_mode = 3;
+}
+// Used for query and apply. An error may still include the actual current mode.
+message DisplaySettingsResponse {
+  string session_id = 1;
+  DisplaySettingsSnapshot settings = 2;
+  ErrorInfo error = 3;
+}

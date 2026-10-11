@@ -14,6 +14,23 @@ pub struct CapturedBgraFrame {
 
 #[cfg(windows)]
 pub fn capture_primary_display_bgra() -> Result<CapturedBgraFrame, String> {
+    use windows::Win32::UI::HiDpi::{
+        SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    struct DpiGuard(DPI_AWARENESS_CONTEXT);
+    impl Drop for DpiGuard {
+        fn drop(&mut self) {
+            if !self.0 .0.is_null() {
+                unsafe {
+                    SetThreadDpiAwarenessContext(self.0);
+                }
+            }
+        }
+    }
+    let _dpi = DpiGuard(unsafe {
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    });
     use std::ffi::c_void;
     use std::ptr::null_mut;
 
@@ -114,7 +131,9 @@ pub fn capture_primary_display_bgra() -> Result<CapturedBgraFrame, String> {
         if bitmap.is_null() {
             let _ = DeleteDC(memory_dc);
             let _ = ReleaseDC(null_mut(), screen_dc);
-            return Err("failed to allocate compatible bitmap for primary display capture".to_string());
+            return Err(
+                "failed to allocate compatible bitmap for primary display capture".to_string(),
+            );
         }
 
         let previous = SelectObject(memory_dc, bitmap as Hgdiobj);

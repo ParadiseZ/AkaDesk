@@ -94,6 +94,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.platform.testTag
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.webrtc.SurfaceViewRenderer
@@ -740,6 +742,7 @@ private fun RemoteStreamScreen(
     val videoStalled = coordinator.isActiveRemoteVideoStalled(session.sessionId)
     var controlsVisible by rememberSaveable(session.sessionId) { mutableStateOf(true) }
     var keyboardVisible by rememberSaveable(session.sessionId) { mutableStateOf(false) }
+    var displaySettingsVisible by rememberSaveable(session.sessionId) { mutableStateOf(false) }
     var touchSize by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
     var touching by remember { mutableStateOf(false) }
     var lastMoveAt by remember { mutableLongStateOf(0) }
@@ -779,7 +782,7 @@ private fun RemoteStreamScreen(
             }
             Box(Modifier.width(videoWidth).height(videoHeight).testTag("remote-pointer").onSizeChanged {touchSize=it}
                 .pointerInteropFilter { event ->
-                    if(!inputEnabled || keyboardVisible || touchSize.width==0 || touchSize.height==0) false
+                    if(!inputEnabled || keyboardVisible || displaySettingsVisible || touchSize.width==0 || touchSize.height==0) false
                     else {
                         val x=(event.x/touchSize.width).coerceIn(0f,1f)
                         val y=(event.y/touchSize.height).coerceIn(0f,1f)
@@ -825,7 +828,7 @@ private fun RemoteStreamScreen(
             color = Color(0xCC000000),
         ) {
             Row(
-                Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+                Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
@@ -838,6 +841,8 @@ private fun RemoteStreamScreen(
                     Text(if (coordinator.audioMutePending) "设置中…" else if (coordinator.computerAudioMuted) "电脑已静音" else "电脑声音", color = Color.White)
                 }
                 OutlinedButton(onClick = onDisconnect) { Text("断开", color = Color.White) }
+                TextButton(onClick={displaySettingsVisible=true;keyboardVisible=false;coordinator.releaseRemoteInput()},
+                    enabled=session.stateLabel!="DISCONNECTING") {Text("显示设置",color=Color.White)}
                 TextButton(onClick={keyboardVisible=true;coordinator.releaseRemoteInput()},enabled=inputEnabled) {Text("键盘",color=Color.White)}
                 TextButton(onClick=coordinator::rightClick,enabled=inputEnabled) {Text("右键",color=Color.White)}
                 TextButton(onClick={coordinator.scrollInput(0f,1f)},enabled=inputEnabled) {Text("滚轮 ↑",color=Color.White)}
@@ -853,6 +858,7 @@ private fun RemoteStreamScreen(
             Surface(Modifier.align(Alignment.TopCenter).padding(top=16.dp),color=Color(0xCC000000)) {Text(error,color=Color.White,modifier=Modifier.padding(12.dp))}
         }
         if(keyboardVisible) RemoteKeyboardSheet(coordinator,onDismiss={keyboardVisible=false})
+        if(displaySettingsVisible) DisplaySettingsSheet(coordinator,onDismiss={displaySettingsVisible=false})
     }
 }
 

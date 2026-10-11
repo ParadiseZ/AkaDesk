@@ -36,6 +36,14 @@ import com.google.protobuf.ByteString
 import com.google.protobuf.MessageLite
 
 object ControlProtoCodec {
+    fun buildGetDisplaySettingsRequest(requestId: String, sessionId: String): ControlEnvelope =
+        buildEnvelope(requestId, ControlMessageKind.CONTROL_MESSAGE_KIND_REQUEST, "GetDisplaySettingsRequest",
+            akadesk.v1.GetDisplaySettingsRequest.newBuilder().setSessionId(sessionId).build())
+
+    fun buildSetDisplaySettingsRequest(requestId: String, sessionId: String, displayId: String, mode: akadesk.v1.DisplayMode): ControlEnvelope =
+        buildEnvelope(requestId, ControlMessageKind.CONTROL_MESSAGE_KIND_REQUEST, "SetDisplaySettingsRequest",
+            akadesk.v1.SetDisplaySettingsRequest.newBuilder().setSessionId(sessionId).setDisplayId(displayId).setRequestedDisplayMode(mode).build())
+
     fun buildControlHello(
         requestId: String,
         controllerDeviceId: String,

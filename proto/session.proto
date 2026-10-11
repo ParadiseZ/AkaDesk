@@ -7,6 +7,7 @@ option java_package = "akadesk.v1";
 
 import "common.proto";
 import "media.proto";
+import "display.proto";
 
 message SessionIntent {
   string session_id = 1;
@@ -44,6 +45,8 @@ message SessionSnapshot {
   int64 closed_at_ms = 14;
   bool mute_controlled_local_playback = 15;
   bool input_enabled = 16;
+  DisplayMode history_display_mode = 17;
+  DisplayMode requested_display_mode = 18;
 }
 
 message SessionClosedEvent {

@@ -8,6 +8,9 @@ use crate::generated::v1::{
     SessionState, SetAudioMuteRequest, SetAudioMuteResponse, StartSessionAccepted,
     StartSessionRejected, StartSessionRequest, WebRtcAnswer,
 };
+use crate::generated::v1::{
+    DisplaySettingsResponse, GetDisplaySettingsRequest, SetDisplaySettingsRequest,
+};
 use crate::pairing::{generate_pair_token, now_ms, PendingChallenge, SharedPairingStore};
 use crate::session::SharedSessionRegistry;
 use crate::settings::{ConnectionMethod, HostSettingsStore};
@@ -47,8 +50,14 @@ pub fn reap_finished_session(state: &ControlPlaneState) -> io::Result<()> {
         .finish(&snapshot.session_id);
     let audio_cleanup =
         crate::audio::finish_audio_session(&state.audio_streams, &snapshot.session_id);
+    let display_cleanup = state
+        .display
+        .lock()
+        .map_err(session_lock_err)?
+        .finish(&snapshot.session_id);
     input_cleanup.map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
     audio_cleanup.map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    display_cleanup.map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
     state
         .video_streams
         .lock()
@@ -281,6 +290,95 @@ mod tests {
         drop(state);
         std::fs::remove_dir_all(directory).unwrap();
     }
+    #[test]
+    fn display_requests_reject_unauthenticated_foreign_and_closed_sessions_without_mutation() {
+        let (directory, state) = fixture();
+        let id = state
+            .sessions
+            .lock()
+            .unwrap()
+            .activate_preparing(
+                String::new(),
+                "owner".into(),
+                "host".into(),
+                String::new(),
+                Default::default(),
+            )
+            .unwrap()
+            .session_id;
+        state.sessions.lock().unwrap().mark_streaming(&id);
+        for (controller, request_id) in [
+            (None, "no-auth"),
+            (Some("intruder"), "foreign"),
+            (Some("owner"), "old-session"),
+        ] {
+            let (tx, rx) = std::sync::mpsc::sync_channel(4);
+            let mut connection = ConnectionSession {
+                authenticated_controller_device_id: controller.map(str::to_owned),
+                ..Default::default()
+            };
+            handle_envelope(
+                &Arc::new(tx),
+                &state,
+                &mut connection,
+                &Arc::new(Mutex::new(None)),
+                ControlEnvelope {
+                    request_id: request_id.into(),
+                    r#type: "SetDisplaySettingsRequest".into(),
+                    payload: SetDisplaySettingsRequest {
+                        session_id: if request_id == "old-session" {
+                            "stale".into()
+                        } else {
+                            id.clone()
+                        },
+                        display_id: "unauthorized".into(),
+                        requested_display_mode: Some(Default::default()),
+                    }
+                    .encode_to_vec(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let WsMessage::Binary(frame) = rx.recv().unwrap() else {
+                panic!("missing response")
+            };
+            let response = DisplaySettingsResponse::decode(
+                &ControlEnvelope::decode(&frame[..]).unwrap().payload[..],
+            )
+            .unwrap();
+            assert!(response.error.is_some());
+            assert!(response.settings.is_none());
+        }
+        state.sessions.lock().unwrap().mark_disconnected(&id);
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        handle_envelope(
+            &Arc::new(tx),
+            &state,
+            &mut ConnectionSession {
+                authenticated_controller_device_id: Some("owner".into()),
+                ..Default::default()
+            },
+            &Arc::new(Mutex::new(None)),
+            ControlEnvelope {
+                r#type: "GetDisplaySettingsRequest".into(),
+                payload: GetDisplaySettingsRequest { session_id: id }.encode_to_vec(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let WsMessage::Binary(frame) = rx.recv().unwrap() else {
+            panic!("missing response")
+        };
+        assert!(DisplaySettingsResponse::decode(
+            &ControlEnvelope::decode(&frame[..]).unwrap().payload[..]
+        )
+        .unwrap()
+        .error
+        .is_some());
+        assert!(!directory.join("display_restore.json").exists());
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 type SharedActiveSessionId = Arc<Mutex<Option<String>>>;
 type SharedTerminalSessionState = Arc<Mutex<Option<(String, i32)>>>;
@@ -315,6 +413,7 @@ struct SentTransportEventState {
 pub struct ControlPlaneState {
     pub audio_streams: crate::audio::SharedAudioStreamState,
     pub input: crate::input::SharedInputState,
+    pub display: crate::display::SharedDisplayState,
     pub host_identity: DeviceIdentity,
     pub advertised_presence: DevicePresence,
     pub capability_flags: CapabilityFlags,
@@ -822,7 +921,12 @@ fn handle_envelope(
                 snapshot: Some(DeviceSnapshot {
                     identity: Some(state.host_identity.clone()),
                     capability_flags: Some(state.capability_flags.clone()),
-                    displays: Vec::new(),
+                    displays: state
+                        .display
+                        .lock()
+                        .map_err(session_lock_err)?
+                        .list()
+                        .unwrap_or_default(),
                     audio_devices: Vec::new(),
                 }),
                 error: None,
@@ -1174,6 +1278,23 @@ fn handle_envelope(
                     );
                 }
             }
+            // Capture a session baseline before remote display writes. Unsupported
+            // control must not prevent ordinary viewing on this machine.
+            {
+                let mut registry = state.sessions.lock().map_err(session_lock_err)?;
+                if registry.should_keep_running(&snapshot.session_id) {
+                    let mut display = state.display.lock().map_err(session_lock_err)?;
+                    if let Err(error) = display.prepare(&snapshot.session_id) {
+                        eprintln!("display preparation unavailable: {error}");
+                    } else if let Some((display_id, history)) =
+                        display.baseline(&snapshot.session_id)
+                    {
+                        let active = registry.active.as_mut().unwrap();
+                        active.target_display_id = Some(display_id);
+                        active.history_display_mode = Some(history);
+                    }
+                }
+            }
             let transport_startup = crate::transport::spawn_h264_webrtc_transport_loop(
                 Arc::clone(&state.sessions),
                 Arc::clone(&state.video_streams),
@@ -1315,6 +1436,82 @@ fn handle_envelope(
                 *active = Some(session_id);
             }
             Ok(())
+        }
+        "GetDisplaySettingsRequest" | "SetDisplaySettingsRequest" => {
+            let (id, change) = if envelope.r#type == "GetDisplaySettingsRequest" {
+                (
+                    GetDisplaySettingsRequest::decode(&envelope.payload[..])
+                        .map_err(decode_err)?
+                        .session_id,
+                    None,
+                )
+            } else {
+                let request =
+                    SetDisplaySettingsRequest::decode(&envelope.payload[..]).map_err(decode_err)?;
+                (
+                    request.session_id,
+                    Some((request.display_id, request.requested_display_mode)),
+                )
+            };
+            // Stop/reap uses the same session -> display lock order.
+            let mut registry = state.sessions.lock().map_err(session_lock_err)?;
+            let authorized = registry.active.as_ref().is_some_and(|s| {
+                s.session_id.0 == id
+                    && session.authenticated_controller_device_id.as_deref()
+                        == Some(s.controller_device_id.as_str())
+                    && s.state == SessionState::Streaming as i32
+                    && registry.should_keep_running(&id)
+            });
+            let mut display = state.display.lock().map_err(session_lock_err)?;
+            let mut result = (|| -> Result<(), String> {
+                if !authorized {
+                    return Err("Display request does not own an active session".into());
+                }
+                display.prepare(&id)?;
+                if let Some((display_id, mode)) = change {
+                    let mode = mode.ok_or("Missing requested display mode")?;
+                    display.apply(&id, &display_id, crate::display::from_proto(&mode))?;
+                    if let Ok(mut stream) = state.video_streams.lock() {
+                        stream.request_keyframe(&id);
+                    }
+                }
+                Ok(())
+            })();
+            let settings = if authorized {
+                match display.snapshot(&id) {
+                    Ok(settings) => Some(settings),
+                    Err(error) => {
+                        if result.is_ok() {
+                            result = Err(error);
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(settings) = &settings {
+                let active = registry.active.as_mut().unwrap();
+                active.history_display_mode = settings.history_display_mode.clone();
+                active.requested_display_mode = settings.requested_display_mode.clone();
+                active.target_display_id = settings.display.as_ref().map(|s| s.display_id.clone());
+                registry.touch_active(&id);
+            }
+            drop(display);
+            drop(registry);
+            send_payload_shared(
+                websocket,
+                &envelope.request_id,
+                ControlMessageKind::Response,
+                "DisplaySettingsResponse",
+                DisplaySettingsResponse {
+                    session_id: id,
+                    settings,
+                    error: result
+                        .err()
+                        .map(|error| simple_error("DISPLAY_SETTINGS_FAILED", &error)),
+                },
+            )
         }
         "SetAudioMuteRequest" => {
             let request = SetAudioMuteRequest::decode(&envelope.payload[..]).map_err(decode_err)?;
@@ -2233,7 +2430,7 @@ pub fn default_capability_flags() -> CapabilityFlags {
     CapabilityFlags {
         supports_audio: cfg!(windows),
         supports_input: cfg!(windows),
-        supports_display_control: false,
+        supports_display_control: cfg!(windows),
         supports_hardware_encode: video_support.has_h264_hardware_encoder,
         supports_hardware_decode: false,
         supports_software_encode: video_support.has_h264_software_encoder,

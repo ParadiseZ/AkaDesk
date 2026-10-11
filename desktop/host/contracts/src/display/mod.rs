@@ -13,7 +13,7 @@ pub struct DisplaySnapshot {
     pub hdr: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DisplayMode {
     pub width: u32,
     pub height: u32,

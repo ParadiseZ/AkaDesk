@@ -4,6 +4,7 @@ pub mod auth;
 pub mod control;
 pub mod diagnostics;
 pub mod discovery;
+pub mod display;
 pub mod events;
 pub mod generated;
 pub mod input;

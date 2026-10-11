@@ -11,6 +11,27 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class HostControlSessionTest {
+    @Test fun displayRequestsUseCapabilitiesAndResponsesKeepVideoConnected() {
+        val fixture = Fixture(); fixture.open()
+        assertFalse(fixture.session.supportsDisplayControl)
+        fixture.receive("DeviceSnapshotResponse", DeviceSnapshotResponse.newBuilder().setSnapshot(
+            DeviceSnapshot.newBuilder().setCapabilityFlags(CapabilityFlags.newBuilder().setSupportsDisplayControl(true))).build())
+        assertTrue(fixture.session.supportsDisplayControl)
+        val mode = DisplayMode.newBuilder().setWidth(1920).setHeight(1200).setRefreshRate(60).setScalePercent(125).build()
+        val queryId = fixture.session.getDisplaySettings("display-session")
+        val applyId = fixture.session.setDisplaySettings("display-session", "stable-id", mode)
+        val sent = fixture.socket.messages.map { ControlEnvelope.parseFrom(it.toByteArray()) }
+        assertEquals("display-session", GetDisplaySettingsRequest.parseFrom(sent.single {it.requestId==queryId}.payload).sessionId)
+        val apply = SetDisplaySettingsRequest.parseFrom(sent.single {it.requestId==applyId}.payload)
+        assertEquals("stable-id", apply.displayId); assertEquals(mode, apply.requestedDisplayMode)
+        fixture.receive("DisplaySettingsResponse", DisplaySettingsResponse.newBuilder().setSessionId("display-session")
+            .setError(ErrorInfo.newBuilder().setMessage("unsupported mode")).build())
+        assertEquals(listOf("display-session:unsupported mode"), fixture.events.displayResults)
+        assertTrue(fixture.events.failures.isEmpty()); assertFalse(fixture.socket.cancelled)
+        fixture.session.close()
+        fixture.receive("DisplaySettingsResponse", DisplaySettingsResponse.getDefaultInstance())
+        assertEquals(1,fixture.events.displayResults.size)
+    }
     @Test fun earlyStartWaitsForCapabilitiesAndEnablesInputExactlyOnce() {
         val fixture=Fixture();fixture.open()
         fixture.receive("ControlHelloAck",ControlHelloAck.newBuilder().setAccepted(true).build())
@@ -221,6 +242,10 @@ class HostControlSessionTest {
     }
 
     private class RecordingListener : HostControlSession.Listener {
+        val displayResults = mutableListOf<String>()
+        override fun onDisplaySettings(host: ControlledHostSummary, requestId: String, response: DisplaySettingsResponse) {
+            displayResults += "${response.sessionId}:${response.error.message}"
+        }
         var authentications = 0
         val audioStates = mutableListOf<String>()
         val audioResults = mutableListOf<String>()

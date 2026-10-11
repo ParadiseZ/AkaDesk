@@ -38,6 +38,54 @@ class ControllerCoordinator(context: Context) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val pairingStore = ControllerPairingStore(appContext)
     private val inputProfileStore = InputProfileStore(appContext)
+    var displaySettings by mutableStateOf<akadesk.v1.DisplaySettingsSnapshot?>(null)
+        private set
+    var displaySettingsPending by mutableStateOf(false)
+        private set
+    var displaySettingsError by mutableStateOf<String?>(null)
+        private set
+    private var displayRequestId: String? = null
+    private var displayApplying = false
+    private val displayTimeout = Runnable {
+        if (displaySettingsPending) {
+            displayRequestId = null
+            displaySettingsPending = false
+            displaySettingsError = "未能确认显示设置，请刷新后查看实际结果"
+        }
+    }
+    fun refreshDisplaySettings() {
+        val session = activeSession ?: return
+        val sessionId = session.sessionId ?: return
+        val control = controlSession ?: return
+        if (displaySettingsPending || pendingStopSessionId != null) return
+        if (!control.supportsDisplayControl) {
+            displaySettingsError = "这台电脑暂不支持调整显示设置"
+            return
+        }
+        displaySettingsError = null
+        displaySettingsPending = true
+        displayApplying = false
+        displayRequestId = control.getDisplaySettings(sessionId)
+        mainHandler.postDelayed(displayTimeout, 15_000)
+    }
+    internal fun collectRemoteMediaStats(callback: (org.webrtc.RTCStatsReport) -> Unit) {
+        webRtcSession?.collectStats(callback)
+    }
+    fun applyDisplaySettings(mode: akadesk.v1.DisplayMode) {
+        val session = activeSession ?: return
+        val sessionId = session.sessionId ?: return
+        val control = controlSession ?: return
+        val settings = displaySettings ?: return
+        if (displaySettingsPending || pendingStopSessionId != null || !control.supportsDisplayControl) return
+        if (settings.supportedModesList.none { it.width == mode.width && it.height == mode.height && it.refreshRate == mode.refreshRate }
+            || mode.scalePercent !in settings.supportedScalePercentsList) return
+        releaseRemoteInput()
+        displaySettingsPending = true
+        displaySettingsError = null
+        displayApplying = true
+        displayRequestId = control.setDisplaySettings(sessionId, settings.display.displayId, mode)
+        mainHandler.postDelayed(displayTimeout, 15_000)
+    }
     var inputShortcuts by mutableStateOf(inputProfileStore.load())
         private set
     var remoteInputReady by mutableStateOf(false)
@@ -685,6 +733,19 @@ class ControllerCoordinator(context: Context) {
                     }
                 }
 
+                override fun onDisplaySettings(host: ControlledHostSummary, requestId: String, response: akadesk.v1.DisplaySettingsResponse) {
+                    mainHandler.post {
+                        if (generation != controlGeneration || response.sessionId != activeSession?.sessionId || requestId != displayRequestId) return@post
+                        mainHandler.removeCallbacks(displayTimeout)
+                        displaySettingsPending = false
+                        displayRequestId = null
+                        if (response.hasSettings()) displaySettings = response.settings
+                        displaySettingsError = if (!response.hasError()) null else if (displayApplying)
+                            "电脑未能应用显示设置，已尝试恢复原设置，请刷新确认"
+                        else "未能读取显示设置，请刷新重试"
+                        if (response.hasError()) logWarn("Display settings failed: ${response.error.message}")
+                    }
+                }
                 override fun onAudioMuteResult(host: ControlledHostSummary, sessionId: String, muted: Boolean, error: String?) {
                     mainHandler.post {
                         if (generation != controlGeneration || activeSession?.sessionId != sessionId) return@post
@@ -1160,6 +1221,11 @@ class ControllerCoordinator(context: Context) {
     }
 
     private fun closeWebRtcSession(retainPendingStop: Boolean = false) {
+        mainHandler.removeCallbacks(displayTimeout)
+        displaySettings = null
+        displaySettingsPending = false
+        displaySettingsError = null
+        displayRequestId = null
         mediaGeneration++
         webRtcSession?.close()
         webRtcSession = null

@@ -7,6 +7,7 @@ fn main() {
         format!("{proto_dir}/session.proto"),
         format!("{proto_dir}/pairing.proto"),
         format!("{proto_dir}/input.proto"),
+        format!("{proto_dir}/display.proto"),
     ];
 
     prost_build::Config::new()
