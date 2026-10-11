@@ -23,7 +23,7 @@ import kotlinx.coroutines.delay
 import top.akadesk.app.MainActivity
 import top.akadesk.app.controller.*
 
-private enum class RemotePanel(val title:String) { Operation("操作"), Display("显示"), Security("安全"), Peripherals("外设"), More("更多"), Network("网络状态"), HideToolbar("自动隐藏工具栏"), Pip("小窗模式"), Guide("操控指南"), Mapping("按键映射"), MappingOptions("映射设置"), System("系统快捷操作"), Advanced("高级选项") }
+private enum class RemotePanel(val title:String) { Operation("操作"), Display("显示"), Security("安全"), Peripherals("外设"), More("更多"), Network("网络状态"), HideToolbar("自动隐藏工具栏"), Pip("小窗模式"), Guide("操控指南"), MappingOptions("映射设置"), System("系统快捷操作"), Advanced("高级选项") }
 
 @Composable
 fun RemoteSessionScreen(coordinator:ControllerCoordinator, session:ActiveRemoteSession, onDisconnect:()->Unit) {
@@ -38,7 +38,9 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
     var panel by rememberSaveable(s.sessionId) { mutableStateOf<RemotePanel?>(null) }
     var keyboard by rememberSaveable(s.sessionId) { mutableStateOf(false) }
     var toolbar by rememberSaveable(s.sessionId) { mutableStateOf(true) }
-    var editPositions by rememberSaveable(s.sessionId) { mutableStateOf(false) }
+    var mappingEditing by rememberSaveable(s.sessionId) {mutableStateOf(false)}
+    var mappingProfiles by rememberSaveable(s.sessionId) {mutableStateOf(false)}
+    var returnToProfiles by rememberSaveable(s.sessionId) {mutableStateOf(false)}
     var guideStep by rememberSaveable { mutableIntStateOf(0) }
     var error by remember { mutableStateOf<String?>(null) }
     var network by remember { mutableStateOf(RemoteNetworkStats()) }
@@ -48,13 +50,13 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
     DisposableEffect(context,s.sessionId) {
         val activity=context as? android.app.Activity
         val previous=activity?.volumeControlStream
-        activity?.volumeControlStream=android.media.AudioManager.STREAM_VOICE_CALL
+        activity?.volumeControlStream=android.media.AudioManager.STREAM_MUSIC
         onDispose {if(previous!=null) activity.volumeControlStream=previous}
     }
     val ready=c.hasActiveRemoteVideoTrack(s.sessionId)
     val stalled=c.isActiveRemoteVideoStalled(s.sessionId)
     val enabled=c.remoteInputReady && ready && !stalled && !c.viewOnly && s.stateLabel!="DISCONNECTING" && !pip
-    val blocked=panel!=null || keyboard || files
+    val blocked=panel!=null || keyboard || files || mappingEditing || mappingProfiles
     ClipboardSync(c)
     DisposableEffect(c,s.sessionId) {onDispose {c.editingLocalInput=false;c.releaseRemoteInput()}}
     LaunchedEffect(blocked,enabled) {c.editingLocalInput=blocked;c.releaseRemoteInput()}
@@ -65,16 +67,16 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
     LaunchedEffect(s.sessionId) {
         val sampler=RemoteStatsSampler()
         while(true) {
+            if(c.toolsReady) runCatching {c.applyConfirmedVideoStatus(c.toolRequest("status"))}
             c.collectRemoteMediaStats {report -> android.os.Handler(android.os.Looper.getMainLooper()).post {if(c.activeSession?.sessionId==s.sessionId) network=sampler.sample(report)}}
             delay(2000)
         }
     }
     BackHandler {when {files->files=false; keyboard->keyboard=false; panel!=null->panel=if(panel==RemotePanel.Operation) null else RemotePanel.Operation; else->onDisconnect()}}
     Box(Modifier.fillMaxSize().background(Color.Black).then(if(prefs.avoidCutout && !pip) Modifier.displayCutoutPadding() else Modifier)) {
-        Row(Modifier.fillMaxSize()) {
-            BoxWithConstraints(Modifier.weight(1f).fillMaxHeight()) {
+            BoxWithConstraints(Modifier.fillMaxSize()) {
                 RemoteVideoSurface(c,s,enabled && !blocked, onReveal={toolbar=true}, rightModeEnabled=prefs.pointerMode==PointerMode.Trackpad)
-                if(!pip && prefs.mappingEnabled && !blocked) MappingOverlay(c,enabled,editPositions)
+                if(!pip && prefs.mappingEnabled && !blocked) MappingOverlay(c,enabled,false)
                 if(!pip && prefs.virtualMouse && !blocked && !c.viewOnly) VirtualMouse(c,enabled)
                 if(!pip && (prefs.showNetwork || !ready || stalled)) Text(
                     if(stalled) "画面中断，等待恢复…" else if(!ready) "正在连接电脑画面…" else "${metric(network.rttMs)} ms · ${metric(network.fps)} FPS · ${metric(network.mbps)} Mbps",
@@ -83,7 +85,7 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
                 if(!toolbar && !pip && panel==null) TextButton(onClick={toolbar=true},modifier=Modifier.align(Alignment.CenterEnd)) {Text("操作")}
                 if(!pip && panel!=null) {
                     Box(Modifier.fillMaxSize().clickable(indication=null,interactionSource=remember {androidx.compose.foundation.interaction.MutableInteractionSource()}) {panel=null})
-                    Surface(Modifier.align(Alignment.CenterEnd).fillMaxHeight().width(minOf(360.dp,maxWidth*.48f)).testTag("remote-panel"),color=Color(0xEF292C34),contentColor=Color.White) {
+                    Surface(Modifier.align(Alignment.CenterEnd).padding(end=72.dp).fillMaxHeight().width(minOf(360.dp,maxWidth*.48f)).testTag("remote-panel"),color=Color(0xEF292C34),contentColor=Color.White) {
                         Column {
                             if(panel!=RemotePanel.Operation) Row(Modifier.fillMaxWidth().height(48.dp),verticalAlignment=Alignment.CenterVertically) {
                                 IconButton(onClick={panel=RemotePanel.Operation}) {Icon(Icons.Outlined.ChevronLeft,"返回")}
@@ -102,9 +104,9 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
                                     RemoteCard {
                                         ToggleRow("启用按键映射",prefs.mappingEnabled,enabled) {c.updateRemotePreferences(prefs.copy(mappingEnabled=it))}
                                         if(prefs.mappingEnabled) {
-                                            MenuRow("切换操控方案",c.selectedInputProfile) {panel=RemotePanel.Mapping}
-                                            MenuRow("编辑当前方案") {keyboard=false;panel=RemotePanel.Mapping}
-                                            MenuRow("调整按钮位置",if(editPositions) "完成" else "") {editPositions=!editPositions;panel=null;toolbar=false}
+                                            MenuRow("切换操控方案",c.selectedInputProfile) {panel=null;mappingProfiles=true}
+                                            MenuRow("编辑当前方案") {keyboard=false;panel=null;returnToProfiles=false;mappingEditing=true}
+                                            MenuRow("调整按钮位置") {panel=null;returnToProfiles=false;mappingEditing=true}
                                             MenuRow("其他设置") {panel=RemotePanel.MappingOptions}
                                         }
                                     }
@@ -126,12 +128,14 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
                                     RemoteCard {MenuRow("系统快捷操作",icon=Icons.Outlined.Computer) {panel=RemotePanel.System}}
                                 }
                                 RemotePanel.Display->Column(Modifier.verticalScroll(rememberScrollState())) {VideoQualityControls(c);DisplaySettingsContent(c,scrollable=false);ReservedFeature("虚拟显示器", "安装虚拟显示驱动后可启用")}
-                                RemotePanel.Mapping->InputMappingEditor(c,onBack={panel=RemotePanel.Operation})
                                 RemotePanel.MappingOptions->Column(Modifier.padding(12.dp).verticalScroll(rememberScrollState())) {
-                                    Text("按钮大小：${prefs.buttonSize}")
+                                    Text("默认按钮大小：${prefs.buttonSize}")
                                     Slider(value=prefs.buttonSize.toFloat(),onValueChange={c.updateRemotePreferences(prefs.copy(buttonSize=it.toInt()))},valueRange=32f..72f)
-                                    Text("按钮透明度")
+                                    Text("默认按钮不透明度")
                                     Slider(value=prefs.buttonOpacity,onValueChange={c.updateRemotePreferences(prefs.copy(buttonOpacity=it))},valueRange=.2f..1f)
+                                    ToggleRow("双指缩放画面",prefs.pinchZoom) {c.updateRemotePreferences(prefs.copy(pinchZoom=it))}
+                                    ToggleRow("按键振动反馈",prefs.buttonHaptics) {c.updateRemotePreferences(prefs.copy(buttonHaptics=it))}
+                                    Text("按键单独设置的大小与不透明度优先于默认值",style=MaterialTheme.typography.bodySmall)
                                 }
                                 RemotePanel.Security->RemoteSecurityPanel(c)
                                 RemotePanel.Peripherals->PeripheralPanel()
@@ -146,12 +150,15 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
                                 }
                                 RemotePanel.Network->Column(Modifier.padding(12.dp).verticalScroll(rememberScrollState())) {
                                     RemoteCard {
-                                        InfoRow("网络延时","${metric(network.rttMs)} ms");InfoRow("解码延时","${metric(network.decodeMs)} ms")
+                                        InfoRow(when {network.processingTarget->"帧延时（播放目标）";network.processingEstimated->"帧处理延时（估算）";else->"帧处理延时"},"${metric(network.frameProcessingMs)} ms");InfoRow("网络往返 RTT","${metric(network.rttMs)} ms");InfoRow("解码延时","${metric(network.decodeMs)} ms")
                                         InfoRow("帧率",metric(network.fps));InfoRow("带宽占用","${metric(network.mbps)} Mbps");InfoRow("丢包率","${metric(network.lossPercent)}%")
                                         InfoRow("连接时间",duration(System.currentTimeMillis()-s.startedAtMs));InfoRow("加密通道",network.transport)
                                         InfoRow("被控端 IP",network.remoteAddress);InfoRow("控制端 IP",network.localAddress)
                                         InfoRow("客户端系统","Android ${android.os.Build.VERSION.RELEASE}");InfoRow("编码",network.codec);InfoRow("解码器",network.decoder);InfoRow("画面尺寸",network.resolution)
+                                        InfoRow("采集方式",c.captureMethod);InfoRow("目标帧率","${c.targetVideoFps} FPS")
+                                        InfoRow("手机屏幕刷新率","${metric((context as? android.app.Activity)?.display?.refreshRate?.toDouble())} Hz")
                                     }
+                                    Text("帧处理延时统计接收至解码完成；缺失时显示缓冲与解码估算，或库提供的播放目标延时并标注。播放目标包含抖动缓冲、解码预算和渲染等待；不是采集到显示的全链路延时。",style=MaterialTheme.typography.bodySmall,modifier=Modifier.padding(8.dp))
                                     ToggleRow("常驻显示网络状态",prefs.showNetwork) {c.updateRemotePreferences(prefs.copy(showNetwork=it))}
                                 }
                                 RemotePanel.HideToolbar->Column(Modifier.padding(12.dp)) {
@@ -181,16 +188,16 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
                         }
                     }
                 }
-                if(!pip && editPositions && panel==null) Button(onClick={editPositions=false},modifier=Modifier.align(Alignment.TopCenter)) {Text("完成位置编辑")}
             }
-            if(!pip && (toolbar || panel!=null || keyboard)) Column(Modifier.width(72.dp).fillMaxHeight().background(Color.Black),verticalArrangement=Arrangement.SpaceEvenly,horizontalAlignment=Alignment.CenterHorizontally) {
+            if(!pip && !mappingEditing && !mappingProfiles && (toolbar || panel!=null || keyboard)) Column(Modifier.align(Alignment.CenterEnd).width(72.dp).fillMaxHeight().background(Color(0x66000000)),verticalArrangement=Arrangement.SpaceEvenly,horizontalAlignment=Alignment.CenterHorizontally) {
                 RailAction("操作",Icons.Outlined.Tune,panel==RemotePanel.Operation) {keyboard=false;panel=if(panel==RemotePanel.Operation) null else RemotePanel.Operation}
                 RailAction("键盘",Icons.Outlined.Keyboard,keyboard,enabled) {panel=null;keyboard=!keyboard}
                 RailAction("显示桌面",Icons.Outlined.DesktopWindows,false,enabled) {c.sendShortcut(InputShortcut("desktop","显示桌面",0x44,meta=true))}
                 RailAction("展示所有窗口",Icons.Outlined.Window,false,enabled) {c.sendShortcut(InputShortcut("tasks","展示所有窗口",0x09,meta=true))}
             }
-        }
-        if(!pip && keyboard) Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth(),color=MaterialTheme.colorScheme.surface) {RemoteKeyboard(c,onClose={keyboard=false},onEdit={keyboard=false;panel=RemotePanel.Mapping})}
+        if(!pip && keyboard) Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth(),color=MaterialTheme.colorScheme.surface) {RemoteKeyboard(c,onClose={keyboard=false},onEdit={keyboard=false;panel=null;mappingEditing=true})}
+        if(!pip && mappingProfiles) MappingProfiles(c,onClose={mappingProfiles=false;panel=RemotePanel.Operation},onEdit={mappingProfiles=false;returnToProfiles=true;mappingEditing=true})
+        if(!pip && mappingEditing) MappingEditorSurface(c.mappingDraft(),prefs.buttonSize,prefs.buttonOpacity,c::saveMappingDraft,onClose={mappingEditing=false;if(returnToProfiles) mappingProfiles=true else panel=RemotePanel.Operation})
         if(!pip && files) FileTransferScreen(c,onClose={files=false})
         val message=error ?: c.audioError ?: c.inputError
         if(!pip && message!=null) Surface(Modifier.align(Alignment.TopCenter).padding(8.dp),shape=RoundedCornerShape(8.dp)) {Row(verticalAlignment=Alignment.CenterVertically) {Text(message,Modifier.padding(8.dp));if(error!=null) TextButton(onClick={error=null}) {Text("关闭")}}}

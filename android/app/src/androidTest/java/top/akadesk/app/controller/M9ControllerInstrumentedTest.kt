@@ -27,9 +27,20 @@ class M9ControllerInstrumentedTest {
         val inst=InstrumentationRegistry.getInstrumentation()
         val c=ViewModelProvider(compose.activity)[ControllerViewModel::class.java].coordinator
         val context=compose.activity
+        val audioManager=context.getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager
+        val originalMode=audioManager.mode;val originalSpeaker=audioManager.isSpeakerphoneOn
+        val originalMediaVolume=audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
+        val originalCallVolume=audioManager.getStreamVolume(android.media.AudioManager.STREAM_VOICE_CALL)
+        val otherMedia=android.media.AudioTrack.Builder()
+            .setAudioAttributes(android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_MEDIA).setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC).build())
+            .setAudioFormat(android.media.AudioFormat.Builder().setSampleRate(48000).setChannelMask(android.media.AudioFormat.CHANNEL_OUT_MONO).setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT).build())
+            .setTransferMode(android.media.AudioTrack.MODE_STATIC).setBufferSizeInBytes(9600).build()
+        otherMedia.write(ByteArray(9600),0,9600);otherMedia.setLoopPoints(0,4800,-1);otherMedia.play()
         val resolver=context.contentResolver
         val originalCodec=c.preferredVideoCodec
         val originalPreferences=c.remotePreferences
+        val mappingPreferences=context.getSharedPreferences("akadesk-input",android.content.Context.MODE_PRIVATE)
+        val originalMappings=mappingPreferences.all.toMap()
         val transferPreferences=context.getSharedPreferences("akadesk-transfers",android.content.Context.MODE_PRIVATE)
         val originalTransferHistory=transferPreferences.getString("history","[]")
         val host=ControlledHostSummary("m9-fixture",args.getString("m9HostId")!!,"Controller test","windows","fixture","test","127.0.0.1",46671,false,true,0L)
@@ -63,7 +74,14 @@ class M9ControllerInstrumentedTest {
                 c.openVerificationSheet(host,args.getString("m9PairCode")!!);c.submitVerificationConnect()
             }
             compose.waitUntil(40_000) {c.remoteInputReady && c.toolsReady && c.hasActiveRemoteVideoTrack(c.activeSession?.sessionId)}
+            compose.waitUntil(15_000) {c.hasActiveAudioPlayout()}
+            assertEquals(originalMode,audioManager.mode);assertEquals(originalSpeaker,audioManager.isSpeakerphoneOn)
+            assertEquals(originalMediaVolume,audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC))
+            assertEquals(originalCallVolume,audioManager.getStreamVolume(android.media.AudioManager.STREAM_VOICE_CALL))
+            assertEquals(android.media.AudioTrack.PLAYSTATE_PLAYING,otherMedia.playState);assertTrue(otherMedia.playbackHeadPosition>4800)
+            val videoBounds=compose.onNodeWithTag("remote-pointer").fetchSemanticsNode().boundsInRoot
             compose.onNodeWithText("操作").performClick()
+            assertEquals(videoBounds,compose.onNodeWithTag("remote-pointer").fetchSemanticsNode().boundsInRoot)
             snapshot("operation")
             compose.onNodeWithText("仅观看").performScrollTo().performClick()
             compose.waitUntil(20_000) {c.viewOnly && !c.viewOnlyPending}
@@ -91,6 +109,8 @@ class M9ControllerInstrumentedTest {
             compose.mainClock.advanceTimeBy(2500)
             Thread.sleep(200)
             compose.onNodeWithTag("network-value-编码",useUnmergedTree=true).assertTextEquals("video/H264")
+            compose.onNodeWithTag("network-value-采集方式",useUnmergedTree=true).assertTextEquals("GDI / BitBlt")
+            compose.runOnIdle {assertEquals(60,c.targetVideoFps)}
             compose.onNodeWithTag("network-value-帧率",useUnmergedTree=true).assert(hasText("—",substring=true).not())
             compose.onNodeWithTag("network-value-带宽占用",useUnmergedTree=true).assert(hasText("—",substring=true).not())
             snapshot("network")
@@ -101,12 +121,27 @@ class M9ControllerInstrumentedTest {
             snapshot("keyboard")
             compose.onNodeWithText("Esc").performClick()
             compose.onNodeWithText("关闭",substring=false).performClick()
+            compose.runOnIdle {c.updateRemotePreferences(c.remotePreferences.copy(mappingEnabled=true))}
+            compose.onNodeWithText("操作",substring=false).performClick()
+            compose.onNodeWithText("编辑当前方案").performScrollTo().performClick()
+            compose.onNodeWithTag("mapping-editor").assertExists()
+            compose.onNodeWithText("＋ 组合键").performScrollTo().performClick()
+            for(title in listOf("Ctrl","R","H")) compose.onNodeWithText(title,substring=false).performScrollTo().performClick()
+            compose.onNodeWithText("鼠标",substring=false).performClick();compose.onNodeWithText("右键",substring=false).performClick()
+            compose.onNodeWithText("确认组合键").performClick()
+            compose.onNode(hasSetTextAction() and hasText("按键名称")).performTextReplacement("组合验收")
+            compose.onNodeWithText("锁定",substring=false).performScrollTo().performClick()
+            snapshot("mapping-editor")
+            compose.onNodeWithText("保存方案").performScrollTo().performClick()
+            compose.runOnIdle {val value=c.inputShortcuts.single {it.label=="组合验收"};assertEquals(4,value.actions.size);assertEquals(MappingBehavior.Toggle,value.behavior)}
             tool("clipboard_enable",JSONObject().put("enabled",true))
             clipboardOriginal=tool("clipboard_get").getString("text")
+            java.io.File(context.filesDir,"controller-clipboard-recovery.txt").writeText(clipboardOriginal!!)
             tool("clipboard_set",JSONObject().put("text","AkaDesk中文🙂 $filename"))
             assertEquals("AkaDesk中文🙂 $filename",tool("clipboard_get").getString("text"))
             tool("clipboard_set",JSONObject().put("text",clipboardOriginal))
             tool("clipboard_enable",JSONObject().put("enabled",false))
+            java.io.File(context.filesDir,"controller-clipboard-recovery.txt").delete()
             source=resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,ContentValues().apply {put(MediaStore.MediaColumns.DISPLAY_NAME,filename);put(MediaStore.MediaColumns.MIME_TYPE,"application/octet-stream")})!!
             resolver.openOutputStream(source!!)?.use {it.write(bytes)} ?: error("No upload output")
             inst.runOnMainSync {c.fileTransfers.upload(source!!)}
@@ -120,6 +155,7 @@ class M9ControllerInstrumentedTest {
             assertArrayEquals(bytes,resolver.openInputStream(destination!!)?.use {it.readBytes()})
             inst.sendStatus(0,android.os.Bundle().apply {putString("controllerAcceptance","live H264 dimension/fps change, view-only, PC keyboard, RTC stats, Unicode clipboard, ${bytes.size}-byte bidirectional scoped-storage transfer")})
         } finally {
+            otherMedia.stop();otherMedia.release()
             if(c.toolsReady && clipboardOriginal!=null) runCatching {tool("clipboard_set",JSONObject().put("text",clipboardOriginal));tool("clipboard_enable",JSONObject().put("enabled",false))}
             inst.runOnMainSync {
                 c.endRemoteSession();c.updatePreferredVideoCodec(originalCodec);c.updateRemotePreferences(originalPreferences)
@@ -127,6 +163,9 @@ class M9ControllerInstrumentedTest {
             }
             source?.let {resolver.delete(it,null,null)};destination?.let {resolver.delete(it,null,null)}
             transferPreferences.edit().putString("history",originalTransferHistory).commit()
+            val mappingRestore=mappingPreferences.edit().clear()
+            originalMappings.forEach {(key,value)->when(value) {is String->mappingRestore.putString(key,value);is Float->mappingRestore.putFloat(key,value);is Int->mappingRestore.putInt(key,value);is Boolean->mappingRestore.putBoolean(key,value);is Long->mappingRestore.putLong(key,value)}}
+            mappingRestore.commit();inst.runOnMainSync {c.selectInputProfile(InputProfileStore(context).selectedProfile())}
         }
     }
 }

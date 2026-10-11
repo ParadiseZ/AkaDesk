@@ -164,17 +164,21 @@ class AndroidWebRtcSession(
     }
 
     private var renderer: SurfaceViewRenderer? = null
+    private var renderFps = 30
+    private var renderSurfaceCallback: android.view.SurfaceHolder.Callback? = null
+    fun setRenderFrameRate(fps:Int) {
+        val next=fps.coerceIn(1,120);if(next==renderFps) return;renderFps=next
+        synchronized(renderLock) {renderer?.let(::applyRenderFrameRate)}
+    }
+    private fun applyRenderFrameRate(target:SurfaceViewRenderer) {
+        target.setFpsReduction(renderFps.toFloat())
+        if(android.os.Build.VERSION.SDK_INT>=30 && target.holder.surface.isValid)
+            target.holder.surface.setFrameRate(renderFps.toFloat(),android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+    }
     private var remoteVideoTrack: VideoTrack? = null
     private var remoteAudioTrack: AudioTrack? = null
     private var localAudioMuted = false
-    private var audioFocusGranted = false
     private val audioPlayoutStarted = AtomicBoolean(false)
-    private val audioOutput = RemoteAudioOutput(appContext.applicationContext) { granted ->
-        synchronized(renderLock) {
-            audioFocusGranted = granted
-            if (!closed) remoteAudioTrack?.setVolume(if (localAudioMuted || !granted) 0.0 else 1.0)
-        }
-    }
 
     init {
         ensurePeerConnectionFactoryInitialized(appContext.applicationContext)
@@ -329,7 +333,15 @@ class AndroidWebRtcSession(
             target.setEnableHardwareScaler(true)
             target.setMirror(false)
             target.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+            target.setZOrderOnTop(false)
+            target.setZOrderMediaOverlay(false)
             renderer = target
+            renderSurfaceCallback=object:android.view.SurfaceHolder.Callback {
+                override fun surfaceCreated(holder:android.view.SurfaceHolder) {applyRenderFrameRate(target)}
+                override fun surfaceChanged(holder:android.view.SurfaceHolder,format:Int,width:Int,height:Int) {applyRenderFrameRate(target)}
+                override fun surfaceDestroyed(holder:android.view.SurfaceHolder)=Unit
+            }.also {target.holder.addCallback(it)}
+            applyRenderFrameRate(target)
             remoteVideoTrack?.addSink(target)
         }
 
@@ -339,6 +351,7 @@ class AndroidWebRtcSession(
     fun releaseRenderer(target: SurfaceViewRenderer) {
         synchronized(renderLock) {
             if (renderer === target) {
+                renderSurfaceCallback?.let(target.holder::removeCallback);renderSurfaceCallback=null
                 remoteVideoTrack?.removeSink(target)
                 renderer = null
             } else {
@@ -355,14 +368,31 @@ class AndroidWebRtcSession(
         synchronized(renderLock) {
             if (closed) return
             localAudioMuted = muted
-            if (!muted && !audioFocusGranted) audioOutput.requestFocus()
-            remoteAudioTrack?.setVolume(if (muted || !audioFocusGranted) 0.0 else 1.0)
+            remoteAudioTrack?.setVolume(if (muted) 0.0 else 1.0)
         }
     }
 
     internal fun hasAudioPlayoutStarted(): Boolean = audioPlayoutStarted.get()
     internal fun collectStats(callback: (org.webrtc.RTCStatsReport) -> Unit) {
-        if (!closed) peerConnection.getStats { report -> callback(report) }
+        if (!closed) peerConnection.getStats { report ->
+            if(closed) {callback(report);return@getStats}
+            // The pinned native library exposes video timing only in its legacy report.
+            // googCurrentDelayMs is TargetVideoDelay(), a playout target, not end-to-end latency.
+            val accepted=peerConnection.getStats(org.webrtc.StatsObserver {legacy->
+                val receiver=legacy.map {it.values.associate {v->v.name to v.value}}.firstOrNull {
+                    it["mediaType"]=="video" && it.containsKey("bytesReceived") && it.containsKey("googCurrentDelayMs")
+                }
+                val target=receiver?.get("googCurrentDelayMs")?.toDoubleOrNull()?.takeIf {it.isFinite() && it>=0}
+                if(target==null) callback(report) else {
+                    val all=report.statsMap.mapValues {(_,value)->
+                        if(value.type=="inbound-rtp" && (value.members["kind"]=="video" || value.members["mediaType"]=="video"))
+                            org.webrtc.RTCStats(value.timestampUs.toLong(),value.type,value.id,value.members+mapOf("receiverTargetDelayMs" to target)) else value
+                    }
+                    callback(org.webrtc.RTCStatsReport(report.timestampUs.toLong(),all))
+                }
+            },null)
+            if(!accepted) callback(report)
+        }
     }
 
     private fun audioFailure(error: String) {
@@ -376,8 +406,7 @@ class AndroidWebRtcSession(
             remoteAudioTrack = track
             track.setEnabled(true)
             track.setVolume(0.0)
-            audioOutput.start()
-            track.setVolume(if (localAudioMuted || !audioFocusGranted) 0.0 else 1.0)
+            track.setVolume(if (localAudioMuted) 0.0 else 1.0)
         }
         callbacks.onRemoteAudioTrack(sessionId)
     }
@@ -411,7 +440,6 @@ class AndroidWebRtcSession(
         peerConnection.dispose()
         peerConnectionFactory.dispose()
         audioDeviceModule.release()
-        audioOutput.close()
         eglBase.release()
     }
 
@@ -618,6 +646,8 @@ class AndroidWebRtcSession(
 
     private fun detachRendererLocked() {
         renderer?.let { target ->
+            renderSurfaceCallback?.let(target.holder::removeCallback);renderSurfaceCallback=null
+            if(android.os.Build.VERSION.SDK_INT>=30 && target.holder.surface.isValid) target.holder.surface.setFrameRate(0f,android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
             remoteVideoTrack?.removeSink(target)
             target.clearImage()
         }

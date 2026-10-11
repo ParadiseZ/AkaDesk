@@ -191,6 +191,23 @@ impl WindowsInputBackend {
         }
         Ok(())
     }
+    pub fn relative_pointer(&self, dx:f32, dy:f32, button:u8, pressed:bool) -> HostResult<()> {
+        if ![dx,dy].iter().all(|v| v.is_finite() && v.abs()<=1.0) || button>3 || button==0 && pressed {return Err(error("Invalid relative pointer delta/button"));}
+        let mut held=self.held.lock().map_err(|_|error("Input lock poisoned"))?;
+        if held.session_id.is_none() {return Err(error("Input is not prepared"));}
+        let (width,height)=unsafe {
+            let previous=SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let size=(GetSystemMetrics(SM_CXSCREEN),GetSystemMetrics(SM_CYSCREEN));
+            if !previous.0.is_null() {SetThreadDpiAwarenessContext(previous);}
+            size
+        };
+        if width<=0 || height<=0 {return Err(error("Invalid display dimensions"));}
+        let mut flags=if dx!=0.0 || dy!=0.0 {MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE} else {MOUSE_EVENT_FLAGS(0)};
+        if button!=0 && held.buttons.contains(&button)!=pressed {flags|=button_flag(button,!pressed)?;}
+        if flags.0!=0 {send(mouse(flags,(dx*width as f32).round() as i32,(dy*height as f32).round() as i32,0))?;}
+        if button!=0 {if pressed {held.buttons.insert(button);} else {held.buttons.remove(&button);}}
+        Ok(())
+    }
     pub fn touch(&self, points: &[(u32, f32, f32, u8)]) -> HostResult<()> {
         if points.is_empty()
             || points.len() > 10

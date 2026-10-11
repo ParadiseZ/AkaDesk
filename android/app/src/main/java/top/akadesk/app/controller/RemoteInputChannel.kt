@@ -70,6 +70,10 @@ class RemoteInputChannel(
         if (!x.isFinite() || !y.isFinite() || kotlin.math.abs(x)>10 || kotlin.math.abs(y)>10) return false
         return send { InputEvent.newBuilder().setScroll(ScrollEvent.newBuilder().setSeq(it).setDeltaX(x).setDeltaY(y).setTimestampMs(System.currentTimeMillis())) }
     }
+    fun relativePointer(x:Float,y:Float,button:PointerButton=PointerButton.POINTER_BUTTON_UNSPECIFIED,pressed:Boolean=false):Boolean {
+        if(!x.isFinite() || !y.isFinite() || kotlin.math.abs(x)>1 || kotlin.math.abs(y)>1) return false
+        return send {InputEvent.newBuilder().setRelativePointer(RelativePointerEvent.newBuilder().setSeq(it).setDeltaX(x).setDeltaY(y).setButton(button).setPressed(pressed).setTimestampMs(System.currentTimeMillis()))}
+    }
     fun touch(points: List<TouchPoint>): Boolean {
         if(points.isEmpty() || points.size>10) return false
         return send { InputEvent.newBuilder().setTouch(TouchInputEvent.newBuilder().setSeq(it)

@@ -10,6 +10,24 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+/// Detect every pixel change; idle streams encode one keepalive frame per second.
+#[derive(Default)]
+struct FrameCadence {
+    previous: Vec<u8>,
+    dimensions: (u32, u32),
+    last_encoded_ms: Option<u64>,
+}
+impl FrameCadence {
+    fn should_encode(&self, bytes: &[u8], dimensions: (u32, u32), now: u64, force: bool) -> bool {
+        force || self.last_encoded_ms.is_none() || self.dimensions != dimensions || self.previous != bytes
+            || now.saturating_sub(self.last_encoded_ms.unwrap_or(0)) >= 1000
+    }
+    fn encoded(&mut self, bytes: &[u8], dimensions: (u32, u32), now: u64) {
+        if self.previous != bytes {self.previous.clear();self.previous.extend_from_slice(bytes);}
+        self.dimensions = dimensions;self.last_encoded_ms = Some(now);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VideoPipelineState {
     pub codec: &'static str,
@@ -94,6 +112,27 @@ const MAX_CONSECUTIVE_RUNTIME_FRAME_ERRORS: usize = 30;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unchanged_frames_keep_alive_once_per_second_and_pixel_changes_resume_immediately() {
+        let mut cadence = FrameCadence::default();
+        let original = vec![0; 16];
+        assert!(cadence.should_encode(&original, (2, 2), 0, false));
+        cadence.encoded(&original, (2, 2), 0);
+        for time in [16, 33, 500, 999] {
+            assert!(!cadence.should_encode(&original, (2, 2), time, false));
+        }
+        assert!(cadence.should_encode(&original, (2, 2), 1000, false));
+        cadence.encoded(&original, (2, 2), 1000);
+        let mut changed = original.clone();
+        changed[7] = 1;
+        assert!(cadence.should_encode(&changed, (2, 2), 1001, false));
+        // A failed encode must not acknowledge the changed frame.
+        assert!(cadence.should_encode(&changed, (2, 2), 1002, false));
+        cadence.encoded(&changed, (2, 2), 1002);
+        assert!(!cadence.should_encode(&changed, (2, 2), 1003, false));
+        assert!(cadence.should_encode(&changed, (2, 2), 1003, true));
+        assert!(cadence.should_encode(&changed, (1, 4), 1003, false));
+    }
     #[test]
     fn slow_receiver_has_bounded_queue_and_resumes_at_a_keyframe() {
         let mut state = VideoStreamState::default();
@@ -244,8 +283,12 @@ pub fn spawn_h264_streaming_loop(
         };
         let mut startup_sent = false;
         let mut consecutive_runtime_frame_errors = 0usize;
+        let origin = std::time::Instant::now();
+        let origin_ms = now_ms();
+        let mut cadence = FrameCadence::default();
         loop {
             let frame_started = std::time::Instant::now();
+            let mut force_frame = false;
             let keep_running = sessions
                 .lock()
                 .map(|registry| registry.should_keep_running(&session_id))
@@ -272,6 +315,7 @@ pub fn spawn_h264_streaming_loop(
                             host_windows::ffmpeg::PreparedEncoderImplementation::Software => CodecImplementation::Software as i32,
                         };
                         encoder = replacement;
+                        force_frame = true;
                         request = next_request;
                         frame_interval = Duration::from_micros(1_000_000 / request.fps.max(1) as u64);
                         if let Ok(mut registry) = sessions.lock() {
@@ -291,11 +335,14 @@ pub fn spawn_h264_streaming_loop(
             if let Ok(mut stream_state) = video_streams.lock() {
                 if stream_state.take_keyframe_request(&session_id) {
                     encoder.request_keyframe();
+                    force_frame = true;
                 }
             }
 
-            match encode_runtime_frame(&mut encoder) {
-                Ok((encoded, frame_source_label)) => {
+            let frame_captured_at_ms = origin_ms + origin.elapsed().as_millis() as i64;
+            match encode_runtime_frame(&mut encoder, &mut cadence, origin.elapsed().as_millis() as u64, force_frame) {
+                Ok(None) => {thread::sleep(frame_interval.saturating_sub(frame_started.elapsed()));continue;}
+                Ok(Some((encoded, frame_source_label))) => {
                     consecutive_runtime_frame_errors = 0;
                     if let Ok(mut stream_state) = video_streams.lock() {
                         stream_state.push_packet(EncodedVideoPacket {
@@ -304,7 +351,7 @@ pub fn spawn_h264_streaming_loop(
                             packet_len: encoded.packet_len,
                             is_keyframe: encoded.is_keyframe,
                             frame_source_label: frame_source_label.clone(),
-                            created_at_ms: now_ms(),
+                            created_at_ms: frame_captured_at_ms,
                         });
                     }
                     if !startup_sent {
@@ -422,13 +469,18 @@ fn request_from_spec(spec: &VideoSessionSpec) -> host_windows::ffmpeg::H264Encod
 #[cfg(windows)]
 fn encode_runtime_frame(
     encoder: &mut host_windows::ffmpeg::StreamingH264EncoderSession,
-) -> Result<(host_windows::ffmpeg::EncodedH264Packet, String), String> {
+    cadence: &mut FrameCadence,
+    now: u64,
+    force: bool,
+) -> Result<Option<(host_windows::ffmpeg::EncodedH264Packet, String)>, String> {
     let frame = host_windows::cap::capture_primary_display_bgra()
         .map_err(|err| format!("failed to capture primary display: {err}"))?;
+    if !cadence.should_encode(&frame.bytes, (frame.width, frame.height), now, force) {return Ok(None);}
     let encoded = encoder
         .encode_frame(Some(&frame.bytes), frame.stride, frame.width, frame.height)
         .map_err(|err| format!("failed to encode captured BGRA frame: {err}"))?;
-    Ok((encoded, "primary-display".to_string()))
+    cadence.encoded(&frame.bytes, (frame.width, frame.height), now);
+    Ok(Some((encoded, "primary-display".to_string())))
 }
 
 impl VideoStreamState {

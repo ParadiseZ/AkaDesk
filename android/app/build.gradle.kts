@@ -1,3 +1,8 @@
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
+import java.util.zip.ZipEntry
+import java.io.ByteArrayOutputStream
+import java.io.ByteArrayInputStream
 import com.google.protobuf.gradle.proto
 
 plugins {
@@ -69,6 +74,49 @@ protobuf {
     }
 }
 
+// The pinned WebRTC AAR has no media AudioAttributes option. Replace only its
+// Java playout class; native libraries, JNI names and the remaining API stay intact.
+val originalWebRtc by configurations.creating { isTransitive = false }
+dependencies { originalWebRtc(libs.google.webrtc) }
+val mediaWebRtcAar = layout.buildDirectory.file("generated/webrtc/google-webrtc-media.aar")
+val prepareMediaWebRtc by tasks.registering {
+    inputs.files(originalWebRtc)
+    inputs.file("src/main/java/org/webrtc/audio/WebRtcAudioTrack.java")
+    outputs.file(mediaWebRtcAar)
+    doLast {
+        check(originalWebRtc.resolvedConfiguration.resolvedArtifacts.single().moduleVersion.id.version == "1.0.32006") {
+            "The media playout JNI adapter must be revalidated when upgrading WebRTC"
+        }
+        val target = mediaWebRtcAar.get().asFile
+        target.parentFile.mkdirs()
+        ZipInputStream(originalWebRtc.singleFile.inputStream()).use { aar ->
+            ZipOutputStream(target.outputStream()).use { output ->
+                while (true) {
+                    val entry = aar.nextEntry ?: break
+                    output.putNextEntry(ZipEntry(entry.name))
+                    if (entry.name == "classes.jar") {
+                        val bytes = ByteArrayOutputStream()
+                        ZipInputStream(ByteArrayInputStream(aar.readBytes())).use { jar ->
+                            ZipOutputStream(bytes).use { filtered ->
+                                while (true) {
+                                    val item = jar.nextEntry ?: break
+                                    if (!item.name.startsWith("org/webrtc/audio/WebRtcAudioTrack")) {
+                                        filtered.putNextEntry(ZipEntry(item.name))
+                                        jar.copyTo(filtered)
+                                        filtered.closeEntry()
+                                    }
+                                }
+                            }
+                        }
+                        output.write(bytes.toByteArray())
+                    } else aar.copyTo(output)
+                    output.closeEntry()
+                }
+            }
+        }
+    }
+}
+
 dependencies {
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
@@ -83,7 +131,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.okhttp)
     implementation(libs.protobuf.javalite)
-    implementation(libs.google.webrtc)
+    implementation(files(mediaWebRtcAar).builtBy(prepareMediaWebRtc))
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)

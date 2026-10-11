@@ -22,7 +22,7 @@ fun VideoQualityControls(c:ControllerCoordinator) {
     var error by remember {mutableStateOf<String?>(null)}
     var preset by remember {mutableStateOf("自动")}
     val scope=rememberCoroutineScope()
-    LaunchedEffect(c.toolsReady) {if(c.toolsReady) runCatching {c.toolRequest("status").optJSONObject("video")?.let {width=it.getInt("width");height=it.getInt("height");fps=it.getInt("fps");bitrate=it.getInt("bitrate")}}}
+    LaunchedEffect(c.toolsReady) {if(c.toolsReady) runCatching {val status=c.toolRequest("status");c.applyConfirmedVideoStatus(status);status.optJSONObject("video")?.let {width=it.getInt("width");height=it.getInt("height");fps=it.getInt("fps");bitrate=it.getInt("bitrate")}}}
     fun apply() {
         scope.launch {
             busy=true;error=null
@@ -31,7 +31,7 @@ fun VideoQualityControls(c:ControllerCoordinator) {
                 c.toolRequest("set_video",JSONObject().put("width",width).put("height",height).put("fps",fps).put("bitrate",bitrate))
                 var confirmed=false
                 repeat(30) {
-                    if(!confirmed) {delay(500);val status=c.toolRequest("status");if(!status.optBoolean("videoPending")) {require(status.optString("videoError").isEmpty()) {"电脑未能应用画质设置"};confirmed=true}}
+                    if(!confirmed) {delay(500);val status=c.toolRequest("status");if(!status.optBoolean("videoPending")) {require(status.optString("videoError").isEmpty()) {"电脑未能应用画质设置"};c.applyConfirmedVideoStatus(status);confirmed=true}}
                 }
                 require(confirmed) {"未能确认画质设置，请重新打开显示页面查看"}
             } catch(e:Exception) {error=e.message} finally {busy=false}
@@ -52,6 +52,7 @@ fun VideoQualityControls(c:ControllerCoordinator) {
             Slider(value=width.toFloat(),onValueChange={width=it.toInt()/2*2;height=(width*9/16).coerceIn(360,1200)/2*2},valueRange=640f..1920f,enabled=!busy)
         }
         Text("${width} × $height · $fps 帧 · ${bitrate/1000f} Mbps",style=MaterialTheme.typography.bodySmall)
+        Text("电脑端目标与手机渲染上限：${c.targetVideoFps} FPS。静态画面降到约 1 FPS；实际帧率见网络状态。",style=MaterialTheme.typography.bodySmall)
         Button(onClick=::apply,enabled=c.toolsReady && !busy) {Text(if(busy) "正在应用…" else "应用画质")}
         error?.let {Text(it,color=MaterialTheme.colorScheme.error)}
     }

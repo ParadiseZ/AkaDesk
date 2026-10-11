@@ -6,6 +6,34 @@ import org.webrtc.RTCStats
 import org.webrtc.RTCStatsReport
 
 class RemoteNetworkStatsTest {
+    @Test fun legacyPlayoutTargetIsIdentifiedAndNeverPresentedAsNetworkRoundTrip() {
+        val source=report(1_000_000,100_000,10,.1);val all=source.statsMap.toMutableMap()
+        val video=all.getValue("video");all["video"]=RTCStats(1_000_000,"inbound-rtp","video",video.members+mapOf("receiverTargetDelayMs" to 50.0))
+        val sampled=RemoteStatsSampler().sample(RTCStatsReport(1_000_000,all))
+        assertEquals(50.0,sampled.frameProcessingMs!!,.001);assertEquals(20.0,sampled.rttMs!!,.001)
+        assertTrue(sampled.processingTarget);assertFalse(sampled.processingEstimated)
+    }
+    @Test fun processingDelayUsesNativeCountersOrClearlyMarkedBufferPlusDecodeEstimate() {
+        fun enriched(time:Long,processing:Double?):RTCStatsReport {
+            val source=report(time,100_000+time/10,time/100_000,time/20_000_000.0)
+            val all=source.statsMap.toMutableMap()
+            val members=all.getValue("video").members.toMutableMap()
+            members["jitterBufferDelay"]=time/10_000_000.0;members["jitterBufferEmittedCount"]=time/100_000
+            processing?.let {members["totalProcessingDelay"]=it}
+            all["video"]=RTCStats(time,"inbound-rtp","video",members)
+            val pair=all.getValue("pair").members.toMutableMap();pair["bytesReceived"]=time/2
+            all["pair"]=RTCStats(time,"candidate-pair","pair",pair)
+            return RTCStatsReport(time,all)
+        }
+        val native=RemoteStatsSampler();native.sample(enriched(1_000_000,.2))
+        val n=native.sample(enriched(3_000_000,.8))
+        assertEquals(30.0,n.frameProcessingMs!!,.001);assertFalse(n.processingEstimated)
+        assertEquals(4.0,n.mbps!!,.001) // transport bytes rather than video bytes
+        val fallback=RemoteStatsSampler();fallback.sample(enriched(1_000_000,null))
+        val f=fallback.sample(enriched(3_000_000,null))
+        assertEquals(15.0,f.frameProcessingMs!!,.001);assertTrue(f.processingEstimated)
+        assertNull(fallback.sample(report(4_000_000,500_000,50,.5)).mbps) // source changed
+    }
     private fun report(time:Long,bytes:Long,frames:Long,decode:Double):RTCStatsReport {
         fun stat(id:String,type:String,values:Map<String,Any>)=RTCStats(time,type,id,values)
         return RTCStatsReport(time,mapOf(

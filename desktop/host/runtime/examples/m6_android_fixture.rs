@@ -9,14 +9,18 @@ mod fixture {
     };
     use host_windows::input::WindowsInputBackend;
     use std::sync::{mpsc, Mutex, OnceLock};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
     use windows::core::w;
     use windows::Win32::Foundation::*;
+    use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::HiDpi::*;
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
     use windows::Win32::UI::WindowsAndMessaging::*;
     static PROBE: OnceLock<Mutex<Probe>> = OnceLock::new();
+    static ANIMATE: AtomicBool = AtomicBool::new(false);
+    static PAINT: AtomicU32 = AtomicU32::new(0);
     #[derive(Default, serde::Serialize)]
     struct Probe {
         left_down: u32,
@@ -54,7 +58,7 @@ mod fixture {
                 WM_LBUTTONUP => p.left_up += 1,
                 WM_RBUTTONDOWN => p.right_down += 1,
                 WM_RBUTTONUP => p.right_up += 1,
-                WM_MOUSEMOVE => p.moves += 1,
+                WM_MOUSEMOVE => {p.moves += 1;p.pointer_positions.push(((lp.0 as u16) as i16 as i32, ((lp.0 >> 16) as u16) as i16 as i32));},
                 WM_POINTERDOWN => p.touch_down += 1,
                 WM_POINTERUP => p.touch_up += 1,
                 WM_POINTERUPDATE => p.touch_move += 1,
@@ -62,6 +66,7 @@ mod fixture {
                 WM_MOUSEHWHEEL => p.horizontal_wheel += (wp.0 >> 16) as u16 as i16 as i32,
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
                     p.keys_down.push(wp.0 as u32);
+                    if wp.0 == 0x7a {ANIMATE.fetch_xor(true, Ordering::SeqCst);}
                     if wp.0 == 0x43 && GetKeyState(0x11) < 0 {
                         p.ctrl_c += 1;
                     }
@@ -72,6 +77,18 @@ mod fixture {
             }
         }
         match message {
+            WM_TIMER => {
+                if ANIMATE.load(Ordering::SeqCst) {PAINT.fetch_add(1, Ordering::SeqCst);let _ = InvalidateRect(Some(hwnd), None, false);}
+                LRESULT(0)
+            }
+            WM_PAINT => {
+                let mut paint = PAINTSTRUCT::default();
+                let dc = BeginPaint(hwnd, &mut paint);
+                let brush = HBRUSH(GetStockObject(if PAINT.load(Ordering::SeqCst) % 2 == 0 {WHITE_BRUSH} else {BLACK_BRUSH}).0);
+                FillRect(dc, &paint.rcPaint, brush);
+                let _ = EndPaint(hwnd, &paint);
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
@@ -208,6 +225,7 @@ mod fixture {
                 None,
             )
             .unwrap();
+            SetTimer(Some(hwnd), 1, 50, None);
             SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
@@ -269,9 +287,9 @@ mod fixture {
             )?,
         )?;
         let _server = spawn_control_server(state)?;
-        eprintln!("M6 fixture ready; native probe center ({x}, {y}); auto-stop 180s");
+        eprintln!("M6 fixture ready; native probe center ({x}, {y}); auto-stop 300s");
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(180) && !directory.join("stop").exists() {
+        while start.elapsed() < Duration::from_secs(300) && !directory.join("stop").exists() {
             service.reap_finished_session()?;
             let p = PROBE.get().unwrap().lock().unwrap();
             std::fs::write(directory.join("input_probe.json"), serde_json::to_vec(&*p)?)?;

@@ -118,7 +118,7 @@ impl ToolSession {
                 |v| json!({"width":v.width,"height":v.height,"fps":v.fps,"bitrate":v.bitrate_kbps}),
             );
             return Ok(
-                json!({"root":self.root.to_string_lossy(),"clipboard":self.clipboard_enabled,"lockAfter":self.lock_after,"canControl":self.can_control,"video":video,"videoPending":active.requested_video.is_some(),"videoError":active.video_change_error}),
+                json!({"root":self.root.to_string_lossy(),"clipboard":self.clipboard_enabled,"lockAfter":self.lock_after,"canControl":self.can_control,"video":video,"captureMethod":"GDI / BitBlt","idleFps":1,"videoPending":active.requested_video.is_some(),"videoError":active.video_change_error}),
             );
         }
         if !self.can_control {

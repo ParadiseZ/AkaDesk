@@ -57,7 +57,18 @@ message InputEvent {
     TextInputEvent text = 5;
     ReleaseInputEvent release = 6;
     TouchInputEvent touch = 7;
+    RelativePointerEvent relative_pointer = 8;
   }
+}
+
+// Relative mouse movement in fractions of the captured display size.
+message RelativePointerEvent {
+  uint64 seq = 1;
+  float delta_x = 2;
+  float delta_y = 3;
+  int64 timestamp_ms = 4;
+  PointerButton button = 5;
+  bool pressed = 6;
 }
 
 // key_code uses Windows virtual-key codes, independent of Android key codes.

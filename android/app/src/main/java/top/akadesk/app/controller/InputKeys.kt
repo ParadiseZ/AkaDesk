@@ -1,5 +1,28 @@
 package top.akadesk.app.controller
 
+enum class MappingActionKind { Key, Mouse, Wheel }
+enum class MappingBehavior(val title:String) { Hold("按住"), Tap("单击"), Toggle("锁定"), Repeat("连发") }
+data class MappingAction(val kind:MappingActionKind,val code:Int) {
+    fun label():String=when(kind) {
+        MappingActionKind.Key->InputKeys.catalog[code] ?: ""
+        MappingActionKind.Mouse->mapOf(1 to "左键",2 to "右键",3 to "中键")[code] ?: ""
+        MappingActionKind.Wheel->if(code>0) "滚轮↑" else "滚轮↓"
+    }
+    fun valid():Boolean=when(kind) {
+        MappingActionKind.Key->code in InputKeys.catalog
+        MappingActionKind.Mouse->code in 1..3
+        MappingActionKind.Wheel->code in listOf(-1,1)
+    }
+}
+enum class ViewTrigger(val title:String) { Move("跟随鼠标移动"), Left("左键按住拖拽"), Right("右键按住拖拽"), Middle("中键按住拖拽") }
+data class MappingViewControl(val enabled:Boolean=false,val trigger:ViewTrigger=ViewTrigger.Move,
+    val rightHalf:Boolean=false,val sensitivityX:Float=1f,val sensitivityY:Float=1f,
+    val hideButtons:Boolean=false,val disableDoubleTap:Boolean=false) {
+    fun valid()=sensitivityX.isFinite() && sensitivityY.isFinite() && sensitivityX in .1f..3f && sensitivityY in .1f..3f
+}
+data class MappingDraft(val originalName:String,val name:String,val bindings:List<InputShortcut>,
+    val positions:Map<String,Pair<Float,Float>>,val view:MappingViewControl)
+
 data class InputShortcut(
     val id: String,
     val label: String,
@@ -8,9 +31,17 @@ data class InputShortcut(
     val alt: Boolean = false,
     val shift: Boolean = false,
     val meta: Boolean = false,
+    val actions:List<MappingAction> = emptyList(),
+    val behavior:MappingBehavior = MappingBehavior.Hold,
+    val size:Int? = null,
+    val opacity:Float? = null,
+    val movable:Boolean = false,
 ) {
-    fun chordLabel(): String = listOfNotNull(if(ctrl) "Ctrl" else null, if(alt) "Alt" else null,
-        if(shift) "Shift" else null, if(meta) "Win" else null, InputKeys.catalog[key]).joinToString(" + ")
+    fun effectiveActions():List<MappingAction> = actions.ifEmpty {
+        (listOfNotNull(if(ctrl) 0x11 else null,if(alt) 0x12 else null,if(shift) 0x10 else null,if(meta) 0x5b else null)+key)
+            .distinct().map {MappingAction(MappingActionKind.Key,it)}
+    }
+    fun chordLabel(): String = effectiveActions().joinToString(" + ") {it.label()}
 }
 
 object InputKeys {
@@ -24,7 +55,11 @@ object InputKeys {
     ) + (0x41..0x5a).associateWith { it.toChar().toString() } + (0x30..0x39).associateWith { it.toChar().toString() } +
         (0x70..0x87).associateWith { "F${it-0x6f}" } + mapOf(0x10 to "Shift",0x11 to "Ctrl",0x12 to "Alt",0x5b to "Win")
     fun valid(shortcut: InputShortcut): Boolean = shortcut.id.isNotBlank() && shortcut.id.length<=64 &&
-        shortcut.label.isNotBlank() && shortcut.label.length<=32 && shortcut.key in catalog
+        shortcut.label.isNotBlank() && shortcut.label.length<=32 && shortcut.key in catalog &&
+        shortcut.actions.size<=4 && shortcut.actions.all {it.valid()} && shortcut.actions.distinct().size==shortcut.actions.size &&
+        (shortcut.size==null || shortcut.size in 16..100) &&
+        (shortcut.opacity==null || shortcut.opacity.isFinite() && shortcut.opacity in .1f..1f) &&
+        !(shortcut.behavior==MappingBehavior.Toggle && shortcut.effectiveActions().any {it.kind==MappingActionKind.Wheel})
     fun validProfile(values: List<InputShortcut>): Boolean = values.size<=30 && values.all(::valid) && values.map {it.id}.distinct().size==values.size
     fun defaults() = listOf(
         InputShortcut("copy","复制",0x43,ctrl=true), InputShortcut("paste","粘贴",0x56,ctrl=true),

@@ -46,6 +46,7 @@ impl InputSink for host_windows::input::WindowsInputBackend {
                 timestamp_ms: p.timestamp_ms,
             }),
             Payload::Release(_) => self.release_held(),
+            Payload::RelativePointer(p) => self.relative_pointer(p.delta_x,p.delta_y,p.button as u8,p.pressed),
             Payload::Touch(p) => self.touch(&p.points.iter().map(|v| (v.id,v.normalized_x,v.normalized_y,v.phase as u8)).collect::<Vec<_>>()),
         }
         .map_err(|e| e.to_string())
@@ -119,7 +120,7 @@ impl InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generated::v1::{KeyEvent, PointerEvent, ReleaseInputEvent, VideoSessionSpec};
+    use crate::generated::v1::{KeyEvent, PointerEvent, RelativePointerEvent, ReleaseInputEvent, VideoSessionSpec};
     use crate::session::SessionRegistry;
     #[derive(Debug)]
     struct Mock {
@@ -261,6 +262,10 @@ mod tests {
     #[test]
     fn replay_invalid_numbers_unknown_enums_and_oversized_packets_are_rejected() {
         let (sessions, input, id, calls) = fixture(false);
+        for (x, button, pressed) in [(f32::NAN,0,false),(1.01,0,false),(0.0,4,true),(0.0,0,true)] {
+            let invalid = InputEvent {session_id:id.clone(),payload:Some(Payload::RelativePointer(RelativePointerEvent {seq:1,delta_x:x,button,pressed,..Default::default()}))};
+            assert!(process(&sessions,&input,&id,&invalid.encode_to_vec()).error.is_some());
+        }
         assert!(process(&sessions, &input, &id, &packet(&id, 0))
             .error
             .is_some());
@@ -341,6 +346,7 @@ pub fn sequence(p: &Payload) -> u64 {
         Payload::Key(p) => p.seq,
         Payload::Text(p) => p.seq,
         Payload::Release(p) => p.seq,
+        Payload::RelativePointer(p) => p.seq,
         Payload::Touch(p) => p.seq,
     }
 }
@@ -360,6 +366,7 @@ fn validate(p: &Payload) -> bool {
         Payload::Key(p) => (8..=254).contains(&p.key_code) && [1, 2].contains(&p.action),
         Payload::Text(p) => !p.text.is_empty() && p.text.len() <= 4096 && !p.text.contains('\0'),
         Payload::Release(_) => true,
+        Payload::RelativePointer(p) => [p.delta_x,p.delta_y].iter().all(|v|v.is_finite() && v.abs()<=1.0) && (0..=3).contains(&p.button) && !(p.button==0 && p.pressed),
         Payload::Touch(p) => !p.points.is_empty() && p.points.len()<=10
             && p.points.iter().all(|v| v.id<32 && v.normalized_x.is_finite() && v.normalized_y.is_finite()
                 && (0.0..=1.0).contains(&v.normalized_x) && (0.0..=1.0).contains(&v.normalized_y) && (1..=3).contains(&v.phase))

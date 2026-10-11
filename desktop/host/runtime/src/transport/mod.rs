@@ -33,7 +33,27 @@ use webrtc::rtp_transceiver::rtp_codec::{
 use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
 use webrtc::rtp_transceiver::{RTCPFeedback, RTCRtpTransceiverInit};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
-use webrtc::track::track_local::TrackLocal;
+use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+use webrtc::track::track_local::{TrackLocal, TrackLocalWriter};
+use webrtc::rtp::{codecs::h264::H264Payloader, header::Header, packet::Packet, packetizer::Payloader};
+
+struct H264RtpPacketizer { payloader: H264Payloader, sequence: u16 }
+impl Default for H264RtpPacketizer {
+    fn default() -> Self {Self {payloader: H264Payloader::default(), sequence: rand::random()}}
+}
+impl H264RtpPacketizer {
+    fn packets(&mut self, bytes: Bytes, captured_ms: i64) -> Result<Vec<Packet>, String> {
+        let payloads = self.payloader.payload(1188, &bytes).map_err(|e| e.to_string())?;
+        let last = payloads.len().saturating_sub(1);
+        Ok(payloads.into_iter().enumerate().map(|(index, payload)| {
+            let sequence_number = self.sequence;
+            self.sequence = self.sequence.wrapping_add(1);
+            Packet {header: Header {version: 2, marker: index == last,
+                sequence_number, timestamp: (captured_ms.max(0) as u64).wrapping_mul(90) as u32,
+                ..Header::default()}, payload}
+        }).collect())
+    }
+}
 
 #[derive(Debug)]
 pub struct TransportStartupResult {
@@ -75,7 +95,7 @@ pub fn spawn_h264_webrtc_transport_loop(
     audio_streams: SharedAudioStreamState,
     input: SharedInputState,
     session_id: String,
-    fps: u32,
+    _fps: u32,
     h264_fmtp_line: String,
 ) -> Result<Receiver<Result<TransportStartupResult, String>>, String> {
     if let Ok(mut status) = transport_status.lock() {
@@ -89,7 +109,6 @@ pub fn spawn_h264_webrtc_transport_loop(
             .subscribe_packets(&session_id)
             .ok_or_else(|| "video packet subscription unavailable for active session".to_string())?
     };
-    let mut frame_duration = Duration::from_micros(1_000_000u64 / fps.max(1) as u64);
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let runtime = match TokioRuntimeBuilder::new_multi_thread()
@@ -240,7 +259,7 @@ pub fn spawn_h264_webrtc_transport_loop(
                 })
             }));
 
-            let video_track = Arc::new(TrackLocalStaticSample::new(
+            let video_track = Arc::new(TrackLocalStaticRTP::new(
                 build_h264_codec_capability(&h264_fmtp_line),
                 "video".to_owned(),
                 "akadesk-host".to_owned(),
@@ -491,10 +510,7 @@ pub fn spawn_h264_webrtc_transport_loop(
         let mut remote_answer_applied = false;
         let mut processed_remote_candidate_count = 0usize;
         let mut applied_remote_candidate_count = 0usize;
-        let mut packet_timestamp = 0u32;
-        let mut timestamp_step = ((90_000u64 / fps.max(1) as u64).max(1)) as u32;
-        let sample_time_origin = SystemTime::now();
-        let mut sample_time_offset = Duration::from_millis(0);
+        let mut packet_timestamp = H264RtpPacketizer::default();
         let mut pending_pre_answer_packets = VecDeque::new();
         let mut deferred_remote_candidates: VecDeque<(IceCandidate, u8)> = VecDeque::new();
         let mut media_stream_started = false;
@@ -512,11 +528,6 @@ pub fn spawn_h264_webrtc_transport_loop(
                 .unwrap_or(false);
             if !keep_running {
                 break;
-            }
-            if let Some(fps) = sessions.lock().ok().and_then(|registry| registry.active.as_ref()
-                .filter(|s| s.session_id.0 == session_id).and_then(|s| s.video.as_ref()).map(|v| v.fps.max(1))) {
-                timestamp_step = (90_000 / fps).max(1);
-                frame_duration = Duration::from_micros(1_000_000 / fps as u64);
             }
             let media_send_ready_now = media_send_ready.load(Ordering::Relaxed);
             if media_send_ready_now {
@@ -613,10 +624,6 @@ pub fn spawn_h264_webrtc_transport_loop(
                         &video_track,
                         &mut pending_pre_answer_packets,
                         &mut packet_timestamp,
-                        timestamp_step,
-                        sample_time_origin,
-                        &mut sample_time_offset,
-                        frame_duration,
                         &transport_status,
                         &sessions,
                         &video_streams,
@@ -685,10 +692,6 @@ pub fn spawn_h264_webrtc_transport_loop(
                         &video_track,
                         packet,
                         &mut packet_timestamp,
-                        timestamp_step,
-                        sample_time_origin,
-                        &mut sample_time_offset,
-                        frame_duration,
                         &transport_status,
                     ) {
                         if let Ok(mut stream_state) = video_streams.lock() {
@@ -716,10 +719,6 @@ pub fn spawn_h264_webrtc_transport_loop(
                             &video_track,
                             &mut pending_pre_answer_packets,
                             &mut packet_timestamp,
-                            timestamp_step,
-                            sample_time_origin,
-                            &mut sample_time_offset,
-                            frame_duration,
                             &transport_status,
                             &sessions,
                             &video_streams,
@@ -791,6 +790,20 @@ fn opus_capability() -> RTCRtpCodecCapability {
 #[cfg(all(test, windows))]
 mod audio_tests {
     use super::*;
+    #[test]
+    fn video_rtp_clock_preserves_idle_gaps_changes_and_wraparound() {
+        let mut packetizer = H264RtpPacketizer::default();
+        let bytes = Bytes::from_static(&[0, 0, 0, 1, 0x65, 1, 2, 3]);
+        let first = packetizer.packets(bytes.clone(), 1000).unwrap();
+        let idle = packetizer.packets(bytes.clone(), 2000).unwrap();
+        let changed = packetizer.packets(bytes.clone(), 2016).unwrap();
+        assert_eq!(idle[0].header.timestamp.wrapping_sub(first[0].header.timestamp), 90_000);
+        assert_eq!(changed[0].header.timestamp.wrapping_sub(idle[0].header.timestamp), 1440);
+        assert_eq!(changed[0].header.sequence_number, idle[0].header.sequence_number.wrapping_add(1));
+        let wrap = packetizer.packets(bytes, u32::MAX as i64 / 90 + 1000).unwrap();
+        assert_eq!(wrap[0].header.timestamp, (((u32::MAX as u64 / 90) + 1000) * 90) as u32);
+        assert!(first.last().unwrap().header.marker);
+    }
     #[test]
     fn offer_bundles_sendonly_opus_with_existing_video() {
         let sessions = Arc::new(Mutex::new(crate::session::SessionRegistry::default()));
@@ -906,13 +919,9 @@ fn rtcp_requests_keyframe(packets: &[Box<dyn rtcp::packet::Packet + Send + Sync>
 
 fn flush_pending_packets(
     runtime: &tokio::runtime::Runtime,
-    video_track: &Arc<TrackLocalStaticSample>,
+    video_track: &Arc<TrackLocalStaticRTP>,
     pending_packets: &mut VecDeque<crate::video::EncodedVideoPacket>,
-    packet_timestamp: &mut u32,
-    timestamp_step: u32,
-    sample_time_origin: SystemTime,
-    sample_time_offset: &mut Duration,
-    frame_duration: Duration,
+    packet_timestamp: &mut H264RtpPacketizer,
     transport_status: &SharedTransportStatusState,
     sessions: &SharedSessionRegistry,
     video_streams: &SharedVideoStreamState,
@@ -924,10 +933,6 @@ fn flush_pending_packets(
             video_track,
             packet,
             packet_timestamp,
-            timestamp_step,
-            sample_time_origin,
-            sample_time_offset,
-            frame_duration,
             transport_status,
         )
         .map_err(|err| format!("flush buffered H.264 packet failed: {err}"))?;
@@ -1049,34 +1054,21 @@ fn retry_deferred_remote_candidates(
 
 fn write_video_packet(
     runtime: &tokio::runtime::Runtime,
-    video_track: &Arc<TrackLocalStaticSample>,
+    video_track: &Arc<TrackLocalStaticRTP>,
     packet: crate::video::EncodedVideoPacket,
-    packet_timestamp: &mut u32,
-    timestamp_step: u32,
-    sample_time_origin: SystemTime,
-    sample_time_offset: &mut Duration,
-    frame_duration: Duration,
+    packet_timestamp: &mut H264RtpPacketizer,
     transport_status: &SharedTransportStatusState,
 ) -> Result<(), String> {
     let packet_len = packet.packet_len;
-    runtime
-        .block_on(video_track.write_sample(&Sample {
-            data: Bytes::from(packet.bytes),
-            timestamp: sample_time_origin + *sample_time_offset,
-            duration: frame_duration,
-            packet_timestamp: *packet_timestamp,
-            prev_dropped_packets: 0,
-            prev_padding_packets: 0,
-            ..Sample::default()
-        }))
-        .map_err(|err| format!("write_sample failed: {err}"))?;
+    // RTP time follows capture time, including the gaps between idle frames.
+    let packets = packet_timestamp.packets(Bytes::from(packet.bytes), packet.created_at_ms)?;
+    runtime.block_on(async {
+        for packet in packets {video_track.write_rtp(&packet).await?;}
+        Ok::<(), webrtc::Error>(())
+    }).map_err(|err| format!("write_rtp failed: {err}"))?;
     if let Ok(mut status) = transport_status.lock() {
         status.record_sample_written(&packet.session_id, packet_len);
     }
-    *packet_timestamp = packet_timestamp.wrapping_add(timestamp_step);
-    *sample_time_offset = sample_time_offset
-        .checked_add(frame_duration)
-        .unwrap_or(*sample_time_offset);
     Ok(())
 }
 

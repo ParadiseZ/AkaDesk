@@ -62,7 +62,7 @@ class MainActivity : ComponentActivity() {
     }
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        if (::coordinator.isInitialized && coordinator.activeSession != null && coordinator.remotePreferences.autoPip) enterRemotePip()
+        if (::coordinator.isInitialized && coordinator.activeSession != null && coordinator.remotePreferences.autoPip && !coordinator.editingLocalInput) enterRemotePip()
     }
     fun enterRemotePip(): Boolean {
         if (coordinator.activeSession == null || !packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE)) return false

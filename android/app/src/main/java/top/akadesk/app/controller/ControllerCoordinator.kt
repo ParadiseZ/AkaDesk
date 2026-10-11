@@ -14,6 +14,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import org.webrtc.SurfaceViewRenderer
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 
 class ControllerCoordinator(context: Context) {
     companion object {
@@ -52,6 +53,14 @@ class ControllerCoordinator(context: Context) {
     var pictureInPicture by mutableStateOf(false)
     var toolsReady by mutableStateOf(false)
         private set
+    var targetVideoFps by mutableStateOf(30)
+        private set
+    var captureMethod by mutableStateOf("—")
+        private set
+    fun applyConfirmedVideoStatus(status:org.json.JSONObject) {
+        captureMethod=status.optString("captureMethod","—")
+        status.optJSONObject("video")?.optInt("fps",30)?.coerceIn(1,120)?.let {targetVideoFps=it;webRtcSession?.setRenderFrameRate(it)}
+    }
     suspend fun toolRequest(op: String, args: org.json.JSONObject = org.json.JSONObject()): org.json.JSONObject {
         val tools = webRtcSession?.tools ?: throw IllegalStateException("这台电脑暂不支持此功能")
         return tools.request(op, args)
@@ -91,8 +100,8 @@ class ControllerCoordinator(context: Context) {
         if(inputAvailable()) webRtcSession?.input?.touch(points)
     }
     fun shortcutKey(value: InputShortcut, down: Boolean) {
-        if (!inputAvailable() || !InputKeys.valid(value)) return
-        webRtcSession?.input?.key(value.key, down, value.ctrl, value.alt, value.shift, value.meta)
+        if (!InputKeys.valid(value) || down && !inputAvailable()) return
+        if(down) holdMapping(value) else cancelMapping(value.id)
     }
     var displaySettings by mutableStateOf<akadesk.v1.DisplaySettingsSnapshot?>(null)
         private set
@@ -148,11 +157,36 @@ class ControllerCoordinator(context: Context) {
         private set
     var selectedInputProfile by mutableStateOf(inputProfileStore.selectedProfile())
         private set
+    var mappingViewControl by mutableStateOf(inputProfileStore.draft().view)
+        private set
+    var viewControlActive by mutableStateOf(false)
+    private var viewControlButton:MappingAction?=null
+    private var viewControlIdleJob:kotlinx.coroutines.Job?=null
+    fun beginViewControl() {
+        if(!inputAvailable() || editingLocalInput || viewControlActive) return
+        viewControlButton=when(mappingViewControl.trigger) {ViewTrigger.Left->1;ViewTrigger.Right->2;ViewTrigger.Middle->3;ViewTrigger.Move->null}?.let {MappingAction(MappingActionKind.Mouse,it)}
+        viewControlButton?.let {mappingAction(it,true)};viewControlActive=true
+    }
+    fun endViewControl() {
+        viewControlIdleJob?.cancel();viewControlIdleJob=null
+        if(!viewControlActive) return
+        viewControlButton?.let {mappingAction(it,false)};viewControlButton=null;viewControlActive=false
+    }
+    fun moveViewControl(dx:Float,dy:Float,hover:Boolean=false) {
+        if(inputAvailable() && viewControlActive) webRtcSession?.input?.relativePointer((dx*mappingViewControl.sensitivityX).coerceIn(-1f,1f),(dy*mappingViewControl.sensitivityY).coerceIn(-1f,1f))
+        if(hover && viewControlActive) {viewControlIdleJob?.cancel();viewControlIdleJob=toolScope.launch {kotlinx.coroutines.delay(500);endViewControl()}}
+    }
+    var activeMappingIds by mutableStateOf<Set<String>>(emptySet())
+        private set
+    private val heldMappings=mutableMapOf<String,List<MappingAction>>()
+    private val mappingCounts=mutableMapOf<MappingAction,Int>()
+    private val repeatMappings=mutableMapOf<String,kotlinx.coroutines.Job>()
     fun selectInputProfile(name: String) {
         releaseRemoteInput()
         if (inputProfileStore.selectProfile(name)) {
             selectedInputProfile = name
             inputShortcuts = inputProfileStore.load()
+            mappingViewControl = inputProfileStore.draft().view
         }
     }
     fun createInputProfile(name: String): Boolean {
@@ -163,6 +197,53 @@ class ControllerCoordinator(context: Context) {
     }
     fun mappingPosition(id: String) = inputProfileStore.position(id)
     fun saveMappingPosition(id: String, x: Float, y: Float) = inputProfileStore.savePosition(id, x, y)
+    fun mappingDraft()=inputProfileStore.draft()
+    private fun reloadMappings() {
+        releaseRemoteInput();inputProfileNames=inputProfileStore.profileNames();selectedInputProfile=inputProfileStore.selectedProfile()
+        inputShortcuts=inputProfileStore.load();mappingViewControl=inputProfileStore.draft().view
+    }
+    fun saveMappingDraft(draft:MappingDraft):Boolean=if(inputProfileStore.saveDraft(draft)) {reloadMappings();true} else false
+    fun deleteInputProfile(name:String):Boolean=if(inputProfileStore.deleteProfile(name)) {reloadMappings();true} else false
+    fun exportInputProfile(name:String=selectedInputProfile)=inputProfileStore.exportProfile(name)
+    fun importInputProfile(raw:String):String {val name=inputProfileStore.importProfile(raw);reloadMappings();selectInputProfile(name);return name}
+    fun copyInputProfile(name:String):String=importInputProfile(exportInputProfile(name))
+    fun renameInputProfile(name:String,newName:String):Boolean {selectInputProfile(name);return saveMappingDraft(mappingDraft().copy(name=newName.trim()))}
+    private fun mappingAction(action:MappingAction,down:Boolean) {
+        if(action.kind==MappingActionKind.Wheel) {if(down) webRtcSession?.input?.scroll(0f,action.code.toFloat());return}
+        val before=mappingCounts[action] ?: 0
+        val after=if(down) before+1 else (before-1).coerceAtLeast(0)
+        if(after==0) mappingCounts.remove(action) else mappingCounts[action]=after
+        if(down && before>0 || !down && after>0 || !down && before==0) return
+        when(action.kind) {
+            MappingActionKind.Key->{fun held(code:Int)=(mappingCounts[MappingAction(MappingActionKind.Key,code)] ?: 0)>0
+                webRtcSession?.input?.key(action.code,down,held(0x11),held(0x12),held(0x10),held(0x5b))}
+            MappingActionKind.Mouse->webRtcSession?.input?.relativePointer(0f,0f,akadesk.v1.PointerButton.forNumber(action.code),down)
+            else->Unit
+        }
+    }
+    private fun holdMapping(value:InputShortcut) {
+        if(value.id in heldMappings) return
+        val actions=value.effectiveActions().sortedBy {if(it.kind==MappingActionKind.Key && it.code in listOf(0x11,0x10,0x12,0x5b)) 0 else 1}
+        heldMappings[value.id]=actions;activeMappingIds=heldMappings.keys.toSet()
+        actions.forEach {mappingAction(it,true)}
+    }
+    fun cancelMapping(id:String) {
+        repeatMappings.remove(id)?.cancel()
+        heldMappings.remove(id)?.asReversed()?.forEach {mappingAction(it,false)}
+        activeMappingIds=heldMappings.keys.toSet()
+    }
+    fun mappingPress(value:InputShortcut,down:Boolean) {
+        if(!InputKeys.valid(value) || down && (!inputAvailable() || editingLocalInput)) return
+        if(!down) {if(value.behavior in listOf(MappingBehavior.Hold,MappingBehavior.Repeat)) cancelMapping(value.id);return}
+        when(value.behavior) {
+            MappingBehavior.Hold->holdMapping(value)
+            MappingBehavior.Tap->{holdMapping(value);cancelMapping(value.id)}
+            MappingBehavior.Toggle->if(value.id in heldMappings) cancelMapping(value.id) else holdMapping(value)
+            MappingBehavior.Repeat->{if(value.id !in repeatMappings) repeatMappings[value.id]=toolScope.launch {
+                while(kotlinx.coroutines.currentCoroutineContext().isActive && inputAvailable()) {holdMapping(value);heldMappings.remove(value.id)?.asReversed()?.forEach {mappingAction(it,false)};activeMappingIds=heldMappings.keys.toSet();kotlinx.coroutines.delay(100)}
+            }}
+        }
+    }
     var remoteInputReady by mutableStateOf(false)
         private set
     var inputError by mutableStateOf<String?>(null)
@@ -187,15 +268,19 @@ class ControllerCoordinator(context: Context) {
     fun scrollInput(x:Float, y:Float) { if (inputAvailable()) webRtcSession?.input?.scroll(x,y) }
     fun sendShortcut(value:InputShortcut) {
         if (!inputAvailable() || !InputKeys.valid(value)) return
-        webRtcSession?.input?.key(value.key,true,value.ctrl,value.alt,value.shift,value.meta)
-        webRtcSession?.input?.key(value.key,false,value.ctrl,value.alt,value.shift,value.meta)
+        val temporary=value.copy(id="tap-${java.util.UUID.randomUUID()}")
+        holdMapping(temporary);cancelMapping(temporary.id)
     }
     fun sendText(value:String):Boolean {
         if (!inputAvailable()) return false
         releaseRemoteInput()
         return webRtcSession?.input?.text(value)==true
     }
-    fun releaseRemoteInput() { webRtcSession?.input?.release() }
+    fun releaseRemoteInput() {
+        repeatMappings.values.toList().forEach {it.cancel()};repeatMappings.clear();heldMappings.clear();mappingCounts.clear()
+        viewControlIdleJob?.cancel();viewControlIdleJob=null
+        activeMappingIds=emptySet();viewControlActive=false;viewControlButton=null;webRtcSession?.input?.release()
+    }
     fun saveInputShortcuts(values:List<InputShortcut>):Boolean {
         if (!inputProfileStore.save(values)) return false
         inputShortcuts=values.toList(); return true
@@ -211,6 +296,7 @@ class ControllerCoordinator(context: Context) {
     private var discoveryClient: HostDiscoveryClient? = null
     private var controlSession: HostControlSession? = null
     private var webRtcSession: AndroidWebRtcSession? = null
+    internal fun hasActiveAudioPlayout() = webRtcSession?.hasAudioPlayoutStarted() == true
     private var mediaGeneration = 0L
     private var activeVideoRenderer: SurfaceViewRenderer? = null
     private var pendingSessionTarget: ControlledHostSummary? = null
