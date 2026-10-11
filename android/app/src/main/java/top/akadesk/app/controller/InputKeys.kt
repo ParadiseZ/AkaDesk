@@ -18,6 +18,9 @@ object InputKeys {
         0x0d to "Enter", 0x1b to "Esc", 0x09 to "Tab", 0x08 to "Backspace", 0x20 to "Space",
         0x2e to "Delete", 0x2d to "Insert", 0x24 to "Home", 0x23 to "End", 0x21 to "Page Up", 0x22 to "Page Down",
         0x25 to "←", 0x26 to "↑", 0x27 to "→", 0x28 to "↓",
+        0x14 to "Caps Lock", 0x2c to "Print Screen", 0x91 to "Scroll Lock", 0x13 to "Pause",
+        0xba to ";", 0xbb to "=", 0xbc to ",", 0xbd to "-", 0xbe to ".", 0xbf to "/",
+        0xc0 to "`", 0xdb to "[", 0xdc to "\\", 0xdd to "]", 0xde to "'",
     ) + (0x41..0x5a).associateWith { it.toChar().toString() } + (0x30..0x39).associateWith { it.toChar().toString() } +
         (0x70..0x87).associateWith { "F${it-0x6f}" } + mapOf(0x10 to "Shift",0x11 to "Ctrl",0x12 to "Alt",0x5b to "Win")
     fun valid(shortcut: InputShortcut): Boolean = shortcut.id.isNotBlank() && shortcut.id.length<=64 &&

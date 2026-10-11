@@ -46,6 +46,7 @@ impl InputSink for host_windows::input::WindowsInputBackend {
                 timestamp_ms: p.timestamp_ms,
             }),
             Payload::Release(_) => self.release_held(),
+            Payload::Touch(p) => self.touch(&p.points.iter().map(|v| (v.id,v.normalized_x,v.normalized_y,v.phase as u8)).collect::<Vec<_>>()),
         }
         .map_err(|e| e.to_string())
     }
@@ -197,6 +198,27 @@ mod tests {
         .encode_to_vec()
     }
     #[test]
+    fn view_only_acknowledges_queued_packets_without_injecting_and_can_resume() {
+        let (sessions,input,id,calls)=fixture(false);
+        sessions.lock().unwrap().active.as_mut().unwrap().view_only=true;
+        assert!(process(&sessions,&input,&id,&packet(&id,1)).error.is_none());
+        assert!(calls.lock().unwrap().iter().all(|s| !s.starts_with("inject:")));
+        sessions.lock().unwrap().active.as_mut().unwrap().view_only=false;
+        assert!(process(&sessions,&input,&id,&packet(&id,2)).error.is_none());
+        assert!(calls.lock().unwrap().contains(&"inject:2".into()));
+    }
+    #[test]
+    fn touch_frames_reject_duplicate_contacts_and_invalid_phases() {
+        use crate::generated::v1::{TouchInputEvent,TouchPoint};
+        let (sessions,input,id,_)=fixture(false);
+        let point=TouchPoint{id:0,normalized_x:0.5,normalized_y:0.5,phase:1};
+        let packet=|points| InputEvent{session_id:id.clone(),payload:Some(Payload::Touch(TouchInputEvent{seq:1,timestamp_ms:0,points}))}.encode_to_vec();
+        assert!(process(&sessions,&input,&id,&packet(vec![point.clone(),point.clone()])).error.is_some());
+        let mut invalid=point.clone();invalid.phase=4;
+        assert!(process(&sessions,&input,&id,&packet(vec![invalid])).error.is_some());
+        assert!(process(&sessions,&input,&id,&packet(vec![point])).error.is_none());
+    }
+    #[test]
     fn only_active_enabled_bound_session_can_inject() {
         let (sessions, input, id, calls) = fixture(false);
         assert!(process(&sessions, &input, &id, &packet("foreign", 1))
@@ -319,6 +341,7 @@ pub fn sequence(p: &Payload) -> u64 {
         Payload::Key(p) => p.seq,
         Payload::Text(p) => p.seq,
         Payload::Release(p) => p.seq,
+        Payload::Touch(p) => p.seq,
     }
 }
 fn validate(p: &Payload) -> bool {
@@ -337,6 +360,10 @@ fn validate(p: &Payload) -> bool {
         Payload::Key(p) => (8..=254).contains(&p.key_code) && [1, 2].contains(&p.action),
         Payload::Text(p) => !p.text.is_empty() && p.text.len() <= 4096 && !p.text.contains('\0'),
         Payload::Release(_) => true,
+        Payload::Touch(p) => !p.points.is_empty() && p.points.len()<=10
+            && p.points.iter().all(|v| v.id<32 && v.normalized_x.is_finite() && v.normalized_y.is_finite()
+                && (0.0..=1.0).contains(&v.normalized_x) && (0.0..=1.0).contains(&v.normalized_y) && (1..=3).contains(&v.phase))
+            && p.points.iter().map(|v|v.id).collect::<std::collections::BTreeSet<_>>().len()==p.points.len(),
     }
 }
 // Keep the session lock until injection completes: a stopped/replaced session cannot inject late.
@@ -377,6 +404,12 @@ pub fn process(
             return Err("Invalid input payload".into());
         }
         state.seq = seq;
+        if registry.active.as_ref().is_some_and(|session| session.view_only) {
+            // Acknowledge input already in flight while suppressing injection.
+            // The reliable channel stays available when viewing mode is disabled.
+            state.release_held(bound_id)?;
+            return Ok(());
+        }
         if let Err(error) = state.sink.as_ref().unwrap().inject(&payload) {
             state.failed = true;
             let cleanup = state.release_held(bound_id);

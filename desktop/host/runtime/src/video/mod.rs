@@ -221,8 +221,8 @@ pub fn spawn_h264_streaming_loop(
     session_id: String,
     spec: VideoSessionSpec,
 ) -> Result<Receiver<Result<StreamingStartupResult, String>>, String> {
-    let request = request_from_spec(&spec);
-    let frame_interval = Duration::from_millis((1_000u64 / (request.fps.max(1) as u64)).max(1));
+    let mut request = request_from_spec(&spec);
+    let mut frame_interval = Duration::from_millis((1_000u64 / (request.fps.max(1) as u64)).max(1));
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     if let Ok(mut stream_state) = video_streams.lock() {
         stream_state.begin_session(session_id.clone());
@@ -258,6 +258,34 @@ pub fn spawn_h264_streaming_loop(
                     ));
                 }
                 break;
+            }
+
+            let pending = sessions.lock().ok().and_then(|registry| registry.active.as_ref()
+                .filter(|s| s.session_id.0 == session_id).and_then(|s| s.requested_video.clone()));
+            if let Some(mut next) = pending {
+                let next_request = request_from_spec(&next);
+                match host_windows::ffmpeg::start_h264_streaming_encoder(&next_request) {
+                    Ok(mut replacement) => {
+                        replacement.request_keyframe();
+                        next.host_encoder = match replacement.prepared().implementation {
+                            host_windows::ffmpeg::PreparedEncoderImplementation::Hardware => CodecImplementation::Hardware as i32,
+                            host_windows::ffmpeg::PreparedEncoderImplementation::Software => CodecImplementation::Software as i32,
+                        };
+                        encoder = replacement;
+                        request = next_request;
+                        frame_interval = Duration::from_micros(1_000_000 / request.fps.max(1) as u64);
+                        if let Ok(mut registry) = sessions.lock() {
+                            if let Some(active) = registry.active.as_mut().filter(|s| s.session_id.0 == session_id) {
+                                active.video = Some(next);active.requested_video = None;active.video_change_error.clear();
+                            }
+                        }
+                    }
+                    Err(error) => if let Ok(mut registry) = sessions.lock() {
+                        if let Some(active) = registry.active.as_mut().filter(|s| s.session_id.0 == session_id) {
+                            active.requested_video = None;active.video_change_error = error;
+                        }
+                    }
+                }
             }
 
             if let Ok(mut stream_state) = video_streams.lock() {

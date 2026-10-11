@@ -89,7 +89,7 @@ pub fn spawn_h264_webrtc_transport_loop(
             .subscribe_packets(&session_id)
             .ok_or_else(|| "video packet subscription unavailable for active session".to_string())?
     };
-    let frame_duration = Duration::from_millis((1_000u64 / fps.max(1) as u64).max(1));
+    let mut frame_duration = Duration::from_micros(1_000_000u64 / fps.max(1) as u64);
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let runtime = match TokioRuntimeBuilder::new_multi_thread()
@@ -347,6 +347,34 @@ pub fn spawn_h264_webrtc_transport_loop(
                     })
                 }));
             }
+            let tools = Arc::new(Mutex::new(crate::tools::ToolSession::new(
+                session_id.clone(), crate::tools::ToolSession::default_root(), has_input,
+            )));
+            tools.lock().unwrap().bind_input(Arc::clone(&input));
+            let channel = peer_connection.create_data_channel("tools", Some(
+                webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+                    ordered: Some(true), protocol: Some("akadesk.tools.v1".into()), ..Default::default()
+                }
+            )).await.map_err(|e| e.to_string())?;
+            let weak = Arc::downgrade(&channel);
+            let tools_for_messages = Arc::clone(&tools);
+            let sessions_for_tools = Arc::clone(&sessions);
+            channel.on_message(Box::new(move |message| {
+                let weak = weak.clone();
+                let tools = Arc::clone(&tools_for_messages);
+                let sessions = Arc::clone(&sessions_for_tools);
+                Box::pin(async move {
+                    if !message.is_string || message.data.len() > 65_536 {return;}
+                    let response = tokio::task::spawn_blocking(move || tools.lock().ok().map(|mut tools| tools.process(&sessions, &message.data))).await;
+                    if let (Ok(Some(response)), Some(channel)) = (response, weak.upgrade()) {
+                        if let Ok(text) = String::from_utf8(response) {let _ = channel.send_text(text).await;}
+                    }
+                })
+            }));
+            channel.on_close(Box::new(move || {
+                let tools = Arc::clone(&tools);
+                Box::pin(async move {let _ = tokio::task::spawn_blocking(move || {if let Ok(mut tools) = tools.lock() {tools.finish();}}).await;})
+            }));
             let offer = peer_connection
                 .create_offer(None)
                 .await
@@ -464,7 +492,7 @@ pub fn spawn_h264_webrtc_transport_loop(
         let mut processed_remote_candidate_count = 0usize;
         let mut applied_remote_candidate_count = 0usize;
         let mut packet_timestamp = 0u32;
-        let timestamp_step = ((90_000u64 / fps.max(1) as u64).max(1)) as u32;
+        let mut timestamp_step = ((90_000u64 / fps.max(1) as u64).max(1)) as u32;
         let sample_time_origin = SystemTime::now();
         let mut sample_time_offset = Duration::from_millis(0);
         let mut pending_pre_answer_packets = VecDeque::new();
@@ -484,6 +512,11 @@ pub fn spawn_h264_webrtc_transport_loop(
                 .unwrap_or(false);
             if !keep_running {
                 break;
+            }
+            if let Some(fps) = sessions.lock().ok().and_then(|registry| registry.active.as_ref()
+                .filter(|s| s.session_id.0 == session_id).and_then(|s| s.video.as_ref()).map(|v| v.fps.max(1))) {
+                timestamp_step = (90_000 / fps).max(1);
+                frame_duration = Duration::from_micros(1_000_000 / fps as u64);
             }
             let media_send_ready_now = media_send_ready.load(Ordering::Relaxed);
             if media_send_ready_now {
@@ -809,7 +842,8 @@ mod audio_tests {
             .lines()
             .find(|line| line.starts_with("a=group:BUNDLE "))
             .unwrap();
-        assert_eq!(bundle.split_whitespace().count(), 3);
+        assert!(offer.contains("m=application "));
+        assert_eq!(bundle.split_whitespace().count(), 4); // video + audio + tools SCTP
         for candidate in signaling.lock().unwrap().local_candidates_snapshot(&id) {
             assert!(!candidate.sdp_mid.is_empty());
             assert_eq!(candidate.sdp_mline_index, 0);

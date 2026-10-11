@@ -61,8 +61,8 @@ class M7DisplayInstrumentedTest {
                 coordinator.submitVerificationConnect()
             }
             compose.waitUntil(35_000) { coordinator.remoteInputReady && coordinator.hasActiveRemoteVideoTrack(coordinator.activeSession?.sessionId) }
-            if (compose.onAllNodesWithText("显示设置").fetchSemanticsNodes().isEmpty()) compose.onNodeWithText("操作").performClick()
-            compose.onNodeWithText("显示设置").performScrollTo().performClick()
+            compose.onNodeWithText("操作").performClick()
+            compose.onNodeWithText("显示",substring=false).performScrollTo().performClick()
             compose.waitUntil(20_000) { !coordinator.displaySettingsPending && coordinator.displaySettings != null }
             val snapshot = coordinator.displaySettings!!
             val original = snapshot.historyDisplayMode

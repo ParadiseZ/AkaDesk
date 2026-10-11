@@ -2,10 +2,12 @@ use host_contracts::error::{HostError, HostErrorCode, HostResult, RetryClass};
 use host_contracts::input::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use windows::Win32::Foundation::{POINT, RECT};
 use windows::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Input::Pointer::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 #[derive(Debug, Default)]
@@ -15,6 +17,8 @@ struct HeldInput {
     // Each held key owns its chord requirements; overlapping chords stay held.
     keys: BTreeMap<u16, u8>,
     modifiers: BTreeSet<u16>,
+    touches: BTreeMap<u32, (i32, i32)>,
+    touch_initialized: bool,
 }
 #[derive(Debug, Default)]
 pub struct WindowsInputBackend {
@@ -187,6 +191,98 @@ impl WindowsInputBackend {
         }
         Ok(())
     }
+    pub fn touch(&self, points: &[(u32, f32, f32, u8)]) -> HostResult<()> {
+        if points.is_empty()
+            || points.len() > 10
+            || points.iter().any(|(id, x, y, phase)| {
+                *id >= 32
+                    || !x.is_finite()
+                    || !y.is_finite()
+                    || !(0.0..=1.0).contains(x)
+                    || !(0.0..=1.0).contains(y)
+                    || !(1..=3).contains(phase)
+            })
+        {
+            return Err(error("Invalid touch contacts"));
+        }
+        let mut held = self.held.lock().map_err(|_| error("Input lock poisoned"))?;
+        if held.session_id.is_none() {
+            return Err(error("Input is not prepared"));
+        }
+        unsafe {
+            if !held.touch_initialized {
+                InitializeTouchInjection(10, TOUCH_FEEDBACK_NONE)
+                    .map_err(|e| error(e.to_string()))?;
+                held.touch_initialized = true;
+            }
+            let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let width = GetSystemMetrics(SM_CXSCREEN);
+            let height = GetSystemMetrics(SM_CYSCREEN);
+            if !previous.0.is_null() {
+                SetThreadDpiAwarenessContext(previous);
+            }
+            if width <= 0 || height <= 0 {
+                return Err(error("No touch geometry"));
+            }
+            let mut next = held.touches.clone();
+            let mut contacts = Vec::new();
+            for &(id, x, y, phase) in points {
+                // UP must use the last injected location, otherwise Windows rejects the frame.
+                let pixel = if phase == 3 {
+                    *held
+                        .touches
+                        .get(&id)
+                        .ok_or_else(|| error("Touch contact is not active"))?
+                } else {
+                    (
+                        (x * (width - 1) as f32).round() as i32,
+                        (y * (height - 1) as f32).round() as i32,
+                    )
+                };
+                if (phase == 1) == next.contains_key(&id) {
+                    return Err(error("Touch phase does not match active contacts"));
+                }
+                contacts.push(touch_contact(
+                    id,
+                    pixel,
+                    match phase {
+                        1 => POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,
+                        2 => POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,
+                        _ => POINTER_FLAG_UP,
+                    },
+                ));
+                if phase == 3 {
+                    next.remove(&id);
+                } else {
+                    next.insert(id, pixel);
+                }
+            }
+            if held
+                .touches
+                .keys()
+                .any(|id| !points.iter().any(|p| p.0 == *id))
+            {
+                return Err(error("Touch frame omitted an active contact"));
+            }
+            if let Err(err) = InjectTouchInput(&contacts) {
+                // Windows may cancel the whole frame; clear the previous contacts best effort.
+                let cancel: Vec<_> = held
+                    .touches
+                    .iter()
+                    .map(|(&id, &pixel)| {
+                        touch_contact(id, pixel, POINTER_FLAG_UP | POINTER_FLAG_CANCELED)
+                    })
+                    .collect();
+                if !cancel.is_empty() {
+                    let _ = InjectTouchInput(&cancel);
+                }
+                held.touches.clear();
+                return Err(error(format!("Touch injection failed: {err}")));
+            }
+            held.touches = next;
+        }
+        Ok(())
+    }
     pub fn keyboard(&self, event: KeyInputCommand) -> HostResult<()> {
         if !(8..=254).contains(&event.key_code) || ![1, 2].contains(&event.action) {
             return Err(error("Invalid virtual key/action"));
@@ -249,6 +345,19 @@ impl WindowsInputBackend {
     pub fn release_held(&self) -> HostResult<()> {
         let mut held = self.held.lock().map_err(|_| error("Input lock poisoned"))?;
         let mut failed = None;
+        if !held.touches.is_empty() {
+            let contacts: Vec<_> = held
+                .touches
+                .iter()
+                .map(|(&id, &pixel)| {
+                    touch_contact(id, pixel, POINTER_FLAG_UP | POINTER_FLAG_CANCELED)
+                })
+                .collect();
+            match unsafe { InjectTouchInput(&contacts) } {
+                Ok(()) => held.touches.clear(),
+                Err(err) => failed = Some(error(err.to_string())),
+            }
+        }
         for vk in held
             .keys
             .keys()
@@ -305,6 +414,30 @@ impl WindowsInputBackend {
             .map_err(|_| error("Input lock poisoned"))?
             .session_id = None;
         Ok(())
+    }
+}
+fn touch_contact(id: u32, pixel: (i32, i32), flags: POINTER_FLAGS) -> POINTER_TOUCH_INFO {
+    POINTER_TOUCH_INFO {
+        pointerInfo: POINTER_INFO {
+            pointerType: PT_TOUCH,
+            pointerId: id + 1,
+            pointerFlags: flags,
+            ptPixelLocation: POINT {
+                x: pixel.0,
+                y: pixel.1,
+            },
+            ..Default::default()
+        },
+        touchMask: 7,
+        rcContact: RECT {
+            left: pixel.0 - 2,
+            top: pixel.1 - 2,
+            right: pixel.0 + 2,
+            bottom: pixel.1 + 2,
+        },
+        orientation: 90,
+        pressure: 32000,
+        ..Default::default()
     }
 }
 impl Drop for WindowsInputBackend {

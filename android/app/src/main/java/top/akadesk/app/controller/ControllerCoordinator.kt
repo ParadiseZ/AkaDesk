@@ -13,6 +13,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import org.webrtc.SurfaceViewRenderer
+import kotlinx.coroutines.launch
 
 class ControllerCoordinator(context: Context) {
     companion object {
@@ -38,6 +39,61 @@ class ControllerCoordinator(context: Context) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val pairingStore = ControllerPairingStore(appContext)
     private val inputProfileStore = InputProfileStore(appContext)
+    val fileTransfers = FileTransferController(appContext, ::toolRequest)
+    private val remotePreferenceStore = RemoteControlPreferenceStore(appContext)
+    var remotePreferences by mutableStateOf(remotePreferenceStore.load())
+        private set
+    var viewOnly by mutableStateOf(false)
+        private set
+    var viewOnlyPending by mutableStateOf(false)
+        private set
+    private val toolScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate)
+    var remotePortrait by mutableStateOf(false)
+    var pictureInPicture by mutableStateOf(false)
+    var toolsReady by mutableStateOf(false)
+        private set
+    suspend fun toolRequest(op: String, args: org.json.JSONObject = org.json.JSONObject()): org.json.JSONObject {
+        val tools = webRtcSession?.tools ?: throw IllegalStateException("这台电脑暂不支持此功能")
+        return tools.request(op, args)
+    }
+    fun updateRemotePreferences(value: RemoteControlPreferences) {
+        releaseRemoteInput()
+        if (remotePreferenceStore.save(value)) remotePreferences = value
+    }
+    fun updateViewOnly(value: Boolean) {
+        if (viewOnlyPending) return
+        releaseRemoteInput()
+        if (!toolsReady) {viewOnly = value;return}
+        val sessionId = activeSession?.sessionId
+        if (value) viewOnly = true
+        viewOnlyPending = true
+        toolScope.launch {
+            try {
+                toolRequest("view_only", org.json.JSONObject().put("enabled", value))
+                if (activeSession?.sessionId == sessionId) viewOnly = value
+            } catch (_: Exception) {
+                if (activeSession?.sessionId == sessionId) inputError = "未能确认观看模式，请重新连接"
+            } finally {
+                if (activeSession?.sessionId == sessionId) viewOnlyPending = false
+            }
+        }
+    }
+    fun movePointer(dx: Float, dy: Float, pressed: Boolean = false) {
+        pointerInput((pointerX + dx * remotePreferences.pointerSpeed).coerceIn(0f, 1f),
+            (pointerY + dy * remotePreferences.pointerSpeed).coerceIn(0f, 1f), pressed, !pressed)
+    }
+    fun pointerButton(right: Boolean, pressed: Boolean) {
+        if (!inputAvailable()) return
+        webRtcSession?.input?.pointer(pointerX, pointerY,
+            if (right) akadesk.v1.PointerButton.POINTER_BUTTON_RIGHT else akadesk.v1.PointerButton.POINTER_BUTTON_LEFT, pressed)
+    }
+    fun touchInput(points: List<akadesk.v1.TouchPoint>) {
+        if(inputAvailable()) webRtcSession?.input?.touch(points)
+    }
+    fun shortcutKey(value: InputShortcut, down: Boolean) {
+        if (!inputAvailable() || !InputKeys.valid(value)) return
+        webRtcSession?.input?.key(value.key, down, value.ctrl, value.alt, value.shift, value.meta)
+    }
     var displaySettings by mutableStateOf<akadesk.v1.DisplaySettingsSnapshot?>(null)
         private set
     var displaySettingsPending by mutableStateOf(false)
@@ -88,6 +144,25 @@ class ControllerCoordinator(context: Context) {
     }
     var inputShortcuts by mutableStateOf(inputProfileStore.load())
         private set
+    var inputProfileNames by mutableStateOf(inputProfileStore.profileNames())
+        private set
+    var selectedInputProfile by mutableStateOf(inputProfileStore.selectedProfile())
+        private set
+    fun selectInputProfile(name: String) {
+        releaseRemoteInput()
+        if (inputProfileStore.selectProfile(name)) {
+            selectedInputProfile = name
+            inputShortcuts = inputProfileStore.load()
+        }
+    }
+    fun createInputProfile(name: String): Boolean {
+        if (!inputProfileStore.createProfile(name)) return false
+        inputProfileNames = inputProfileStore.profileNames()
+        selectInputProfile(name)
+        return true
+    }
+    fun mappingPosition(id: String) = inputProfileStore.position(id)
+    fun saveMappingPosition(id: String, x: Float, y: Float) = inputProfileStore.savePosition(id, x, y)
     var remoteInputReady by mutableStateOf(false)
         private set
     var inputError by mutableStateOf<String?>(null)
@@ -95,8 +170,10 @@ class ControllerCoordinator(context: Context) {
     private var pointerX = 0.5f
     private var pointerY = 0.5f
     var editingLocalInput = false
-    var inputForeground = true
-    private fun inputAvailable() = inputForeground && remoteInputReady && activeSession?.stateLabel != "DISCONNECTING" && pendingStopSessionId == null
+    var inputForeground by mutableStateOf(true)
+    var clipboardSync by mutableStateOf(false)
+    var lockAfterSession by mutableStateOf(false)
+    private fun inputAvailable() = inputForeground && !viewOnly && remoteInputReady && !activeRemoteVideoStalled && activeSession?.stateLabel != "DISCONNECTING" && pendingStopSessionId == null
     fun pointerInput(x:Float, y:Float, pressed:Boolean, moveOnly:Boolean=false) {
         if (!inputAvailable() || activeRemoteVideoStalled) return
         pointerX=x; pointerY=y
@@ -1051,6 +1128,18 @@ class ControllerCoordinator(context: Context) {
             appContext = appContext,
             sessionId = sessionId,
             callbacks = object : AndroidWebRtcSession.Callbacks {
+                override fun onRemoteVideoSizeChanged(sessionId: String, width: Int, height: Int) {
+                    mainHandler.post {
+                        if (generation != mediaGeneration || activeSession?.sessionId != sessionId) return@post
+                        activeVideoAspectRatio = width.toFloat() / height.coerceAtLeast(1)
+                    }
+                }
+                override fun onToolsStateChanged(sessionId: String, ready: Boolean) {
+                    mainHandler.post {
+                        if (generation != mediaGeneration || activeSession?.sessionId != sessionId) return@post
+                        toolsReady = ready
+                    }
+                }
                 override fun onInputStateChanged(sessionId: String, ready: Boolean) {
                     mainHandler.post {
                         if (generation != mediaGeneration || activeSession?.sessionId != sessionId) return@post
@@ -1203,6 +1292,13 @@ class ControllerCoordinator(context: Context) {
     }
 
     private fun closeWebRtcSession(retainPendingStop: Boolean = false) {
+        fileTransfers.finishSession()
+        toolsReady = false
+        clipboardSync = false
+        lockAfterSession = false
+        viewOnly = false
+        viewOnlyPending = false
+        pictureInPicture = false
         mainHandler.removeCallbacks(displayTimeout)
         displaySettings = null
         displaySettingsPending = false

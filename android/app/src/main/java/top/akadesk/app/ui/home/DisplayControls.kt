@@ -22,7 +22,13 @@ fun DisplaySettingsSheet(coordinator: ControllerCoordinator, onDismiss: () -> Un
         }
     }
     ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        DisplaySettingsContent(coordinator)
+    }
+}
+
+@Composable
+fun DisplaySettingsContent(coordinator: ControllerCoordinator, scrollable:Boolean=true) {
+        Column(Modifier.padding(16.dp).then(if(scrollable) Modifier.verticalScroll(rememberScrollState()) else Modifier), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("电脑显示设置", style = MaterialTheme.typography.titleLarge)
                 TextButton(onClick = coordinator::refreshDisplaySettings, enabled = !coordinator.displaySettingsPending) { Text("刷新") }
@@ -61,7 +67,6 @@ fun DisplaySettingsSheet(coordinator: ControllerCoordinator, onDismiss: () -> Un
             coordinator.displaySettingsError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             Spacer(Modifier.height(12.dp))
         }
-    }
 }
 
 @Composable

@@ -16,4 +16,5 @@ pub mod settings;
 pub mod signaling;
 pub mod state;
 pub mod transport;
+pub mod tools;
 pub mod video;

@@ -25,8 +25,10 @@ class MainActivity : ComponentActivity() {
         coordinator = ViewModelProvider(this)[ControllerViewModel::class.java].coordinator
         setContent {
             val viewing = coordinator.activeSession != null
-            LaunchedEffect(viewing) {
-                requestedOrientation = if (viewing) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else originalOrientation
+            LaunchedEffect(viewing, coordinator.remotePortrait) {
+                requestedOrientation = if (viewing) {
+                    if (coordinator.remotePortrait) ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT else ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                } else originalOrientation
                 val bars = WindowCompat.getInsetsController(window, window.decorView)
                 if (viewing) {
                     bars.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -57,6 +59,25 @@ class MainActivity : ComponentActivity() {
             coordinator.releaseRemoteInput()
         }
         super.onStop()
+    }
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (::coordinator.isInitialized && coordinator.activeSession != null && coordinator.remotePreferences.autoPip) enterRemotePip()
+    }
+    fun enterRemotePip(): Boolean {
+        if (coordinator.activeSession == null || !packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE)) return false
+        coordinator.releaseRemoteInput()
+        val ratio = coordinator.activeVideoAspectRatio.coerceIn(1f / 2.39f, 2.39f)
+        return runCatching { enterPictureInPictureMode(android.app.PictureInPictureParams.Builder()
+            .setAspectRatio(android.util.Rational((ratio * 1000).toInt(), 1000)).build()) }.getOrDefault(false)
+    }
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: android.content.res.Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        if (::coordinator.isInitialized) {
+            coordinator.pictureInPicture = isInPictureInPictureMode
+            coordinator.inputForeground = !isInPictureInPictureMode
+            coordinator.releaseRemoteInput()
+        }
     }
     override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
         if (::coordinator.isInitialized && coordinator.hardwareKey(event)) return true

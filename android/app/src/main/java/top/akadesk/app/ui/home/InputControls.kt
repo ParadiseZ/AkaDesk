@@ -25,6 +25,7 @@ fun InputMappingEditor(coordinator: ControllerCoordinator, onBack: () -> Unit) {
     var meta by rememberSaveable { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    var newProfile by rememberSaveable { mutableStateOf("") }
     fun resetEditor() {
         editing = null
         label = ""
@@ -46,6 +47,15 @@ fun InputMappingEditor(coordinator: ControllerCoordinator, onBack: () -> Unit) {
             }) { Text("重置") }
         }
         Text("保存常用按键或组合键，在远程键盘中点按发送。最多 30 个。")
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement=Arrangement.spacedBy(6.dp)) {
+            coordinator.inputProfileNames.forEach { name ->
+                FilterChip(selected=name==coordinator.selectedInputProfile, onClick={coordinator.selectInputProfile(name); resetEditor()}, label={Text(name)})
+            }
+        }
+        Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(value=newProfile,onValueChange={newProfile=it.take(32)},label={Text("新方案名称")},singleLine=true,modifier=Modifier.weight(1f))
+            TextButton(onClick={if(coordinator.createInputProfile(newProfile)) {newProfile=""; resetEditor()} else error="名称重复或已达到 20 个方案"},enabled=newProfile.isNotBlank()) {Text("创建")}
+        }
         coordinator.inputShortcuts.forEach { value ->
             Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween) {
                 TextButton(onClick={ editing=value; label=value.label; key=value.key; ctrl=value.ctrl; alt=value.alt; shift=value.shift; meta=value.meta; error=null }) {

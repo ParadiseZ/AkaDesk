@@ -53,12 +53,14 @@ class AndroidWebRtcSession(
         fun onRemoteVideoTrack(sessionId: String)
         fun onRemoteAudioTrack(sessionId: String)
         fun onRemoteVideoFirstFrame(sessionId: String, width: Int, height: Int)
+        fun onRemoteVideoSizeChanged(sessionId: String, width: Int, height: Int) {}
         fun onRemoteVideoStalled(sessionId: String, stalledForMs: Long, frameCount: Int)
         fun onRemoteVideoFlowResumed(sessionId: String, width: Int, height: Int, frameCount: Int)
         fun onFailure(sessionId: String, message: String)
         fun onInputStateChanged(sessionId: String, ready: Boolean) {}
         fun onInputResult(sessionId: String, result: akadesk.v1.InputResult) {}
         fun onInputError(sessionId: String) {}
+        fun onToolsStateChanged(sessionId: String, ready: Boolean) {}
     }
 
     private val eglBase: EglBase
@@ -76,6 +78,7 @@ class AndroidWebRtcSession(
         onResult = { callbacks.onInputResult(sessionId, it) },
         onError = { callbacks.onInputError(sessionId) },
     )
+    val tools = RemoteToolsChannel(sessionId) { callbacks.onToolsStateChanged(sessionId, it) }
 
     @Volatile
     private var closed = false
@@ -96,6 +99,7 @@ class AndroidWebRtcSession(
     private val remoteFirstFrameReported = AtomicBoolean(false)
     private val remoteVideoStalled = AtomicBoolean(false)
     private val lastRemoteFrameAtMs = AtomicLong(0L)
+    private val remoteFrameSize = AtomicLong(0L)
     private val remoteVideoStallCheck = Runnable {
         if (closed || !remoteFirstFrameReported.get()) {
             return@Runnable
@@ -126,6 +130,8 @@ class AndroidWebRtcSession(
         val now = SystemClock.elapsedRealtime()
         lastRemoteFrameAtMs.set(now)
         val frameIndex = remoteFrameCount.incrementAndGet()
+        val size = (frame.rotatedWidth.toLong() shl 32) or frame.rotatedHeight.toLong()
+        if (remoteFrameSize.getAndSet(size) != size) callbacks.onRemoteVideoSizeChanged(sessionId, frame.rotatedWidth, frame.rotatedHeight)
         if (remoteVideoStalled.compareAndSet(true, false)) {
             callbacks.onRemoteVideoFlowResumed(
                 sessionId,
@@ -381,6 +387,7 @@ class AndroidWebRtcSession(
             return
         }
         input.close()
+        tools.close()
         closed = true
         synchronized(candidateLock) {
             pendingRemoteCandidates.clear()
@@ -459,7 +466,9 @@ class AndroidWebRtcSession(
                 override fun onRemoveStream(stream: MediaStream?) = Unit
 
                 override fun onDataChannel(dataChannel: DataChannel?) {
-                    if (dataChannel != null) input.attach(dataChannel)
+                    if (dataChannel != null) {
+                        if (dataChannel.label() == "tools") tools.attach(dataChannel) else input.attach(dataChannel)
+                    }
                 }
 
                 override fun onRenegotiationNeeded() {

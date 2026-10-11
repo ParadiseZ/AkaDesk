@@ -18,10 +18,12 @@ class M6InputUiInstrumentedTest {
         assumeTrue("Requires isolated M6 fixture",args.containsKey("m6HostId"))
         val coordinator=ViewModelProvider(compose.activity)[ControllerViewModel::class.java].coordinator
         val originalCodec=coordinator.preferredVideoCodec
+        val originalPreferences=coordinator.remotePreferences
         val host=ControlledHostSummary("m6-ui-fixture",args.getString("m6HostId")!!,"M6 UI test","windows","fixture","test","127.0.0.1",46671,false,true,0L)
         try {
             compose.runOnIdle {
                 coordinator.updatePreferredVideoCodec(ControllerVideoCodecPreset.H264)
+                coordinator.updateRemotePreferences(originalPreferences.copy(mappingEnabled=false,virtualMouse=true,tabletTouch=false,toolbarHide=ToolbarHide.Never))
                 coordinator.openVerificationSheet(host,args.getString("m6PairCode")!!)
                 coordinator.submitVerificationConnect()
             }
@@ -30,12 +32,9 @@ class M6InputUiInstrumentedTest {
             compose.onNodeWithTag("remote-pointer",useUnmergedTree=true).performTouchInput {
                 down(Offset(width*x,height*y));moveTo(Offset(width*(x+0.02f),height*(y+0.02f)),100);up()
             }
-            fun showControls(){
-                if(compose.onAllNodesWithText("右键").fetchSemanticsNodes().isEmpty()) compose.onNodeWithText("操作").performClick()
-            }
-            showControls();compose.onNodeWithText("右键").performClick()
-            showControls();compose.onNodeWithText("滚轮 ↑").performClick()
-            showControls();compose.onNodeWithText("键盘").performClick()
+            compose.onNodeWithText("右键").performClick()
+            compose.onNodeWithText("滚轮 ↑").performClick()
+            compose.onNodeWithText("键盘").performClick()
             compose.onNode(hasSetTextAction()).performTextInput("UI中文🙂")
             compose.onNodeWithText("发送文字").performScrollTo().performClick()
             val instrumentation=InstrumentationRegistry.getInstrumentation()
@@ -51,6 +50,7 @@ class M6InputUiInstrumentedTest {
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
                 coordinator.endRemoteSession()
                 coordinator.updatePreferredVideoCodec(originalCodec)
+                coordinator.updateRemotePreferences(originalPreferences)
                 val fixtureIds=(args.getString("m6CleanupHostIds","")!!.split(",")+host.deviceId).filter {it.length==9 && it.all(Char::isDigit)}
                 fixtureIds.forEach { id ->
                     coordinator.removeHistory(id)

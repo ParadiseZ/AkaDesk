@@ -128,7 +128,7 @@ fun ControllerHomeApp(
             .then(if (coordinator.activeSession == null) Modifier.statusBarsPadding() else Modifier),
     ) {
         when {
-            coordinator.activeSession != null -> RemoteStreamScreen(
+            coordinator.activeSession != null -> RemoteSessionScreen(
                 coordinator = coordinator,
                 session = coordinator.activeSession!!,
                 onDisconnect = coordinator::endRemoteSession,
@@ -728,137 +728,6 @@ private fun WaitingApprovalSheet(
             Text("${host.displayName} 等待允许 (${seconds}s)", style = MaterialTheme.typography.bodyLarge)
             TextButton(onClick = onDismiss) { Text("取消") }
         }
-    }
-}
-
-@Composable
-private fun RemoteStreamScreen(
-    coordinator: ControllerCoordinator,
-    session: ActiveRemoteSession,
-    onDisconnect: () -> Unit,
-) {
-    val now = rememberTickerMillis()
-    val videoReady = coordinator.hasActiveRemoteVideoTrack(session.sessionId)
-    val videoStalled = coordinator.isActiveRemoteVideoStalled(session.sessionId)
-    var controlsVisible by rememberSaveable(session.sessionId) { mutableStateOf(true) }
-    var keyboardVisible by rememberSaveable(session.sessionId) { mutableStateOf(false) }
-    var displaySettingsVisible by rememberSaveable(session.sessionId) { mutableStateOf(false) }
-    var touchSize by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
-    var touching by remember { mutableStateOf(false) }
-    var lastMoveAt by remember { mutableLongStateOf(0) }
-    val inputEnabled=coordinator.remoteInputReady && videoReady && !videoStalled && session.stateLabel!="DISCONNECTING"
-    DisposableEffect(session.sessionId) { onDispose {coordinator.releaseRemoteInput()} }
-    LaunchedEffect(inputEnabled) { if(!inputEnabled) { touching=false; coordinator.releaseRemoteInput() } }
-    val activity = LocalContext.current as? android.app.Activity
-    DisposableEffect(activity, session.sessionId) {
-        val previous = activity?.volumeControlStream
-        activity?.volumeControlStream = android.media.AudioManager.STREAM_VOICE_CALL
-        onDispose { if (previous != null) activity.volumeControlStream = previous }
-    }
-    BackHandler(onBack = onDisconnect)
-    LaunchedEffect(controlsVisible, videoReady, keyboardVisible) {
-        if (controlsVisible && videoReady && !keyboardVisible) { delay(3_000); controlsVisible = false }
-    }
-    Box(
-        Modifier.fillMaxSize().background(Color.Black).clickable(
-            interactionSource = remember { MutableInteractionSource() },
-            indication = null,
-        ) { controlsVisible = !controlsVisible },
-    ) {
-        BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            val aspect = coordinator.activeVideoAspectRatio
-            val videoWidth = minOf(maxWidth, maxHeight * aspect)
-            val videoHeight = videoWidth / aspect
-            key(session.sessionId ?: session.host.deviceId) {
-                AndroidView(
-                    modifier = Modifier.width(videoWidth).height(videoHeight),
-                    factory = { context ->
-                        SurfaceViewRenderer(context).also(coordinator::bindActiveVideoRenderer)
-                    },
-                    update = coordinator::bindActiveVideoRenderer,
-                    onReset = null,
-                    onRelease = coordinator::releaseActiveVideoRenderer,
-                )
-            }
-            Box(Modifier.width(videoWidth).height(videoHeight).testTag("remote-pointer").onSizeChanged {touchSize=it}
-                .pointerInteropFilter { event ->
-                    if(!inputEnabled || keyboardVisible || displaySettingsVisible || touchSize.width==0 || touchSize.height==0) false
-                    else {
-                        val x=(event.x/touchSize.width).coerceIn(0f,1f)
-                        val y=(event.y/touchSize.height).coerceIn(0f,1f)
-                        when(event.actionMasked) {
-                            android.view.MotionEvent.ACTION_DOWN -> {touching=true; coordinator.pointerInput(x,y,true)}
-                            android.view.MotionEvent.ACTION_MOVE -> if(touching && event.eventTime-lastMoveAt>=16) {lastMoveAt=event.eventTime;coordinator.pointerInput(x,y,true)}
-                            android.view.MotionEvent.ACTION_UP -> {if(touching) coordinator.pointerInput(x,y,false);touching=false}
-                            android.view.MotionEvent.ACTION_CANCEL, android.view.MotionEvent.ACTION_POINTER_DOWN -> {touching=false;coordinator.releaseRemoteInput()}
-                        }
-                        true
-                    }
-                })
-        }
-        TextButton(onClick={controlsVisible=!controlsVisible},modifier=Modifier.align(Alignment.TopEnd).padding(8.dp)) {Text("操作",color=Color.White)}
-        if (controlsVisible) Surface(
-            modifier = Modifier.align(Alignment.TopStart).padding(16.dp),
-            color = Color(0x99000000),
-            shape = RoundedCornerShape(12.dp),
-        ) {
-            Column(Modifier.padding(12.dp)) {
-                Text(session.host.displayName.ifBlank { "Windows" }, color = Color.White, fontWeight = FontWeight.Bold)
-                Text(formatDuration(now - session.startedAtMs), color = Color.LightGray)
-            }
-        }
-        if (!videoReady || videoStalled) {
-            Surface(
-                modifier = Modifier.align(Alignment.Center),
-                color = Color(0xBB000000),
-                shape = RoundedCornerShape(12.dp),
-            ) {
-                Column(Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator(color = Color.White, strokeWidth = 3.dp)
-                    Text(
-                        if (videoStalled) "画面暂时中断，正在等待恢复" else "正在连接电脑画面…",
-                        modifier = Modifier.padding(top = 12.dp),
-                        color = Color.White,
-                    )
-                }
-            }
-        }
-        if (controlsVisible) Surface(
-            modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth(),
-            color = Color(0xCC000000),
-        ) {
-            Row(
-                Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                TextButton(onClick = coordinator::togglePhoneAudioMute,
-                    enabled = coordinator.remoteAudioReady && session.stateLabel != "DISCONNECTING") {
-                    Text(if (coordinator.phoneAudioMuted) "手机已静音" else "手机声音", color = Color.White)
-                }
-                TextButton(onClick = coordinator::toggleComputerAudioMute,
-                    enabled = coordinator.computerAudioAvailable && !coordinator.audioMutePending && session.stateLabel != "DISCONNECTING") {
-                    Text(if (coordinator.audioMutePending) "设置中…" else if (coordinator.computerAudioMuted) "电脑已静音" else "电脑声音", color = Color.White)
-                }
-                OutlinedButton(onClick = onDisconnect) { Text("断开", color = Color.White) }
-                TextButton(onClick={displaySettingsVisible=true;keyboardVisible=false;coordinator.releaseRemoteInput()},
-                    enabled=session.stateLabel!="DISCONNECTING") {Text("显示设置",color=Color.White)}
-                TextButton(onClick={keyboardVisible=true;coordinator.releaseRemoteInput()},enabled=inputEnabled) {Text("键盘",color=Color.White)}
-                TextButton(onClick=coordinator::rightClick,enabled=inputEnabled) {Text("右键",color=Color.White)}
-                TextButton(onClick={coordinator.scrollInput(0f,1f)},enabled=inputEnabled) {Text("滚轮 ↑",color=Color.White)}
-                TextButton(onClick={coordinator.scrollInput(0f,-1f)},enabled=inputEnabled) {Text("滚轮 ↓",color=Color.White)}
-            }
-        }
-        coordinator.audioError?.let { error ->
-            Surface(Modifier.align(Alignment.BottomCenter).padding(bottom = 76.dp), color = Color(0xCC000000)) {
-                Text(error, color = Color.White, modifier = Modifier.padding(12.dp))
-            }
-        }
-        coordinator.inputError?.let { error ->
-            Surface(Modifier.align(Alignment.TopCenter).padding(top=16.dp),color=Color(0xCC000000)) {Text(error,color=Color.White,modifier=Modifier.padding(12.dp))}
-        }
-        if(keyboardVisible) RemoteKeyboardSheet(coordinator,onDismiss={keyboardVisible=false})
-        if(displaySettingsVisible) DisplaySettingsSheet(coordinator,onDismiss={displaySettingsVisible=false})
     }
 }
 
