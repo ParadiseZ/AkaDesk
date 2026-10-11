@@ -49,6 +49,8 @@ impl RuntimeService {
         let host_identity = HostIdentity::load_or_create(base_dir)?;
         let state_signal: SharedStateSignal = Arc::new(StateSignal::default());
         let audio_streams = Arc::new(Mutex::new(crate::audio::AudioStreamState::new(base_dir)));
+        let had_display_journal = base_dir.join("display_restore.json").exists();
+        let had_audio_journal = base_dir.join("audio_restore.json").exists();
         let mut display_state = crate::display::DisplayState::new(base_dir);
         let display_restore_error = display_state.recover().err();
         let display = Arc::new(Mutex::new(display_state));
@@ -61,19 +63,31 @@ impl RuntimeService {
         diagnostics_buffer.set_signal(Arc::clone(&state_signal));
         #[cfg(windows)]
         if let Some(error) = audio_restore_error {
-            diagnostics_buffer.push("error", "AUDIO_OUTPUT_RESTORE_FAILED", error);
+            let _ = error;
+            diagnostics_buffer.health(None, "audio-restore", false, "AUDIO_OUTPUT_RESTORE_FAILED");
+        } else if had_audio_journal {
+            diagnostics_buffer.record("info", "AUDIO_OUTPUT_RESTORE_SUCCEEDED", None);
         }
         let diagnostics: SharedDiagnosticBuffer = Arc::new(Mutex::new(diagnostics_buffer));
         if let Some(error) = display_restore_error {
+            diagnostics.lock().unwrap().health(
+                None,
+                "display-restore",
+                false,
+                "DISPLAY_RESTORE_FAILED",
+            );
+            let _ = error;
+        } else if had_display_journal {
             diagnostics
                 .lock()
                 .unwrap()
-                .push("error", "DISPLAY_RESTORE_FAILED", error);
+                .record("info", "DISPLAY_RESTORE_SUCCEEDED", None);
         }
         let pairing_store: SharedPairingStore =
             Arc::new(Mutex::new(PairingStore::load(&base_dir)?));
         let mut session_registry = SessionRegistry::default();
         session_registry.set_signal(Arc::clone(&state_signal));
+        session_registry.set_diagnostics(Arc::clone(&diagnostics));
         let sessions: SharedSessionRegistry = Arc::new(Mutex::new(session_registry));
         let mut pending_request_store = PendingRemoteRequestStore::default();
         pending_request_store.set_signal(Arc::clone(&state_signal));
@@ -84,6 +98,14 @@ impl RuntimeService {
         let signaling: SharedSignalingState = Arc::new(Mutex::new(SignalingState::default()));
         let transport_status: SharedTransportStatusState =
             Arc::new(Mutex::new(TransportStatusState::default()));
+        video_streams
+            .lock()
+            .unwrap()
+            .set_diagnostics(Arc::clone(&diagnostics));
+        transport_status
+            .lock()
+            .unwrap()
+            .set_diagnostics(Arc::clone(&diagnostics));
         let device_identity = default_host_identity(
             host_identity.device_id.clone(),
             host_identity.display_name.clone(),
@@ -91,11 +113,19 @@ impl RuntimeService {
             host_identity.app_version.clone(),
         );
         let control_state = ControlPlaneState {
+            diagnostics: Arc::clone(&diagnostics),
             host_identity: device_identity.clone(),
             advertised_presence: DevicePresence {
                 identity: Some(device_identity),
                 lan_address: String::new(),
-                control_port: DEFAULT_CONTROL_PORT as u32,
+                control_port: std::env::var("AKADESK_CONTROL_PORT")
+                    .ok()
+                    .map(|p| p.parse::<u16>())
+                    .transpose()
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "Invalid AKADESK_CONTROL_PORT")
+                    })?
+                    .unwrap_or(DEFAULT_CONTROL_PORT) as u32,
                 paired: false,
                 reachable: true,
                 last_seen_ms: crate::pairing::now_ms(),
@@ -160,13 +190,7 @@ impl RuntimeService {
     }
 
     pub fn reap_finished_session(&self) -> io::Result<()> {
-        let result = crate::control::reap_finished_session(&self.control_state);
-        if let Err(error) = &result {
-            if let Ok(mut diagnostics) = self.diagnostics.lock() {
-                diagnostics.push("error", "SESSION_OUTPUT_RESTORE_FAILED", error.to_string());
-            }
-        }
-        result
+        crate::control::reap_finished_session(&self.control_state)
     }
 
     pub fn sessions(&self) -> &SharedSessionRegistry {
@@ -329,12 +353,14 @@ impl RuntimeService {
         DiagnosticsResponse {
             entries: self.diagnostic_entries(),
             error: None,
+            snapshot: self.diagnostics.lock().ok().map(|b| b.snapshot()),
         }
     }
 
     pub fn ipc_diagnostics_changed(&self) -> DiagnosticsChanged {
         DiagnosticsChanged {
             entries: self.diagnostic_entries(),
+            snapshot: self.diagnostics.lock().ok().map(|b| b.snapshot()),
         }
     }
 
@@ -406,9 +432,14 @@ impl RuntimeService {
 impl RuntimeService {
     fn runtime_status_snapshot(&self) -> RuntimeStatusSnapshot {
         let now = crate::pairing::now_ms();
+        let degraded = self
+            .diagnostics
+            .lock()
+            .map(|d| d.snapshot().degraded)
+            .unwrap_or(true);
         let Ok(sessions) = self.sessions.lock() else {
             return RuntimeStatusSnapshot {
-                state_label: "READY".to_string(),
+                state_label: "DEGRADED".to_string(),
                 active_session_id: None,
                 updated_at_ms: now,
                 active_started_at_ms: 0,
@@ -416,15 +447,22 @@ impl RuntimeService {
         };
         let Some(session) = sessions.active.as_ref() else {
             return RuntimeStatusSnapshot {
-                state_label: "READY".to_string(),
+                state_label: if degraded { "DEGRADED" } else { "READY" }.to_string(),
                 active_session_id: None,
                 updated_at_ms: now,
                 active_started_at_ms: 0,
             };
         };
+        let label = if degraded {
+            "DEGRADED"
+        } else if session.closed_at_ms > 0 {
+            "READY"
+        } else {
+            runtime_state_label_for_session_state(session.state)
+        };
         RuntimeStatusSnapshot {
-            state_label: runtime_state_label_for_session_state(session.state).to_string(),
-            active_session_id: Some(session.session_id.0.clone()),
+            state_label: label.to_string(),
+            active_session_id: (session.closed_at_ms == 0).then(|| session.session_id.0.clone()),
             updated_at_ms: session.updated_at_ms,
             active_started_at_ms: session.created_at_ms,
         }
@@ -480,5 +518,70 @@ impl From<crate::video::VideoStreamSnapshot> for IpcVideoStreamSnapshot {
             latest_error: value.latest_error,
             updated_at_ms: value.updated_at_ms,
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn runtime_status_and_ipc_summary_follow_actual_transport_transitions() {
+        let path = std::env::temp_dir().join(format!(
+            "akadesk-m8-{}",
+            crate::pairing::generate_pair_token()
+        ));
+        let service = RuntimeService::new_in(&path).unwrap();
+        let id = service
+            .sessions
+            .lock()
+            .unwrap()
+            .activate_preparing(
+                "".into(),
+                "owner".into(),
+                "host".into(),
+                "".into(),
+                Default::default(),
+            )
+            .unwrap()
+            .session_id;
+        service.sessions.lock().unwrap().mark_streaming(&id);
+        let mut transport = service.control_state.transport_status.lock().unwrap();
+        transport.begin_session(id.clone());
+        transport.record_peer_connection_state(&id, "Connected".into());
+        transport.record_peer_connection_state(&id, "Disconnected".into());
+        assert_eq!(
+            service
+                .runtime_status_response()
+                .status
+                .unwrap()
+                .state_label,
+            "DEGRADED"
+        );
+        assert!(service.diagnostics_response().snapshot.unwrap().degraded);
+        transport.record_peer_connection_state(&id, "Connected".into());
+        drop(transport);
+        assert_eq!(
+            service
+                .runtime_status_response()
+                .status
+                .unwrap()
+                .state_label,
+            "STREAMING"
+        );
+        service.stop_session(&id).unwrap();
+        let summary = service.diagnostics_response().snapshot.unwrap();
+        assert_eq!(
+            summary.last_session_closed_event.unwrap().code,
+            "SESSION_CLOSED"
+        );
+        assert!(!summary.degraded);
+        assert!(service
+            .runtime_status_response()
+            .status
+            .unwrap()
+            .active_session_id
+            .is_none());
+        drop(service);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

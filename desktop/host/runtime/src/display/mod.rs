@@ -183,7 +183,12 @@ mod tests {
         f.data.lock().unwrap().fail = 1;
         assert!(restarted.recover().is_err());
         assert!(restarted.journal.exists());
-        restarted.recover().unwrap();
+        // An ordinary viewing session may never have prepared display control.
+        // Its cleanup must retry the startup journal rather than report success.
+        f.data.lock().unwrap().fail = 1;
+        assert!(restarted.finish("view-only").is_err());
+        assert!(restarted.needs_restore("view-only"));
+        restarted.finish("view-only").unwrap();
         assert_eq!(f.data.lock().unwrap().current, original());
         assert!(!restarted.journal.exists());
     }
@@ -476,6 +481,9 @@ impl DisplayState {
     }
     pub fn finish(&mut self, id: &str) -> Result<(), String> {
         let Some(active) = self.active.as_ref().filter(|a| a.session_id == id) else {
+            if self.active.is_none() {
+                return self.recover();
+            }
             return Ok(());
         };
         if active.journaled {
@@ -498,5 +506,13 @@ impl DisplayState {
         self.active = None;
         self.last_restore_error = None;
         Ok(())
+    }
+    pub fn needs_restore(&self, id: &str) -> bool {
+        if self.active.is_none() {
+            return self.journal.exists();
+        }
+        self.active
+            .as_ref()
+            .is_some_and(|a| a.session_id == id && a.journaled)
     }
 }

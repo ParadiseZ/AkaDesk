@@ -13,7 +13,7 @@ const route = useRoute();
 onMounted(async () => {
   await store.bootstrap();
   const savedRoute = store.shellSettings?.lastRoute;
-  if (route.path === '/remote' && savedRoute && ['/remote', '/settings'].includes(savedRoute)) {
+  if (route.path === '/remote' && savedRoute && ['/remote', '/settings', '/diagnostics'].includes(savedRoute)) {
     await router.replace(savedRoute);
   }
 });
@@ -28,10 +28,12 @@ const activeRole = computed(() => activeSession.value?.role ?? null);
     <button type="button" class="shrink-0 underline" @click="store.clearError">关闭</button>
   </div>
   <ControlledHostSessionWindow
-    v-if="store.snapshot?.desktopUiState === 'SESSION_ACTIVE_VIEW' && activeRole === 'controlled_host' && activeSession"
+    v-if="route.path !== '/diagnostics' && store.snapshot?.desktopUiState === 'SESSION_ACTIVE_VIEW' && activeRole === 'controlled_host' && activeSession"
     :session="activeSession"
-    :streaming="store.snapshot?.runtimeStatusLabel === 'STREAMING'"
+    :streaming="['STREAMING','DEGRADED'].includes(store.snapshot?.runtimeStatusLabel ?? '')"
+    :degraded="store.snapshot?.diagnostics.degraded ?? false"
     @disconnect="store.disconnectSession"
+    @diagnostics="router.push('/diagnostics')"
   />
 
   <div v-else class="grid h-screen grid-cols-[236px_minmax(0,1fr)] overflow-hidden bg-[#eaf4ff]">

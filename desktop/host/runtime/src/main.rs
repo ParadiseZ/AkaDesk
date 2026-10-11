@@ -28,9 +28,8 @@ fn main() -> io::Result<()> {
     let _control_server = spawn_control_server(service.control_state().clone())?;
     let service_for_cleanup = Arc::clone(&service);
     thread::spawn(move || loop {
-        if let Err(err) = service_for_cleanup.reap_finished_session() {
-            eprintln!("session cleanup failed: {err}");
-        }
+        // Structured diagnostics aggregate failures; don't print each cleanup retry.
+        let _ = service_for_cleanup.reap_finished_session();
         thread::sleep(std::time::Duration::from_millis(250));
     });
     eprintln!(

@@ -61,6 +61,7 @@ const MAX_DEFERRED_REMOTE_CANDIDATE_RETRIES: u8 = 8;
 pub struct TransportStatusState {
     active_session_id: Option<String>,
     snapshot: TransportStatusSnapshot,
+    diagnostics: Option<crate::diagnostics::SharedDiagnosticBuffer>,
 }
 
 pub type SharedTransportStatusState = Arc<Mutex<TransportStatusState>>;
@@ -190,7 +191,6 @@ pub fn spawn_h264_webrtc_transport_loop(
                 let media_send_ready = Arc::clone(&media_send_ready_for_state);
                 let input = Arc::clone(&input_for_state);
                 Box::pin(async move {
-                    eprintln!("webrtc peer connection state session={session_id} state={state:?}");
                     media_send_ready.store(
                         matches!(state, RTCPeerConnectionState::Connected),
                         Ordering::Relaxed,
@@ -1115,6 +1115,9 @@ fn build_h264_codec_parameters(h264_fmtp_line: &str) -> RTCRtpCodecParameters {
 }
 
 impl TransportStatusState {
+    pub fn set_diagnostics(&mut self, diagnostics: crate::diagnostics::SharedDiagnosticBuffer) {
+        self.diagnostics = Some(diagnostics);
+    }
     pub fn begin_session(&mut self, session_id: String) {
         self.active_session_id = Some(session_id.clone());
         self.snapshot = TransportStatusSnapshot {
@@ -1131,6 +1134,27 @@ impl TransportStatusState {
         }
         if state.eq_ignore_ascii_case("Connected") {
             self.snapshot.latest_error.clear();
+        }
+        if self.snapshot.peer_connection_state != state {
+            if let Some(diagnostics) = &self.diagnostics {
+                if let Ok(mut d) = diagnostics.lock() {
+                    if state == "Connected" {
+                        d.health(
+                            Some(session_id),
+                            "transport",
+                            true,
+                            "MEDIA_CONNECTION_RECOVERED",
+                        );
+                    } else if state == "Disconnected" || state == "Failed" {
+                        d.health(
+                            Some(session_id),
+                            "transport",
+                            false,
+                            "MEDIA_CONNECTION_INTERRUPTED",
+                        );
+                    }
+                }
+            }
         }
         self.snapshot.peer_connection_state = state;
         self.snapshot.updated_at_ms = now_ms();

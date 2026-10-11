@@ -68,6 +68,7 @@ pub struct VideoStreamSnapshot {
 
 #[derive(Debug, Default)]
 pub struct VideoStreamState {
+    diagnostics: Option<crate::diagnostics::SharedDiagnosticBuffer>,
     active_session_id: Option<String>,
     recent_packets: VecDeque<EncodedVideoPacket>,
     subscribers: Vec<PacketSubscriber>,
@@ -403,6 +404,9 @@ fn encode_runtime_frame(
 }
 
 impl VideoStreamState {
+    pub fn set_diagnostics(&mut self, diagnostics: crate::diagnostics::SharedDiagnosticBuffer) {
+        self.diagnostics = Some(diagnostics);
+    }
     pub fn begin_session(&mut self, session_id: String) {
         if self.active_session_id.as_deref() == Some(session_id.as_str()) {
             self.snapshot.updated_at_ms = now_ms();
@@ -433,6 +437,18 @@ impl VideoStreamState {
         }
         self.snapshot.latest_packet_len = packet.packet_len;
         self.snapshot.latest_frame_source_label = packet.frame_source_label.clone();
+        if !self.snapshot.latest_error.is_empty() {
+            if let Some(diagnostics) = &self.diagnostics {
+                if let Ok(mut d) = diagnostics.lock() {
+                    d.health(
+                        Some(&packet.session_id),
+                        "video",
+                        true,
+                        "MEDIA_STREAM_RECOVERED",
+                    );
+                }
+            }
+        }
         self.snapshot.latest_error.clear();
         self.snapshot.updated_at_ms = packet.created_at_ms;
         self.recent_packets.push_back(packet.clone());
@@ -478,6 +494,19 @@ impl VideoStreamState {
     pub fn record_error(&mut self, session_id: &str, error: String) {
         if self.active_session_id.as_deref() != Some(session_id) {
             return;
+        }
+        if !error.is_empty() && self.snapshot.latest_error != error {
+            if let Some(diagnostics) = &self.diagnostics {
+                if let Ok(mut d) = diagnostics.lock() {
+                    d.health(Some(session_id), "video", false, "MEDIA_STREAM_FAILED");
+                }
+            }
+        } else if error.is_empty() && !self.snapshot.latest_error.is_empty() {
+            if let Some(diagnostics) = &self.diagnostics {
+                if let Ok(mut d) = diagnostics.lock() {
+                    d.health(Some(session_id), "video", true, "MEDIA_STREAM_RECOVERED");
+                }
+            }
         }
         self.snapshot.latest_error = error;
         self.snapshot.updated_at_ms = now_ms();

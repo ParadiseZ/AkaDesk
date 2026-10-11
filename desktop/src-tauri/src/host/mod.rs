@@ -12,6 +12,7 @@ use std::time::Duration;
 
 #[derive(Debug)]
 pub struct HostSnapshotBundle {
+    pub generation: u64,
     pub runtime_status: RuntimeStatusResponse,
     pub capability_snapshot: CapabilitySnapshotResponse,
     pub host_overview: HostOverviewResponse,
@@ -20,6 +21,7 @@ pub struct HostSnapshotBundle {
 
 #[derive(Debug, Default)]
 pub struct HostSupervisor {
+    generation: u64,
     pub ready: bool,
     pub ipc_name: String,
     child: Option<Child>,
@@ -33,6 +35,7 @@ impl HostSupervisor {
             ipc_name: String::new(),
             child: None,
             resource_dir: Some(resource_dir),
+            generation: 0,
         }
     }
     pub fn ensure_started(&mut self) -> io::Result<()> {
@@ -55,6 +58,7 @@ impl HostSupervisor {
         prepend_path_env(&mut command, &ffmpeg_bin_dir);
 
         self.child = Some(command.spawn()?);
+        self.generation += 1;
         let mut client = self.connect_client(Duration::from_secs(5))?;
         let _ = client.get_runtime_status()?;
         self.ready = true;
@@ -65,6 +69,7 @@ impl HostSupervisor {
         self.ensure_started()?;
         let mut client = self.connect_client(Duration::from_secs(2))?;
         Ok(HostSnapshotBundle {
+            generation: self.generation,
             runtime_status: client.get_runtime_status()?,
             capability_snapshot: client.get_capability_snapshot()?,
             host_overview: client.get_host_overview()?,

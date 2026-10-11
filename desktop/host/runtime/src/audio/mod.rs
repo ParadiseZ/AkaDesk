@@ -40,6 +40,12 @@ pub struct AudioStreamState {
 pub type SharedAudioStreamState = Arc<Mutex<AudioStreamState>>;
 
 impl AudioStreamState {
+    pub fn needs_restore(&self, id: &str) -> bool {
+        if self.active.is_none() && self.session_id.is_empty() {
+            return self.journal_path.exists();
+        }
+        self.session_id == id && (self.active.is_some() || self.journal_path.exists())
+    }
     pub fn new(base_dir: &Path) -> Self {
         Self {
             journal_path: base_dir.join("audio_restore.json"),
@@ -326,6 +332,19 @@ pub fn finish_audio_session(
             .as_ref()
             .is_none_or(|a| a.session_id != session_id)
         {
+            #[cfg(windows)]
+            if state.active.is_none()
+                && (state.session_id == session_id || state.session_id.is_empty())
+                && state.journal_path.exists()
+            {
+                let parent = state
+                    .journal_path
+                    .parent()
+                    .ok_or("Missing audio journal parent")?;
+                recover_audio_output(parent)?;
+                state.latest_error.clear();
+                state.last_restore_result = "Audio output restored".into();
+            }
             return Ok(());
         }
         state.packets.clear();
@@ -456,5 +475,24 @@ mod tests {
             .unwrap()
             .stop
             .load(Ordering::Acquire));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn unprepared_cleanup_does_not_hide_a_failed_startup_restore() {
+        let directory = std::env::temp_dir().join(format!(
+            "akadesk-audio-recovery-{}",
+            crate::pairing::generate_pair_token()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let journal = directory.join("audio_restore.json");
+        std::fs::write(&journal, b"invalid journal").unwrap();
+        let streams = Arc::new(Mutex::new(AudioStreamState::new(&directory)));
+        assert!(streams.lock().unwrap().needs_restore("view-only"));
+        assert!(finish_audio_session(&streams, "view-only").is_err());
+        assert!(journal.exists());
+        std::fs::remove_file(&journal).unwrap();
+        finish_audio_session(&streams, "view-only").unwrap();
+        assert!(!streams.lock().unwrap().needs_restore("view-only"));
+        std::fs::remove_dir(&directory).unwrap();
     }
 }

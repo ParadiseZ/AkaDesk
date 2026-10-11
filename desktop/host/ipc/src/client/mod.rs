@@ -15,7 +15,7 @@ use crate::types::{
 };
 use interprocess::local_socket::{prelude::*, GenericFilePath, GenericNamespaced, Stream};
 use prost::Message;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct IpcClient {
     stream: Stream,
     request_counter: u64,
+    unusable: bool,
 }
 
 impl IpcClient {
@@ -36,6 +37,7 @@ impl IpcClient {
         Ok(Self {
             stream,
             request_counter: 0,
+            unusable: false,
         })
     }
 
@@ -168,6 +170,12 @@ impl IpcClient {
         Req: Message,
         Res: Message + Default,
     {
+        if self.unusable {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "IPC client must reconnect",
+            ));
+        }
         self.request_counter += 1;
         let envelope = IpcEnvelope {
             request_id: format!("req-{}", self.request_counter),
@@ -176,17 +184,126 @@ impl IpcClient {
             payload: payload.encode_to_vec(),
             timestamp_ms: now_ms(),
         };
-        write_envelope(&mut self.stream, &envelope)?;
-        loop {
-            let response = read_envelope(&mut self.stream)?;
-            if response.message_type == response_type
-                && response.request_id == envelope.request_id
-                && response.kind == IpcMessageKind::Response as i32
-            {
-                return Res::decode(&response.payload[..])
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()));
+        self.stream.set_nonblocking(true)?;
+        let result = (|| {
+            let mut stream = DeadlineIo {
+                inner: &mut self.stream,
+                deadline: std::time::Instant::now() + Duration::from_secs(5),
+            };
+            write_envelope(&mut stream, &envelope)?;
+            loop {
+                let response = read_envelope(&mut stream)?;
+                if response.message_type == response_type
+                    && response.request_id == envelope.request_id
+                    && response.kind == IpcMessageKind::Response as i32
+                {
+                    return Res::decode(&response.payload[..]).map_err(|err| {
+                        io::Error::new(io::ErrorKind::InvalidData, err.to_string())
+                    });
+                }
+            }
+        })();
+        let reset = self.stream.set_nonblocking(false);
+        self.unusable = result.is_err() || reset.is_err();
+        reset?;
+        result
+    }
+}
+
+// Preserve partial frames while bounding the entire request, including streams
+// that keep delivering unrelated events. After timeout the caller must reconnect.
+struct DeadlineIo<T> {
+    inner: T,
+    deadline: std::time::Instant,
+}
+fn retry_until<T>(
+    deadline: std::time::Instant,
+    mut action: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "IPC request timed out",
+            ));
+        }
+        match action() {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(2))
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+impl<T: Read> Read for DeadlineIo<T> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        retry_until(self.deadline, || {
+            let count = self.inner.read(bytes)?;
+            // Windows byte-mode PIPE_NOWAIT may complete an empty read with zero bytes.
+            // A closed pipe is still bounded by the same request deadline.
+            if cfg!(windows) && count == 0 && !bytes.is_empty() {
+                Err(io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(count)
+            }
+        })
+    }
+}
+impl<T: Write> Write for DeadlineIo<T> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        retry_until(self.deadline, || {
+            let count = self.inner.write(bytes)?;
+            if cfg!(windows) && count == 0 && !bytes.is_empty() {
+                Err(io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(count)
+            }
+        })
+    }
+    // Named-pipe flush can wait for the remote reader. write_all already handed
+    // every byte to the OS; a remote acknowledgement comes in the response.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    #[test]
+    fn partial_reads_survive_would_block_and_silent_reads_expire() {
+        struct Fragmented {
+            calls: usize,
+            cursor: io::Cursor<Vec<u8>>,
+        }
+        impl Read for Fragmented {
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.calls % 2 == 1 {
+                    Err(io::ErrorKind::WouldBlock.into())
+                } else {
+                    self.cursor.read(&mut b[..1])
+                }
             }
         }
+        let mut stream = DeadlineIo {
+            inner: Fragmented {
+                calls: 0,
+                cursor: io::Cursor::new(vec![1, 2, 3, 4]),
+            },
+            deadline: std::time::Instant::now() + Duration::from_secs(1),
+        };
+        let mut bytes = [0; 4];
+        stream.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        let started = std::time::Instant::now();
+        let error = retry_until::<()>(started + Duration::from_millis(10), || {
+            Err(io::ErrorKind::WouldBlock.into())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 }
 

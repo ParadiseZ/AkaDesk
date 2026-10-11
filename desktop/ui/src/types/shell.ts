@@ -61,6 +61,24 @@ export interface ShellMessage {
   code: string;
   message: string;
   createdAtMs: number;
+  eventId: string;
+  category: string;
+  sessionId: string | null;
+  repeatCount: number;
+  lastSeenMs: number;
+  suggestedAction: string;
+  retryable: boolean;
+}
+
+export interface DiagnosticSnapshotView {
+  lastError: ShellMessage | null;
+  lastWarning: ShellMessage | null;
+  lastDegradedEvent: ShellMessage | null;
+  lastDisplayRestoreResult: ShellMessage | null;
+  lastAudioRestoreResult: ShellMessage | null;
+  lastSessionClosedEvent: ShellMessage | null;
+  degraded: boolean;
+  updatedAtMs: number;
 }
 
 export interface IncomingRequestPreview {
@@ -88,6 +106,7 @@ export interface ShellSnapshot {
   hostOverview: HostOverviewView;
   shellSettings: ShellSettings;
   messages: ShellMessage[];
+  diagnostics: DiagnosticSnapshotView;
   incomingRequest: IncomingRequestPreview | null;
   activeSession: ActiveSessionPresentation | null;
   updatedAtMs: number;

@@ -7,10 +7,12 @@ import { Button } from "@/components/ui/button";
 const props = defineProps<{
   session: ActiveSessionPresentation;
   streaming: boolean;
+  degraded: boolean;
 }>();
 
 const emit = defineEmits<{
   disconnect: [];
+  diagnostics: [];
 }>();
 
 const now = ref(Date.now());
@@ -65,10 +67,11 @@ const elapsedLabel = computed(() => {
               <strong class="block text-base">{{ session.peerName }}</strong>
               <span class="inline-flex items-center gap-1 text-xs text-slate-500">
                 <MonitorDot class="size-3.5" />
-                {{ streaming ? "屏幕共享中" : "正在建立连接" }}
+                {{ degraded ? "连接异常，等待恢复" : streaming ? "屏幕共享中" : "正在建立连接" }}
               </span>
             </div>
-            <span class="text-sm text-slate-500">连接时长 {{ elapsedLabel }} · 当前不支持鼠标键盘操作</span>
+            <span class="text-sm text-slate-500">连接时长 {{ elapsedLabel }}</span>
+            <Button variant="outline" class="h-8" @click="emit('diagnostics')">查看诊断</Button>
           </div>
           <Button variant="outline" class="h-10 border-slate-300 px-4" @click="emit('disconnect')">
             停止共享

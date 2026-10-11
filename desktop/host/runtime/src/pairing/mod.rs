@@ -175,6 +175,9 @@ pub struct PendingChallenge {
 pub type SharedPairingStore = Arc<Mutex<PairingStore>>;
 
 pub fn load_runtime_base_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("AKADESK_RUNTIME_DATA_DIR") {
+        return PathBuf::from(path);
+    }
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         return PathBuf::from(local_app_data)
             .join("AkaDesk")

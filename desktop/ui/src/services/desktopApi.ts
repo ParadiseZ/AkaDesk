@@ -16,6 +16,8 @@ const previewSnapshot: ShellSnapshot = {
   shellSettings: { launchOnStartup: false, minimizeToTray: false, notificationsEnabled: false,
     lastRoute: "/remote", lastRemoteDeviceId: "", lastAccessCode: "" },
   messages: [], incomingRequest: null, activeSession: null, updatedAtMs: 0,
+  diagnostics: {lastError:null,lastWarning:null,lastDegradedEvent:null,lastDisplayRestoreResult:null,
+    lastAudioRestoreResult:null,lastSessionClosedEvent:null,degraded:false,updatedAtMs:0},
 };
 
 function command<T>(name: string, args?: Record<string, unknown>): Promise<T> {
@@ -36,6 +38,7 @@ export const desktopApi = {
   respondIncomingRequest: (requestId: string, allow: boolean) =>
     command<ShellSnapshot>("respond_incoming_request", { requestId, allow }),
   disconnectSession: () => command<ShellSnapshot>("disconnect_session"),
+  exportDiagnostics: () => command<string>("export_diagnostics"),
   async onShellError(listener: (error: string) => void): Promise<UnlistenFn> {
     return isTauriRuntime ? listen<string>("shell://error", event => listener(event.payload)) : () => {};
   },

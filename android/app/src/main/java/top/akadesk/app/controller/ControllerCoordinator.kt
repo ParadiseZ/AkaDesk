@@ -773,7 +773,7 @@ class ControllerCoordinator(context: Context) {
                         confirmActiveSessionRecovery(offer.sessionId)
                         val session = ensureWebRtcSession(host, offer.sessionId)
                         session.applyRemoteOffer(offer)
-                        logInfo("Received WebRTC offer for ${host.displayName} session=${offer.sessionId} sdpLen=${offer.sdp.length}")
+                        logInfo("Video connection offer received")
                     }
                 }
 
@@ -796,7 +796,6 @@ class ControllerCoordinator(context: Context) {
                         confirmActiveSessionRecovery(candidate.sessionId)
                         val session = ensureWebRtcSession(host, candidate.sessionId)
                         session.addRemoteIceCandidate(candidate)
-                        logInfo("Received remote ICE candidate for ${host.displayName} session=${candidate.sessionId}")
                     }
                 }
 
@@ -809,17 +808,10 @@ class ControllerCoordinator(context: Context) {
                         confirmActiveSessionRecovery(event.sessionId)
                         val hostStalled = event.latestError.isNotBlank() ||
                             (System.currentTimeMillis() - event.updatedAtMs) >= 2_500L
+                        val videoChanged = activeHostVideoStalled != hostStalled
                         activeHostVideoStalled = hostStalled
-                        activeHostVideoStatus = if (event.latestError.isNotBlank()) {
-                            "Host 出包错误: ${event.latestError}"
-                        } else if (hostStalled) {
-                            "Host 出包疑似停滞，累计 ${event.packetCount} 包 / ${event.keyframeCount} 关键帧"
-                        } else {
-                            "Host 持续出包 ${event.packetCount} 包 / ${event.keyframeCount} 关键帧 / ${event.latestPacketLen}B / ${event.latestFrameSourceLabel}"
-                        }
-                        logInfo(
-                            "Host video stream event session=${event.sessionId} packets=${event.packetCount} keyframes=${event.keyframeCount} latestError=${event.latestError}"
-                        )
+                        activeHostVideoStatus = if (hostStalled) "电脑画面暂时中断" else "电脑画面传输正常"
+                        if (videoChanged) logInfo(if (hostStalled) "Computer video interrupted" else "Computer video recovered")
                     }
                 }
 
@@ -834,17 +826,10 @@ class ControllerCoordinator(context: Context) {
                             event.peerConnectionState.equals("Failed", ignoreCase = true) ||
                             event.peerConnectionState.equals("Disconnected", ignoreCase = true) ||
                             (event.remoteAnswerApplied && event.sentSampleCount == 0L)
+                        val transportChanged = activeHostTransportStalled != transportStalled
                         activeHostTransportStalled = transportStalled
-                        activeHostTransportStatus = if (event.latestError.isNotBlank()) {
-                            "Transport 错误: ${event.latestError}"
-                        } else if (transportStalled) {
-                            "Transport 状态异常: peer=${event.peerConnectionState} / sent=${event.sentSampleCount} / remoteAnswer=${event.remoteAnswerApplied}"
-                        } else {
-                            "Transport 正在发送: peer=${event.peerConnectionState} / sent=${event.sentSampleCount} / remoteAnswer=${event.remoteAnswerApplied} / remoteIce=${event.appliedRemoteCandidateCount}"
-                        }
-                        logInfo(
-                            "Host transport event session=${event.sessionId} peer=${event.peerConnectionState} sent=${event.sentSampleCount} remoteAnswer=${event.remoteAnswerApplied}"
-                        )
+                        activeHostTransportStatus = if (transportStalled) "画面连接暂时异常" else "画面连接正常"
+                        if (transportChanged) logInfo(if (transportStalled) "Media connection interrupted" else "Media connection recovered")
                     }
                 }
 
@@ -1119,9 +1104,6 @@ class ControllerCoordinator(context: Context) {
                         )
                         if (controlSession != null) {
                             controlSession?.sendIceCandidate(sessionId, candidate, sdpMid, sdpMlineIndex)
-                            logInfo("Sent local ICE candidate session=$sessionId")
-                        } else {
-                            logWarn("Queued local ICE candidate session=$sessionId until control reconnect")
                         }
                     }
                 }
@@ -1274,7 +1256,6 @@ class ControllerCoordinator(context: Context) {
                     candidate.sdpMid,
                     candidate.sdpMlineIndex,
                 )
-                logInfo("Re-sent local ICE candidate session=${candidate.sessionId} after control reconnect")
             }
     }
 
@@ -1318,7 +1299,7 @@ class ControllerCoordinator(context: Context) {
         )
         controlReconnectScheduled = true
         mainHandler.postDelayed(controlReconnectRunnable, delayMs)
-        logWarn("Scheduling control reconnect for ${host.displayName} in ${delayMs}ms attempt=$nextAttempt")
+        if (nextAttempt == 1) logWarn("Control connection lost; reconnecting")
     }
 
     private fun clearScheduledControlReconnect() {
@@ -1352,6 +1333,7 @@ class ControllerCoordinator(context: Context) {
     private fun confirmActiveSessionRecovery(sessionId: String) {
         if (pendingRecoveredSessionId != sessionId) return
         clearPendingSessionRecoveryValidation()
+        if (pendingControlReconnectHost != null) logInfo("Control connection recovered")
         clearPendingControlReconnect()
     }
 

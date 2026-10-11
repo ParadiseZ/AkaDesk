@@ -32,7 +32,8 @@ use tungstenite::{accept, Error as WsError, Message as WsMessage};
 pub const DEFAULT_CONTROL_PORT: u16 = 46661;
 
 pub fn reap_finished_session(state: &ControlPlaneState) -> io::Result<()> {
-    let sessions = state.sessions.lock().map_err(session_lock_err)?;
+    let mut sessions = state.sessions.lock().map_err(session_lock_err)?;
+    sessions.expire_control_at(now_ms());
     let Some(snapshot) = sessions
         .active
         .as_ref()
@@ -41,8 +42,17 @@ pub fn reap_finished_session(state: &ControlPlaneState) -> io::Result<()> {
     else {
         return Ok(());
     };
-    // Attempt both releases even if one fails; an audio restore error must not
-    // leave remote keys held, nor should input cleanup prevent audio restoration.
+    let had_audio = state
+        .audio_streams
+        .lock()
+        .map_err(session_lock_err)?
+        .needs_restore(&snapshot.session_id);
+    let had_display = state
+        .display
+        .lock()
+        .map_err(session_lock_err)?
+        .needs_restore(&snapshot.session_id);
+    // Attempt all releases before propagating an error.
     let input_cleanup = state
         .input
         .lock()
@@ -55,9 +65,41 @@ pub fn reap_finished_session(state: &ControlPlaneState) -> io::Result<()> {
         .lock()
         .map_err(session_lock_err)?
         .finish(&snapshot.session_id);
-    input_cleanup.map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-    audio_cleanup.map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-    display_cleanup.map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    if let Ok(mut d) = state.diagnostics.lock() {
+        for (result, had, source, success, failure) in [
+            (
+                &input_cleanup,
+                false,
+                "input-restore",
+                "INPUT_RELEASE_SUCCEEDED",
+                "INPUT_RELEASE_FAILED",
+            ),
+            (
+                &audio_cleanup,
+                had_audio,
+                "audio-restore",
+                "AUDIO_OUTPUT_RESTORE_SUCCEEDED",
+                "AUDIO_OUTPUT_RESTORE_FAILED",
+            ),
+            (
+                &display_cleanup,
+                had_display,
+                "display-restore",
+                "DISPLAY_RESTORE_SUCCEEDED",
+                "DISPLAY_RESTORE_FAILED",
+            ),
+        ] {
+            d.health(
+                None,
+                source,
+                result.is_ok(),
+                if result.is_ok() { success } else { failure },
+            );
+            if had && result.is_ok() {
+                d.record("info", success, Some(&snapshot.session_id));
+            }
+        }
+    }
     state
         .video_streams
         .lock()
@@ -73,11 +115,19 @@ pub fn reap_finished_session(state: &ControlPlaneState) -> io::Result<()> {
         .lock()
         .map_err(transport_status_lock_err)?
         .finish_session(&snapshot.session_id);
-    state
+    let settings_cleanup = state
         .settings
         .lock()
         .map_err(settings_lock_err)?
-        .refresh_after_session_end(&snapshot.session_id)
+        .refresh_after_session_end(&snapshot.session_id);
+    for result in [input_cleanup, audio_cleanup, display_cleanup] {
+        result.map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    }
+    settings_cleanup?;
+    if let Ok(mut d) = state.diagnostics.lock() {
+        d.end_session(&snapshot.session_id);
+    }
+    Ok(())
 }
 
 type SharedControlWebSocket = Arc<SyncSender<WsMessage>>;
@@ -411,6 +461,7 @@ struct SentTransportEventState {
 
 #[derive(Debug, Clone)]
 pub struct ControlPlaneState {
+    pub diagnostics: crate::diagnostics::SharedDiagnosticBuffer,
     pub audio_streams: crate::audio::SharedAudioStreamState,
     pub input: crate::input::SharedInputState,
     pub display: crate::display::SharedDisplayState,
@@ -439,7 +490,7 @@ pub fn spawn_control_server(
             let connection_state = Arc::clone(&shared_state);
             thread::spawn(move || {
                 if let Err(err) = handle_connection(stream, connection_state) {
-                    eprintln!("control websocket connection error: {err}");
+                    let _ = err; // Structured diagnostics own the failure summary.
                 }
             });
         }
@@ -493,6 +544,7 @@ fn handle_connection(stream: TcpStream, state: Arc<ControlPlaneState>) -> io::Re
     );
     let mut session = ConnectionSession {
         peer,
+        connection_id: generate_pair_token(),
         ..ConnectionSession::default()
     };
     // Always run cleanup, including decode errors and rejected messages.
@@ -540,6 +592,15 @@ fn handle_connection(stream: TcpStream, state: Arc<ControlPlaneState>) -> io::Re
         }
     })();
     stopping.store(true, Ordering::Relaxed);
+    if let Some(controller) = session.authenticated_controller_device_id.as_deref() {
+        if let Ok(mut registry) = state.sessions.lock() {
+            if let Some(id) = registry.lose_control(controller, &session.connection_id) {
+                if let Ok(mut input) = state.input.lock() {
+                    let _ = input.release_held(&id);
+                }
+            }
+        }
+    }
     if let Some(pending) = session.pending_confirmation.take() {
         if let Ok(mut requests) = state.pending_remote_requests.lock() {
             requests.cancel(&pending.request_id);
@@ -557,6 +618,7 @@ fn handle_connection(stream: TcpStream, state: Arc<ControlPlaneState>) -> io::Re
 
 #[derive(Debug, Default)]
 struct ConnectionSession {
+    connection_id: String,
     peer: String,
     authenticated_controller_device_id: Option<String>,
     pending_challenge: Option<PendingChallenge>,
@@ -632,6 +694,13 @@ fn handle_envelope(
                     active_session_id,
                     &controller_device_id,
                 )?;
+                if let Ok(mut registry) = state.sessions.lock() {
+                    if let Some(snapshot) =
+                        registry.active_snapshot_for_controller(&controller_device_id)
+                    {
+                        registry.attach_control(&snapshot.session_id, &session.connection_id);
+                    }
+                }
             }
             let ack = ControlHelloAck {
                 request_id: hello.request_id.clone(),
@@ -940,6 +1009,13 @@ fn handle_envelope(
             )
         }
         "HeartbeatPing" => {
+            if let Some(controller) = session.authenticated_controller_device_id.as_deref() {
+                state
+                    .sessions
+                    .lock()
+                    .map_err(session_lock_err)?
+                    .touch_control(controller, &session.connection_id);
+            }
             let ping = HeartbeatPing::decode(&envelope.payload[..]).map_err(decode_err)?;
             let pong = HeartbeatPong {
                 request_id: ping.request_id,
@@ -957,6 +1033,7 @@ fn handle_envelope(
             if session.authenticated_controller_device_id.is_none() {
                 let host_settings = state.settings.lock().map_err(settings_lock_err)?.current();
                 return send_start_session_rejected(
+                    &state.diagnostics,
                     websocket,
                     &envelope.request_id,
                     String::new(),
@@ -968,6 +1045,7 @@ fn handle_envelope(
             let host_settings = state.settings.lock().map_err(settings_lock_err)?.current();
             if !host_settings.allow_remote_assistance {
                 return send_start_session_rejected(
+                    &state.diagnostics,
                     websocket,
                     &envelope.request_id,
                     String::new(),
@@ -979,6 +1057,7 @@ fn handle_envelope(
             }
             let Some(mut intent) = request.intent else {
                 return send_start_session_rejected(
+                    &state.diagnostics,
                     websocket,
                     &envelope.request_id,
                     String::new(),
@@ -999,6 +1078,7 @@ fn handle_envelope(
             }
             if intent.controller_device_id != authenticated_controller {
                 return send_start_session_rejected(
+                        &state.diagnostics,
                     websocket,
                     &envelope.request_id,
                     intent.session_id,
@@ -1013,6 +1093,7 @@ fn handle_envelope(
             }
             if intent.controlled_device_id != state.host_identity.device_id {
                 return send_start_session_rejected(
+                    &state.diagnostics,
                     websocket,
                     &envelope.request_id,
                     intent.session_id,
@@ -1027,6 +1108,7 @@ fn handle_envelope(
                 || !intent.target_display_id.is_empty()
             {
                 return send_start_session_rejected(
+                    &state.diagnostics,
                     websocket,
                     &envelope.request_id,
                     intent.session_id,
@@ -1040,6 +1122,7 @@ fn handle_envelope(
             if let Some(audio) = &intent.audio {
                 if let Err(error) = crate::audio::audio_spec(audio) {
                     return send_start_session_rejected(
+                        &state.diagnostics,
                         websocket,
                         &envelope.request_id,
                         intent.session_id,
@@ -1058,6 +1141,7 @@ fn handle_envelope(
                 .is_some_and(|s| s.closed_at_ms == 0)
             {
                 return send_start_session_rejected(
+                    &state.diagnostics,
                     websocket,
                     &envelope.request_id,
                     intent.session_id,
@@ -1071,6 +1155,7 @@ fn handle_envelope(
                 Ok(prepared) => prepared,
                 Err(err) => {
                     return send_start_session_rejected(
+                        &state.diagnostics,
                         websocket,
                         &envelope.request_id,
                         intent.session_id,
@@ -1078,14 +1163,6 @@ fn handle_envelope(
                     )
                 }
             };
-            eprintln!(
-                "prepared H.264 session encoder={} packet_len={} keyframe={} fmtp={} frame_source={}",
-                prepared.encoder_name,
-                prepared.smoke_packet_len,
-                prepared.smoke_keyframe,
-                prepared.rtp_fmtp_line,
-                prepared.frame_source_label
-            );
             let prepared_spec = prepared.spec.clone();
 
             let snapshot = state
@@ -1101,6 +1178,7 @@ fn handle_envelope(
                 );
             let Some(snapshot) = snapshot else {
                 return send_start_session_rejected(
+                    &state.diagnostics,
                     websocket,
                     &envelope.request_id,
                     String::new(),
@@ -1110,6 +1188,11 @@ fn handle_envelope(
                     ),
                 );
             };
+            state
+                .sessions
+                .lock()
+                .map_err(session_lock_err)?
+                .attach_control(&snapshot.session_id, &session.connection_id);
             state
                 .signaling
                 .lock()
@@ -1145,6 +1228,7 @@ fn handle_envelope(
                         signaling.finish_session(&snapshot.session_id);
                     }
                     return send_start_session_rejected(
+                        &state.diagnostics,
                         websocket,
                         &envelope.request_id,
                         snapshot.session_id,
@@ -1167,6 +1251,7 @@ fn handle_envelope(
                         signaling.finish_session(&snapshot.session_id);
                     }
                     return send_start_session_rejected(
+                        &state.diagnostics,
                         websocket,
                         &envelope.request_id,
                         snapshot.session_id,
@@ -1192,6 +1277,7 @@ fn handle_envelope(
                         signaling.finish_session(&snapshot.session_id);
                     }
                     return send_start_session_rejected(
+                        &state.diagnostics,
                         websocket,
                         &envelope.request_id,
                         snapshot.session_id,
@@ -1202,13 +1288,6 @@ fn handle_envelope(
                     );
                 }
             };
-            eprintln!(
-                "continuous H.264 stream prepared session={} packet_len={} fmtp={} frame_source={}",
-                streaming.snapshot.session_id,
-                streaming.first_packet_len,
-                streaming.rtp_fmtp_line,
-                streaming.first_frame_source_label
-            );
             if let Some(preference) = audio_preference {
                 let audio_result = crate::audio::spawn_audio_stream(
                     Arc::clone(&state.sessions),
@@ -1238,6 +1317,7 @@ fn handle_envelope(
                             .mark_failed(&snapshot.session_id);
                         let _ = reap_finished_session(state);
                         return send_start_session_rejected(
+                            &state.diagnostics,
                             websocket,
                             &envelope.request_id,
                             snapshot.session_id,
@@ -1271,6 +1351,7 @@ fn handle_envelope(
                         .mark_failed(&snapshot.session_id);
                     let _ = reap_finished_session(state);
                     return send_start_session_rejected(
+                        &state.diagnostics,
                         websocket,
                         &envelope.request_id,
                         snapshot.session_id,
@@ -1284,11 +1365,20 @@ fn handle_envelope(
                 let mut registry = state.sessions.lock().map_err(session_lock_err)?;
                 if registry.should_keep_running(&snapshot.session_id) {
                     let mut display = state.display.lock().map_err(session_lock_err)?;
-                    if let Err(error) = display.prepare(&snapshot.session_id) {
-                        eprintln!("display preparation unavailable: {error}");
+                    if display.prepare(&snapshot.session_id).is_err() {
+                        if let Ok(mut d) = state.diagnostics.lock() {
+                            d.record(
+                                "warn",
+                                "DISPLAY_PREPARATION_FAILED",
+                                Some(&snapshot.session_id),
+                            );
+                        }
                     } else if let Some((display_id, history)) =
                         display.baseline(&snapshot.session_id)
                     {
+                        if let Ok(mut d) = state.diagnostics.lock() {
+                            d.health(None, "display-restore", true, "DISPLAY_RESTORE_SUCCEEDED");
+                        }
                         let active = registry.active.as_mut().unwrap();
                         active.target_display_id = Some(display_id);
                         active.history_display_mode = Some(history);
@@ -1318,15 +1408,7 @@ fn handle_envelope(
                 io::Error::new(io::ErrorKind::Other, err)
             })?;
             match transport_startup.recv_timeout(Duration::from_millis(1_500)) {
-                Ok(Ok(transport)) => {
-                    eprintln!(
-                        "webrtc transport prepared session={} local_offer_sdp_len={} local_candidates={} fmtp={}",
-                        snapshot.session_id,
-                        transport.local_offer_sdp_len,
-                        transport.local_candidate_count,
-                        streaming.rtp_fmtp_line
-                    );
-                }
+                Ok(Ok(_transport)) => {}
                 Ok(Err(err)) => {
                     let _ = state
                         .sessions
@@ -1343,6 +1425,7 @@ fn handle_envelope(
                         signaling.finish_session(&snapshot.session_id);
                     }
                     return send_start_session_rejected(
+                        &state.diagnostics,
                         websocket,
                         &envelope.request_id,
                         snapshot.session_id,
@@ -1365,6 +1448,7 @@ fn handle_envelope(
                         signaling.finish_session(&snapshot.session_id);
                     }
                     return send_start_session_rejected(
+                        &state.diagnostics,
                         websocket,
                         &envelope.request_id,
                         snapshot.session_id,
@@ -1390,6 +1474,7 @@ fn handle_envelope(
                         signaling.finish_session(&snapshot.session_id);
                     }
                     return send_start_session_rejected(
+                        &state.diagnostics,
                         websocket,
                         &envelope.request_id,
                         snapshot.session_id,
@@ -1454,6 +1539,7 @@ fn handle_envelope(
                 )
             };
             // Stop/reap uses the same session -> display lock order.
+            let applying = change.is_some();
             let mut registry = state.sessions.lock().map_err(session_lock_err)?;
             let authorized = registry.active.as_ref().is_some_and(|s| {
                 s.session_id.0 == id
@@ -1499,6 +1585,19 @@ fn handle_envelope(
             }
             drop(display);
             drop(registry);
+            if authorized && (applying || result.is_err()) {
+                if let Ok(mut d) = state.diagnostics.lock() {
+                    d.record(
+                        if result.is_ok() { "info" } else { "error" },
+                        if result.is_ok() {
+                            "DISPLAY_SETTINGS_APPLIED"
+                        } else {
+                            "DISPLAY_SETTINGS_FAILED"
+                        },
+                        Some(&id),
+                    );
+                }
+            }
             send_payload_shared(
                 websocket,
                 &envelope.request_id,
@@ -1569,11 +1668,6 @@ fn handle_envelope(
                 .set_remote_answer(answer.clone());
             match store_result {
                 RemoteAnswerStoreResult::Stored => {
-                    eprintln!(
-                        "stored remote WebRTC answer for session {} sdp_len={}",
-                        answer.session_id,
-                        answer.sdp.len()
-                    );
                     flush_local_signaling_events(
                         websocket,
                         &envelope.request_id,
@@ -1581,24 +1675,9 @@ fn handle_envelope(
                         &answer.session_id,
                     )?;
                 }
-                RemoteAnswerStoreResult::Duplicate => {
-                    eprintln!(
-                        "ignoring duplicate remote WebRTC answer for session {}",
-                        answer.session_id
-                    );
-                }
-                RemoteAnswerStoreResult::IgnoredReplacement => {
-                    eprintln!(
-                        "ignoring replacement remote WebRTC answer for session {} after first answer was already stored",
-                        answer.session_id
-                    );
-                }
-                RemoteAnswerStoreResult::InactiveSession => {
-                    eprintln!(
-                        "ignoring WebRtcAnswer for inactive session {}",
-                        answer.session_id
-                    );
-                }
+                RemoteAnswerStoreResult::Duplicate => {}
+                RemoteAnswerStoreResult::IgnoredReplacement => {}
+                RemoteAnswerStoreResult::InactiveSession => {}
             }
             Ok(())
         }
@@ -1618,10 +1697,6 @@ fn handle_envelope(
                 .push_remote_candidate(candidate.clone());
             match store_result {
                 RemoteCandidateStoreResult::Stored => {
-                    eprintln!(
-                        "stored remote ICE candidate for session {}",
-                        candidate.session_id
-                    );
                     flush_local_signaling_events(
                         websocket,
                         &envelope.request_id,
@@ -1629,18 +1704,8 @@ fn handle_envelope(
                         &candidate.session_id,
                     )?;
                 }
-                RemoteCandidateStoreResult::Duplicate => {
-                    eprintln!(
-                        "ignoring duplicate remote ICE candidate for session {}",
-                        candidate.session_id
-                    );
-                }
-                RemoteCandidateStoreResult::InactiveSession => {
-                    eprintln!(
-                        "ignoring IceCandidate for inactive session {}",
-                        candidate.session_id
-                    );
-                }
+                RemoteCandidateStoreResult::Duplicate => {}
+                RemoteCandidateStoreResult::InactiveSession => {}
             }
             Ok(())
         }
@@ -1741,10 +1806,11 @@ fn spawn_signaling_pump(
                     | io::ErrorKind::ConnectionReset
                     | io::ErrorKind::ConnectionAborted
                     | io::ErrorKind::UnexpectedEof => break,
-                    _ => eprintln!(
-                        "control signaling pump failed for session {}: {}",
-                        session_id, err
-                    ),
+                    _ => {
+                        if let Ok(mut d) = state.diagnostics.lock() {
+                            d.record("warn", "CONTROL_DELIVERY_FAILED", Some(&session_id));
+                        }
+                    }
                 }
             }
         }
@@ -1836,10 +1902,15 @@ fn spawn_terminal_session_pump(
                 | io::ErrorKind::ConnectionReset
                 | io::ErrorKind::ConnectionAborted
                 | io::ErrorKind::UnexpectedEof => break,
-                _ => eprintln!(
-                    "control session-state pump failed for session {}: {}",
-                    snapshot.session_id, err
-                ),
+                _ => {
+                    if let Ok(mut d) = state.diagnostics.lock() {
+                        d.record(
+                            "warn",
+                            "CONTROL_DELIVERY_FAILED",
+                            Some(&snapshot.session_id),
+                        );
+                    }
+                }
             },
         }
 
@@ -1942,10 +2013,11 @@ fn spawn_video_stream_event_pump(
                 | io::ErrorKind::ConnectionReset
                 | io::ErrorKind::ConnectionAborted
                 | io::ErrorKind::UnexpectedEof => break,
-                _ => eprintln!(
-                    "control video-stream pump failed for session {}: {}",
-                    session_id, err
-                ),
+                _ => {
+                    if let Ok(mut d) = state.diagnostics.lock() {
+                        d.record("warn", "CONTROL_DELIVERY_FAILED", Some(&session_id));
+                    }
+                }
             },
         }
 
@@ -2054,10 +2126,11 @@ fn spawn_transport_status_event_pump(
                 | io::ErrorKind::ConnectionReset
                 | io::ErrorKind::ConnectionAborted
                 | io::ErrorKind::UnexpectedEof => break,
-                _ => eprintln!(
-                    "control transport-status pump failed for session {}: {}",
-                    session_id, err
-                ),
+                _ => {
+                    if let Ok(mut d) = state.diagnostics.lock() {
+                        d.record("warn", "CONTROL_DELIVERY_FAILED", Some(&session_id));
+                    }
+                }
             },
         }
 
@@ -2109,11 +2182,19 @@ fn pairing_required_error(settings: &crate::settings::HostSettings) -> ErrorInfo
 }
 
 fn send_start_session_rejected(
+    diagnostics: &crate::diagnostics::SharedDiagnosticBuffer,
     websocket: &SharedControlWebSocket,
     request_id: &str,
     session_id: String,
     error: ErrorInfo,
 ) -> io::Result<()> {
+    if let Ok(mut d) = diagnostics.lock() {
+        d.record(
+            "error",
+            &error.code,
+            (!session_id.is_empty()).then_some(session_id.as_str()),
+        );
+    }
     send_payload_shared(
         websocket,
         request_id,
@@ -2126,11 +2207,12 @@ fn send_start_session_rejected(
     )
 }
 
-fn simple_error(code: &str, message: &str) -> ErrorInfo {
+fn simple_error(code: &str, _message: &str) -> ErrorInfo {
+    let (message, _, retryable) = host_ipc::diagnostics::presentation(code);
     ErrorInfo {
         code: code.to_string(),
         message: message.to_string(),
-        retryable: true,
+        retryable,
         detail: String::new(),
     }
 }

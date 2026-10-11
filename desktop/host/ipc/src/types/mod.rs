@@ -1,6 +1,7 @@
 pub type TimestampMs = i64;
 
 include!(concat!(env!("OUT_DIR"), "/akadesk.v1.rs"));
+pub type DiagnosticEntry = DiagnosticEvent;
 
 pub const GET_RUNTIME_STATUS: &str = "GetRuntimeStatus";
 pub const RUNTIME_STATUS_RESPONSE: &str = "RuntimeStatusResponse";

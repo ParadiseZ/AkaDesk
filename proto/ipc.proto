@@ -118,11 +118,27 @@ message VideoStreamSnapshot {
   int64 updated_at_ms = 7;
 }
 
-message DiagnosticEntry {
+message DiagnosticEvent {
   string level = 1;
   string code = 2;
   string message = 3;
   int64 created_at_ms = 4;
+  string event_id = 5;
+  string category = 6;
+  optional string session_id = 7;
+  uint32 repeat_count = 8;
+  int64 last_seen_ms = 9;
+}
+
+message DiagnosticSnapshot {
+  optional DiagnosticEvent last_error = 1;
+  optional DiagnosticEvent last_warning = 2;
+  optional DiagnosticEvent last_degraded_event = 3;
+  optional DiagnosticEvent last_display_restore_result = 4;
+  optional DiagnosticEvent last_audio_restore_result = 5;
+  optional DiagnosticEvent last_session_closed_event = 6;
+  int64 updated_at_ms = 7;
+  bool degraded = 8;
 }
 
 message GetHostOverviewRequest {
@@ -178,10 +194,12 @@ message GetDiagnosticsRequest {
 }
 
 message DiagnosticsResponse {
-  repeated DiagnosticEntry entries = 1;
+  repeated DiagnosticEvent entries = 1;
   optional ErrorInfo error = 2;
+  optional DiagnosticSnapshot snapshot = 3;
 }
 
 message DiagnosticsChanged {
-  repeated DiagnosticEntry entries = 1;
+  repeated DiagnosticEvent entries = 1;
+  optional DiagnosticSnapshot snapshot = 2;
 }

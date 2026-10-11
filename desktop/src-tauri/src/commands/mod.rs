@@ -9,7 +9,7 @@ use tauri::{AppHandle, Emitter, State};
 pub fn bootstrap_shell(state: State<Arc<AppState>>) -> Result<ShellSnapshot, String> {
     state.bootstrap_snapshot().map_err(|err| {
         state.log_command_error("BOOTSTRAP_SHELL_FAILED", &err);
-        err
+        "电脑服务暂不可用，请稍候重试".into()
     })
 }
 
@@ -17,7 +17,7 @@ pub fn bootstrap_shell(state: State<Arc<AppState>>) -> Result<ShellSnapshot, Str
 pub fn refresh_shell(state: State<Arc<AppState>>) -> Result<ShellSnapshot, String> {
     state.bootstrap_snapshot().map_err(|err| {
         state.log_command_error("REFRESH_SHELL_FAILED", &err);
-        err
+        "电脑服务暂不可用，请稍候重试".into()
     })
 }
 
@@ -115,6 +115,14 @@ fn emit_snapshot(app: &AppHandle, snapshot: &ShellSnapshot) {
     let _ = app.emit("shell://state", snapshot);
 }
 
+#[tauri::command]
+pub fn export_diagnostics(state: State<Arc<AppState>>) -> Result<String, String> {
+    state.export_diagnostics().map_err(|error| {
+        state.log_command_error("DIAGNOSTIC_EXPORT_FAILED", &error);
+        error
+    })
+}
+
 fn snapshot_command<F>(
     app: &AppHandle,
     state: State<Arc<AppState>>,
@@ -131,7 +139,7 @@ where
         }
         Err(err) => {
             state.log_command_error(error_code, &err);
-            Err(err)
+            Err(host_ipc::diagnostics::presentation(error_code).0.into())
         }
     }
 }

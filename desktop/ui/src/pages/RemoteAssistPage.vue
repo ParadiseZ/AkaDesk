@@ -134,7 +134,7 @@ async function copyLocalDeviceInfo() {
             </section>
 
             <section class="px-5 py-4 text-sm text-slate-500">
-              当前版本支持 Android 连接此电脑并查看屏幕；桌面主控与鼠标键盘输入尚未开放。
+              支持 Android 查看电脑画面、接收电脑声音、操作鼠标键盘和调整显示设置。
             </section>
           </div>
         </TabsContent>

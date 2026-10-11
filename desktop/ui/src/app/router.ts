@@ -1,5 +1,5 @@
 import { createRouter, createWebHashHistory } from "vue-router";
-import { Files, RadioTower, Settings2 } from "lucide-vue-next";
+import { Files, RadioTower, Settings2, Activity } from "lucide-vue-next";
 const routes = [
       {
         path: "/",
@@ -17,6 +17,12 @@ const routes = [
         props: { title: '文件传输', description: '当前版本尚未开放文件传输。' },
         icon: Files,
         title:'文件传输',
+      },
+      {
+        path: "/diagnostics",
+        component: () => import('@/pages/DiagnosticsPage.vue'),
+        icon: Activity,
+        title: '诊断',
       },
       {
         path: "/settings",

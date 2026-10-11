@@ -15,6 +15,9 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
+            let app_data_dir = std::env::var_os("AKADESK_SHELL_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or(app_data_dir);
             let state = Arc::new(AppState::load(app_data_dir, app.path().resource_dir()?)?);
             if let Err(err) = state.ensure_host_started() {
                 state.log_command_error("HOST_START_FAILED", &err);
@@ -32,7 +35,8 @@ pub fn run() {
             commands::queue_remote_connect,
             commands::preview_incoming_request,
             commands::respond_incoming_request,
-            commands::disconnect_session
+            commands::disconnect_session,
+            commands::export_diagnostics
         ])
         .build(tauri::generate_context!())
         .expect("failed to build AkaDesk desktop shell");
@@ -44,15 +48,25 @@ pub fn run() {
 }
 
 fn start_sync_loop(app: tauri::AppHandle, state: Arc<AppState>) {
-    std::thread::spawn(move || loop {
-        match state.bootstrap_snapshot() {
-            Ok(snapshot) => {
-                let _ = app.emit("shell://state", snapshot);
+    std::thread::spawn(move || {
+        let mut retry_delay = 2u64;
+        loop {
+            if state.is_shutting_down() {
+                break;
             }
-            Err(error) => {
-                let _ = app.emit("shell://error", error);
+            match state.bootstrap_snapshot() {
+                Ok(snapshot) => {
+                    state.record_connection_state(true);
+                    retry_delay = 2;
+                    let _ = app.emit("shell://state", snapshot);
+                }
+                Err(_error) => {
+                    state.record_connection_state(false);
+                    let _ = app.emit("shell://error", "电脑服务连接中断，正在重新连接");
+                    retry_delay = (retry_delay * 2).min(8);
+                }
             }
+            std::thread::sleep(Duration::from_secs(retry_delay));
         }
-        std::thread::sleep(Duration::from_secs(2));
     });
 }

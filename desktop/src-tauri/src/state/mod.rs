@@ -1,8 +1,9 @@
 use crate::diagnostics::ShellDiagnosticState;
 use crate::host::HostSupervisor;
 use host_ipc::types::{
-    CapabilitySnapshot, DiagnosticEntry, HostIdentitySnapshot, HostOverviewSnapshot,
-    HostSettingsSnapshot, PendingRemoteRequestSnapshot, RuntimeStatusSnapshot, VideoStreamSnapshot,
+    CapabilitySnapshot, DiagnosticEntry, DiagnosticSnapshot, HostIdentitySnapshot,
+    HostOverviewSnapshot, HostSettingsSnapshot, PendingRemoteRequestSnapshot,
+    RuntimeStatusSnapshot, VideoStreamSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -19,6 +20,9 @@ pub struct AppState {
     supervisor: Mutex<HostSupervisor>,
     shell_messages: Mutex<Vec<ShellMessage>>,
     diagnostics: Mutex<ShellDiagnosticState>,
+    connection_lost: AtomicBool,
+    last_snapshot: Mutex<Option<ShellSnapshot>>,
+    seen_host_generation: Mutex<u64>,
 }
 
 impl AppState {
@@ -43,6 +47,9 @@ impl AppState {
             supervisor: Mutex::new(HostSupervisor::with_resources(resource_dir)),
             shell_messages: Mutex::new(Vec::new()),
             diagnostics: Mutex::new(ShellDiagnosticState::new(app_data_dir)?),
+            connection_lost: AtomicBool::new(false),
+            last_snapshot: Mutex::new(None),
+            seen_host_generation: Mutex::new(0),
         };
         let _ = state.push_shell_message(ShellMessage::info(
             "DESKTOP_SHELL_READY",
@@ -55,6 +62,18 @@ impl AppState {
         self.shutting_down.store(true, Ordering::Relaxed);
         if let Ok(mut supervisor) = self.supervisor.lock() {
             supervisor.stop();
+        }
+    }
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
+    pub fn record_connection_state(&self, healthy: bool) {
+        let was_lost = self.connection_lost.swap(!healthy, Ordering::Relaxed);
+        if healthy && was_lost {
+            let _ = self.push_shell_message(ShellMessage::info("IPC_CONNECTION_RECOVERED", ""));
+        }
+        if !healthy && !was_lost {
+            let _ = self.push_shell_message(ShellMessage::error("IPC_CONNECTION_LOST", ""));
         }
     }
 
@@ -77,10 +96,23 @@ impl AppState {
             .fetch_snapshot()
             .map_err(|err| err.to_string())?;
         let shell_settings = self.shell_store.lock().map_err(lock_err)?.settings.clone();
+        let restarted = {
+            let mut seen = self.seen_host_generation.lock().map_err(lock_err)?;
+            let restarted = *seen > 0 && host_bundle.generation > *seen;
+            *seen = host_bundle.generation;
+            restarted
+        };
+        if restarted {
+            self.push_shell_message(ShellMessage::warning("HOST_SERVICE_RESTARTED", ""))?;
+        }
+        if let Ok(mut logs) = self.diagnostics.lock() {
+            logs.ingest(&host_bundle.diagnostics.entries);
+        }
         let mut messages = host_bundle
             .diagnostics
             .entries
-            .into_iter()
+            .iter()
+            .cloned()
             .map(ShellMessage::from_host)
             .collect::<Vec<_>>();
         messages.extend(
@@ -108,7 +140,7 @@ impl AppState {
             .filter(|_| {
                 matches!(
                     runtime_status.state_label.as_str(),
-                    "SESSION_PREPARING" | "STREAMING" | "STOPPING"
+                    "SESSION_PREPARING" | "STREAMING" | "STOPPING" | "DEGRADED"
                 )
             })
             .map(|session_id| ActiveSessionPresentation {
@@ -118,7 +150,9 @@ impl AppState {
                     .active_controller_display_name
                     .clone()
                     .unwrap_or_else(|| "远程设备".to_string()),
-                peer_subtitle: if runtime_status.state_label == "STREAMING" {
+                peer_subtitle: if runtime_status.state_label == "DEGRADED" {
+                    "连接异常，正在等待恢复"
+                } else if runtime_status.state_label == "STREAMING" {
                     "正在共享屏幕"
                 } else {
                     "正在建立屏幕共享"
@@ -137,7 +171,28 @@ impl AppState {
             .map(|input| input.supports_pointer && input.supports_keyboard)
             .unwrap_or(false);
 
-        Ok(ShellSnapshot {
+        let mut diagnostic_summary = host_bundle
+            .diagnostics
+            .snapshot
+            .map(DiagnosticSnapshotView::from)
+            .unwrap_or_default();
+        if let Some(previous) = self.last_snapshot.lock().map_err(lock_err)?.as_ref() {
+            diagnostic_summary.retain_history(&previous.diagnostics);
+        }
+        for entry in &messages {
+            let pinned = match entry.level.as_str() {
+                "warning" => &mut diagnostic_summary.last_warning,
+                "error" => &mut diagnostic_summary.last_error,
+                _ => continue,
+            };
+            if pinned
+                .as_ref()
+                .is_none_or(|old| old.last_seen_ms < entry.last_seen_ms)
+            {
+                *pinned = Some(entry.clone());
+            }
+        }
+        let snapshot = ShellSnapshot {
             ready: true,
             runtime_status_label: runtime_status.state_label.clone(),
             desktop_ui_state,
@@ -147,10 +202,13 @@ impl AppState {
             host_overview: HostOverviewView::from(host_overview),
             shell_settings,
             messages,
+            diagnostics: diagnostic_summary,
             incoming_request,
             active_session,
             updated_at_ms: now_ms(),
-        })
+        };
+        *self.last_snapshot.lock().map_err(lock_err)? = Some(snapshot.clone());
+        Ok(snapshot)
     }
 
     pub fn save_shell_settings(&self, next: ShellSettings) -> Result<ShellSnapshot, String> {
@@ -260,6 +318,15 @@ impl AppState {
         let code = message.code.clone();
         let content = message.message.clone();
         let mut buffer = self.shell_messages.lock().map_err(lock_err)?;
+        if let Some(previous) = buffer
+            .iter_mut()
+            .rev()
+            .find(|e| e.code == code && message.created_at_ms - e.last_seen_ms < 30_000)
+        {
+            previous.repeat_count = previous.repeat_count.saturating_add(1);
+            previous.last_seen_ms = message.created_at_ms;
+            return Ok(());
+        }
         buffer.push(message);
         if buffer.len() > 20 {
             buffer.remove(0);
@@ -276,6 +343,20 @@ impl AppState {
         if let Ok(mut diagnostics) = self.diagnostics.lock() {
             let _ = diagnostics.append(level, code, message);
         }
+    }
+    pub fn export_diagnostics(&self) -> Result<String, String> {
+        let current = self.bootstrap_snapshot();
+        let available = current.is_ok();
+        let cached = self.last_snapshot.lock().map_err(lock_err)?.clone();
+        let snapshot = current.ok().or(cached);
+        let shell_messages = self.shell_messages.lock().map_err(lock_err)?.clone();
+        let report = diagnostic_report(snapshot.as_ref(), available, &shell_messages);
+        self.diagnostics
+            .lock()
+            .map_err(lock_err)?
+            .export(&report)
+            .map(|p| p.display().to_string())
+            .map_err(|_| "诊断导出失败，请检查磁盘空间后重试".into())
     }
 }
 
@@ -325,7 +406,10 @@ impl ShellStore {
         settings.minimize_to_tray = false;
         settings.notifications_enabled = false;
         settings.last_access_code.clear();
-        if !matches!(settings.last_route.as_str(), "/remote" | "/settings") {
+        if !matches!(
+            settings.last_route.as_str(),
+            "/remote" | "/settings" | "/diagnostics"
+        ) {
             settings.last_route = "/remote".to_string();
         }
         Ok(Self { path, settings })
@@ -338,7 +422,10 @@ impl ShellStore {
                 "开机自启、托盘和系统通知尚未实现",
             ));
         }
-        if !matches!(next.last_route.as_str(), "/remote" | "/settings") {
+        if !matches!(
+            next.last_route.as_str(),
+            "/remote" | "/settings" | "/diagnostics"
+        ) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "无效的启动页"));
         }
         let mut next = next;
@@ -361,6 +448,7 @@ pub struct ShellSnapshot {
     pub host_overview: HostOverviewView,
     pub shell_settings: ShellSettings,
     pub messages: Vec<ShellMessage>,
+    pub diagnostics: DiagnosticSnapshotView,
     pub incoming_request: Option<IncomingRequestPreview>,
     pub active_session: Option<ActiveSessionPresentation>,
     pub updated_at_ms: i64,
@@ -566,36 +654,46 @@ pub struct ShellMessage {
     pub code: String,
     pub message: String,
     pub created_at_ms: i64,
+    pub event_id: String,
+    pub category: String,
+    pub session_id: Option<String>,
+    pub repeat_count: u32,
+    pub last_seen_ms: i64,
+    pub suggested_action: String,
+    pub retryable: bool,
 }
 
 impl ShellMessage {
-    fn info(code: &str, message: impl Into<String>) -> Self {
+    fn info(code: &str, _message: impl Into<String>) -> Self {
         Self {
             source: "shell".to_string(),
             level: "info".to_string(),
             code: code.to_string(),
-            message: message.into(),
+            message: host_ipc::diagnostics::presentation(code).0.into(),
             created_at_ms: now_ms(),
+            ..Self::metadata(code)
         }
     }
 
-    fn warning(code: &str, message: impl Into<String>) -> Self {
+    fn warning(code: &str, _message: impl Into<String>) -> Self {
         Self {
             source: "shell".to_string(),
             level: "warning".to_string(),
             code: code.to_string(),
-            message: message.into(),
+            message: host_ipc::diagnostics::presentation(code).0.into(),
             created_at_ms: now_ms(),
+            ..Self::metadata(code)
         }
     }
 
-    fn error(code: &str, message: impl Into<String>) -> Self {
+    fn error(code: &str, _message: impl Into<String>) -> Self {
         Self {
             source: "shell".to_string(),
             level: "error".to_string(),
             code: code.to_string(),
-            message: message.into(),
+            message: host_ipc::diagnostics::presentation(code).0.into(),
             created_at_ms: now_ms(),
+            ..Self::metadata(code)
         }
     }
 
@@ -603,10 +701,162 @@ impl ShellMessage {
         Self {
             source: "host-runtime".to_string(),
             level: entry.level,
-            code: entry.code,
-            message: entry.message,
+            code: entry.code.clone(),
+            message: host_ipc::diagnostics::presentation(&entry.code).0.into(),
             created_at_ms: entry.created_at_ms,
+            event_id: entry.event_id,
+            category: entry.category,
+            session_id: entry.session_id,
+            repeat_count: entry.repeat_count.max(1),
+            last_seen_ms: entry.last_seen_ms,
+            suggested_action: host_ipc::diagnostics::presentation(&entry.code).1.into(),
+            retryable: host_ipc::diagnostics::presentation(&entry.code).2,
         }
+    }
+    fn metadata(code: &str) -> Self {
+        let now = now_ms();
+        let (message, action, retryable) = host_ipc::diagnostics::presentation(code);
+        Self {
+            source: "shell".into(),
+            level: "info".into(),
+            code: code.into(),
+            message: message.into(),
+            created_at_ms: now,
+            event_id: format!("shell-{now}-{code}"),
+            category: host_ipc::diagnostics::category(code).into(),
+            session_id: None,
+            repeat_count: 1,
+            last_seen_ms: now,
+            suggested_action: action.into(),
+            retryable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticSnapshotView {
+    pub last_error: Option<ShellMessage>,
+    pub last_warning: Option<ShellMessage>,
+    pub last_degraded_event: Option<ShellMessage>,
+    pub last_display_restore_result: Option<ShellMessage>,
+    pub last_audio_restore_result: Option<ShellMessage>,
+    pub last_session_closed_event: Option<ShellMessage>,
+    pub degraded: bool,
+    pub updated_at_ms: i64,
+}
+impl From<DiagnosticSnapshot> for DiagnosticSnapshotView {
+    fn from(s: DiagnosticSnapshot) -> Self {
+        Self {
+            last_error: s.last_error.map(ShellMessage::from_host),
+            last_warning: s.last_warning.map(ShellMessage::from_host),
+            last_degraded_event: s.last_degraded_event.map(ShellMessage::from_host),
+            last_display_restore_result: s.last_display_restore_result.map(ShellMessage::from_host),
+            last_audio_restore_result: s.last_audio_restore_result.map(ShellMessage::from_host),
+            last_session_closed_event: s.last_session_closed_event.map(ShellMessage::from_host),
+            degraded: s.degraded,
+            updated_at_ms: s.updated_at_ms,
+        }
+    }
+}
+impl DiagnosticSnapshotView {
+    fn retain_history(&mut self, previous: &Self) {
+        for (current, old) in [
+            (&mut self.last_error, &previous.last_error),
+            (&mut self.last_warning, &previous.last_warning),
+            (&mut self.last_degraded_event, &previous.last_degraded_event),
+            (
+                &mut self.last_display_restore_result,
+                &previous.last_display_restore_result,
+            ),
+            (
+                &mut self.last_audio_restore_result,
+                &previous.last_audio_restore_result,
+            ),
+            (
+                &mut self.last_session_closed_event,
+                &previous.last_session_closed_event,
+            ),
+        ] {
+            if current.is_none() {
+                *current = old.clone();
+            }
+        }
+    }
+}
+
+// Explicit allowlist: never serialize settings, pairing data, device names,
+// addresses, SDP, candidates, input contents, or the complete shell snapshot.
+fn diagnostic_report(
+    s: Option<&ShellSnapshot>,
+    available: bool,
+    shell: &[ShellMessage],
+) -> serde_json::Value {
+    let mut events = s.map(|s| s.messages.clone()).unwrap_or_default();
+    for event in shell {
+        if !events.iter().any(|e| e.event_id == event.event_id) {
+            events.push(event.clone());
+        }
+    }
+    events.sort_by_key(|e| e.last_seen_ms);
+    if events.len() > 40 {
+        events = events.split_off(events.len() - 40);
+    }
+    serde_json::json!({"schemaVersion":1,"createdAtMs":now_ms(),"hostAvailable":available,
+        "runtime":s.map(|s|&s.runtime_status),"capability":s.map(|s|&s.capability),
+        "summary":s.map(|s|&s.diagnostics),"events":events})
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    #[test]
+    fn report_allowlist_omits_settings_identity_and_raw_errors() {
+        let mut overview = HostOverviewSnapshot::default();
+        overview.identity = Some(HostIdentitySnapshot {
+            device_id: "private-id".into(),
+            display_name: "private-name".into(),
+            ..Default::default()
+        });
+        overview.settings = Some(HostSettingsSnapshot {
+            temporary_verification_code: "SECRETCODE".into(),
+            custom_verification_code: "PRIVATECODE".into(),
+            ..Default::default()
+        });
+        let message = ShellMessage::from_host(DiagnosticEntry {
+            code: "DISPLAY_RESTORE_FAILED".into(),
+            message: "pair_token=hidden sdp=hidden".into(),
+            ..Default::default()
+        });
+        let snapshot = ShellSnapshot {
+            ready: true,
+            runtime_status_label: "READY".into(),
+            desktop_ui_state: "READY".into(),
+            supports_input: false,
+            runtime_status: RuntimeStatusView::from(RuntimeStatusSnapshot::default()),
+            capability: CapabilityView::from(CapabilitySnapshot::default()),
+            host_overview: HostOverviewView::from(overview),
+            shell_settings: ShellSettings::default(),
+            messages: vec![message],
+            diagnostics: Default::default(),
+            incoming_request: None,
+            active_session: None,
+            updated_at_ms: 0,
+        };
+        let report = diagnostic_report(Some(&snapshot), false, &[]);
+        let text = report.to_string();
+        for secret in [
+            "SECRETCODE",
+            "PRIVATECODE",
+            "private-name",
+            "private-id",
+            "pair_token",
+            "sdp=",
+        ] {
+            assert!(!text.contains(secret));
+        }
+        assert_eq!(report["hostAvailable"], false);
+        assert_eq!(report["events"][0]["code"], "DISPLAY_RESTORE_FAILED");
     }
 }
 

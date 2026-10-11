@@ -206,6 +206,7 @@ fn test_control_state(port: u16) -> ControlPlaneState {
         "0.1.0-test".to_string(),
     );
     ControlPlaneState {
+        diagnostics: Arc::new(Mutex::new(Default::default())),
         input: Arc::new(Mutex::new(host_runtime::input::InputState::default())),
         display: Arc::new(Mutex::new(host_runtime::display::DisplayState::new(
             &base_dir,
