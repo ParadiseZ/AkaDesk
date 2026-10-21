@@ -18,9 +18,11 @@ import top.akadesk.app.ui.theme.AkaDeskTheme
 class MainActivity : ComponentActivity() {
     private lateinit var coordinator: top.akadesk.app.controller.ControllerCoordinator
     private var originalOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    private var originalCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         originalOrientation = savedInstanceState?.getInt("normal_orientation") ?: requestedOrientation
+        originalCutoutMode = window.attributes.layoutInDisplayCutoutMode
         enableEdgeToEdge()
         coordinator = ViewModelProvider(this)[ControllerViewModel::class.java].coordinator
         setContent {
@@ -30,6 +32,9 @@ class MainActivity : ComponentActivity() {
                     if (coordinator.remotePortrait) ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT else ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 } else originalOrientation
                 val bars = WindowCompat.getInsetsController(window, window.decorView)
+                window.attributes = window.attributes.apply {
+                    layoutInDisplayCutoutMode = if (viewing) WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES else originalCutoutMode
+                }
                 if (viewing) {
                     bars.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                     bars.hide(WindowInsetsCompat.Type.systemBars())

@@ -129,7 +129,7 @@ class M9ControllerInstrumentedTest {
             for(title in listOf("Ctrl","R","H")) compose.onNodeWithText(title,substring=false).performScrollTo().performClick()
             compose.onNodeWithText("鼠标",substring=false).performClick();compose.onNodeWithText("右键",substring=false).performClick()
             compose.onNodeWithText("确认组合键").performClick()
-            compose.onNode(hasSetTextAction() and hasText("按键名称")).performTextReplacement("组合验收")
+            compose.onNodeWithTag("mapping-key-name").performTextReplacement("组合验收")
             compose.onNodeWithText("锁定",substring=false).performScrollTo().performClick()
             snapshot("mapping-editor")
             compose.onNodeWithText("保存方案").performScrollTo().performClick()

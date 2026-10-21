@@ -7,12 +7,18 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
@@ -94,6 +100,7 @@ internal fun MappingProfiles(c:ControllerCoordinator,onClose:()->Unit,onEdit:()-
 
 @Composable
 internal fun MappingEditorSurface(initial:MappingDraft,defaultSize:Int,defaultOpacity:Float,onSave:(MappingDraft)->Boolean,onClose:()->Unit) {
+    CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides 32.dp) {
     var draft by remember(initial.originalName) {mutableStateOf(initial)}
     var selected by remember {mutableStateOf<String?>(null)}
     var picker by remember {mutableStateOf<Int?>(null)}
@@ -121,34 +128,43 @@ internal fun MappingEditorSurface(initial:MappingDraft,defaultSize:Int,defaultOp
                 .pointerInput(key.id,area,size) {detectDragGestures(onDragStart={selected=key.id}) {point,delta->
                     point.consume();val current=draft.positions[key.id] ?: position
                     draft=draft.copy(positions=draft.positions+(key.id to ((current.first+delta.x/availableW).coerceIn(0f,1f) to (current.second+delta.y/availableH).coerceIn(0f,1f))))
-                }},contentAlignment=Alignment.Center) {Text(key.label,color=Color.White,maxLines=3,style=MaterialTheme.typography.labelSmall)}
+                }},contentAlignment=Alignment.Center) {MappingKeyLabel(key.label,key.size ?: defaultSize)}
         }
-        Surface(Modifier.align(Alignment.TopCenter).fillMaxWidth(),color=Color(0xD9262930)) {
+        Surface(Modifier.align(Alignment.TopCenter).displayCutoutPadding().widthIn(max=720.dp).fillMaxWidth().testTag("mapping-properties"),color=Color(0xD9262930),shape=RoundedCornerShape(bottomStart=6.dp,bottomEnd=6.dp)) {
             Column(Modifier.padding(4.dp)) {
-                Row(Modifier.horizontalScroll(rememberScrollState()),verticalAlignment=Alignment.CenterVertically) {
-                    TextButton(onClick={naming=true}) {Text("${draft.name} ✎")}
-                    TextButton(onClick={newPicker(false)}) {Text("＋ 单个按键")}
-                    TextButton(onClick={newPicker(true)}) {Text("＋ 组合键")}
-                    TextButton(onClick={view=true}) {Text("3D 视角控制")}
-                    TextButton(onClick={clear=true}) {Text("清空")}
-                    TextButton(onClick=::leave) {Text("取消")}
-                    Button(onClick={if(onSave(draft)) onClose() else error="保存失败，请检查名称、按键与视角配置"}) {Text("保存方案")}
+                Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically) {
+                    Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()),verticalAlignment=Alignment.CenterVertically) {
+                        MappingTextAction("${draft.name} ✎",onClick={naming=true})
+                        MappingTextAction("＋ 单个按键",onClick={newPicker(false)})
+                        MappingTextAction("＋ 组合键",onClick={newPicker(true)})
+                        MappingTextAction("3D 视角控制",onClick={view=true})
+                        MappingTextAction("清空",onClick={clear=true})
+                    }
+                    MappingTextAction("取消",onClick=::leave)
+                    Button(onClick={if(onSave(draft)) onClose() else error="保存失败，请检查名称、按键与视角配置"},
+                        modifier=Modifier.height(32.dp),shape=RoundedCornerShape(6.dp),contentPadding=PaddingValues(horizontal=10.dp,vertical=0.dp)) {Text("保存方案",fontSize=12.sp)}
                 }
-                if(binding!=null) Column(Modifier.heightIn(max=175.dp).verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(2.dp)) {
-                    Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(binding.label,onValueChange={change(binding.copy(label=it.take(32)))},label={Text("按键名称")},singleLine=true,modifier=Modifier.width(180.dp))
-                        TextButton(onClick={pickerActions=binding.effectiveActions();picker=if(pickerActions.size>1) 2 else 1}) {Text(binding.chordLabel())}
-                        TextButton(onClick={draft=draft.copy(bindings=draft.bindings.filterNot {it.id==binding.id},positions=draft.positions-binding.id);selected=null}) {Text("删除按键")}
-                        TextButton(onClick={selected=null}) {Text("收起属性")}
-                    }
-                    Row(Modifier.horizontalScroll(rememberScrollState()),verticalAlignment=Alignment.CenterVertically) {
-                        Text("触发方式 ")
-                        MappingBehavior.entries.forEach {mode->FilterChip(selected=binding.behavior==mode,enabled=mode!=MappingBehavior.Toggle || binding.effectiveActions().none {it.kind==MappingActionKind.Wheel},onClick={change(binding.copy(behavior=mode))},label={Text(mode.title)})}
-                        FilterChip(selected=binding.movable,onClick={change(binding.copy(movable=!binding.movable))},label={Text("可移动")})
-                    }
+                if(binding!=null) Column(Modifier.heightIn(max=88.dp).verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(2.dp)) {
                     Row(Modifier.fillMaxWidth(),verticalAlignment=Alignment.CenterVertically) {
-                        Text("大小 ${binding.size ?: defaultSize}",Modifier.width(80.dp));Slider((binding.size ?: defaultSize).toFloat(),onValueChange={change(binding.copy(size=it.toInt()))},valueRange=16f..100f,modifier=Modifier.weight(1f))
-                        Text("不透明度 ${((binding.opacity ?: defaultOpacity)*100).toInt()}%",Modifier.padding(start=12.dp).width(125.dp));Slider(binding.opacity ?: defaultOpacity,onValueChange={change(binding.copy(opacity=it))},valueRange=.1f..1f,modifier=Modifier.weight(1f))
+                        Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(4.dp)) {
+                            BasicTextField(binding.label,onValueChange={change(binding.copy(label=it.take(32)))},singleLine=true,
+                                textStyle=MaterialTheme.typography.bodySmall.copy(color=Color.White,fontSize=12.sp),cursorBrush=SolidColor(MaterialTheme.colorScheme.primary),
+                                modifier=Modifier.width(148.dp).height(32.dp).border(1.dp,Color.Gray,RoundedCornerShape(4.dp)).padding(horizontal=6.dp).testTag("mapping-key-name"),
+                                decorationBox={field->Row(verticalAlignment=Alignment.CenterVertically) {Text("名称",fontSize=11.sp,color=Color.LightGray,modifier=Modifier.padding(end=6.dp));Box(Modifier.weight(1f)) {field()}}})
+                            MappingTextAction(binding.chordLabel(),onClick={pickerActions=binding.effectiveActions();picker=if(pickerActions.size>1) 2 else 1})
+                            MappingBehavior.entries.forEach {mode->MappingOption(mode.title,binding.behavior==mode,
+                                enabled=mode!=MappingBehavior.Toggle || binding.effectiveActions().none {it.kind==MappingActionKind.Wheel},
+                                onClick={change(binding.copy(behavior=mode))})}
+                            MappingOption("可移动",binding.movable,onClick={change(binding.copy(movable=!binding.movable))})
+                        }
+                        IconButton(onClick={draft=draft.copy(bindings=draft.bindings.filterNot {it.id==binding.id},positions=draft.positions-binding.id);selected=null},modifier=Modifier.size(32.dp)) {Icon(Icons.Outlined.DeleteOutline,"删除按键",Modifier.size(18.dp),tint=MaterialTheme.colorScheme.error)}
+                        IconButton(onClick={selected=null},modifier=Modifier.size(32.dp)) {Icon(Icons.Outlined.Close,"收起属性",Modifier.size(18.dp))}
+                    }
+                    Row(Modifier.fillMaxWidth().testTag("mapping-sliders"),verticalAlignment=Alignment.CenterVertically) {
+                        Text("大小 ${binding.size ?: defaultSize}",Modifier.width(52.dp),fontSize=11.sp)
+                        CompactRemoteSlider((binding.size ?: defaultSize).toFloat(),onValueChange={change(binding.copy(size=it.toInt()))},valueRange=16f..100f,modifier=Modifier.weight(1f))
+                        Text("不透明度 ${((binding.opacity ?: defaultOpacity)*100).toInt()}%",Modifier.padding(start=8.dp).width(92.dp),fontSize=11.sp)
+                        CompactRemoteSlider(binding.opacity ?: defaultOpacity,onValueChange={change(binding.copy(opacity=it))},valueRange=.1f..1f,modifier=Modifier.weight(1f))
                     }
                 }
                 error?.let {Text(it,color=MaterialTheme.colorScheme.error)}
@@ -166,6 +182,19 @@ internal fun MappingEditorSurface(initial:MappingDraft,defaultSize:Int,defaultOp
     if(exit) AlertDialog(onDismissRequest={exit=false},title={Text("退出编辑？")},text={Text("尚未保存的按键、位置和配置将被丢弃")},confirmButton={TextButton(onClick=onClose) {Text("放弃更改")}},dismissButton={TextButton(onClick={exit=false}) {Text("继续编辑")}})
     if(clear) AlertDialog(onDismissRequest={clear=false},title={Text("清空当前草稿？")},confirmButton={TextButton(onClick={draft=draft.copy(bindings=emptyList(),positions=emptyMap());selected=null;clear=false}) {Text("清空")}},dismissButton={TextButton(onClick={clear=false}) {Text("取消")}})
     if(naming) AlertDialog(onDismissRequest={naming=false},title={Text("方案名称")},text={OutlinedTextField(draft.name,onValueChange={draft=draft.copy(name=it.take(32))},singleLine=true)},confirmButton={TextButton(onClick={naming=false}) {Text("确定")}})
+    }
+}
+
+@Composable private fun MappingTextAction(title:String,onClick:()->Unit) {
+    TextButton(onClick=onClick,modifier=Modifier.height(32.dp),contentPadding=PaddingValues(horizontal=8.dp,vertical=0.dp)) {Text(title,fontSize=12.sp,maxLines=1)}
+}
+
+@Composable private fun MappingOption(title:String,selected:Boolean,enabled:Boolean=true,onClick:()->Unit) {
+    Surface(shape=RoundedCornerShape(4.dp),color=if(selected) MaterialTheme.colorScheme.primary.copy(alpha=.35f) else Color.Transparent) {
+        Box(Modifier.height(28.dp).clickable(enabled=enabled,onClick=onClick).padding(horizontal=8.dp),contentAlignment=Alignment.Center) {
+            Text(title,fontSize=11.sp,color=if(enabled) Color.White else Color.Gray)
+        }
+    }
 }
 
 @Composable private fun MappingActionPicker(combo:Boolean,initial:List<MappingAction>,onClose:()->Unit,onSave:(List<MappingAction>)->Unit) {

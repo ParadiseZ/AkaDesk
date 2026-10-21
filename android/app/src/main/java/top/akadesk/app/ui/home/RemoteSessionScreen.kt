@@ -27,8 +27,16 @@ private enum class RemotePanel(val title:String) { Operation("操作"), Display(
 
 @Composable
 fun RemoteSessionScreen(coordinator:ControllerCoordinator, session:ActiveRemoteSession, onDisconnect:()->Unit) {
-    MaterialTheme(colorScheme=darkColorScheme(primary=Color(0xFF477CFF),onPrimary=Color.White,surface=Color(0xFF272930),surfaceVariant=Color(0xFF42454E),onSurface=Color.White,onSurfaceVariant=Color.White)) {
+    val typography=MaterialTheme.typography
+    MaterialTheme(colorScheme=darkColorScheme(primary=Color(0xFF477CFF),onPrimary=Color.White,surface=Color(0xFF272930),surfaceVariant=Color(0xFF42454E),onSurface=Color.White,onSurfaceVariant=Color.White),
+        typography=typography.copy(bodyLarge=typography.bodyLarge.copy(fontSize=13.sp,lineHeight=18.sp),
+            bodyMedium=typography.bodyMedium.copy(fontSize=12.sp,lineHeight=16.sp),
+            labelLarge=typography.labelLarge.copy(fontSize=12.sp,lineHeight=16.sp),
+            labelSmall=typography.labelSmall.copy(fontSize=10.sp,lineHeight=12.sp),
+            titleLarge=typography.titleLarge.copy(fontSize=16.sp,lineHeight=20.sp))) {
+        CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides 32.dp) {
         Surface(Modifier.fillMaxSize(),color=Color.Black,contentColor=Color.White) {RemoteSessionContent(coordinator,session,onDisconnect)}
+        }
     }
 }
 
@@ -73,10 +81,12 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
         }
     }
     BackHandler {when {files->files=false; keyboard->keyboard=false; panel!=null->panel=if(panel==RemotePanel.Operation) null else RemotePanel.Operation; else->onDisconnect()}}
-    Box(Modifier.fillMaxSize().background(Color.Black).then(if(prefs.avoidCutout && !pip) Modifier.displayCutoutPadding() else Modifier)) {
+    // Video and mappings share the full viewport; only the controls avoid the cutout.
+    val controlInsets=if(prefs.avoidCutout && !pip) Modifier.windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.End + WindowInsetsSides.Vertical)) else Modifier
+    Box(Modifier.fillMaxSize().background(Color.Black).testTag("remote-viewport")) {
             BoxWithConstraints(Modifier.fillMaxSize()) {
                 RemoteVideoSurface(c,s,enabled && !blocked, onReveal={toolbar=true}, rightModeEnabled=prefs.pointerMode==PointerMode.Trackpad)
-                if(!pip && prefs.mappingEnabled && !blocked) MappingOverlay(c,enabled,false)
+                if(!pip && prefs.mappingEnabled && !keyboard && !files && !mappingEditing && !mappingProfiles) MappingOverlay(c,enabled && !blocked,false)
                 if(!pip && prefs.virtualMouse && !blocked && !c.viewOnly) VirtualMouse(c,enabled)
                 if(!pip && (prefs.showNetwork || !ready || stalled)) Text(
                     if(stalled) "画面中断，等待恢复…" else if(!ready) "正在连接电脑画面…" else "${metric(network.rttMs)} ms · ${metric(network.fps)} FPS · ${metric(network.mbps)} Mbps",
@@ -85,15 +95,15 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
                 if(!toolbar && !pip && panel==null) TextButton(onClick={toolbar=true},modifier=Modifier.align(Alignment.CenterEnd)) {Text("操作")}
                 if(!pip && panel!=null) {
                     Box(Modifier.fillMaxSize().clickable(indication=null,interactionSource=remember {androidx.compose.foundation.interaction.MutableInteractionSource()}) {panel=null})
-                    Surface(Modifier.align(Alignment.CenterEnd).padding(end=72.dp).fillMaxHeight().width(minOf(360.dp,maxWidth*.48f)).testTag("remote-panel"),color=Color(0xEF292C34),contentColor=Color.White) {
+                    Surface(Modifier.align(Alignment.CenterEnd).then(controlInsets).padding(end=48.dp).fillMaxHeight().width(minOf(272.dp,maxWidth*.42f)).testTag("remote-panel"),color=Color(0xEF292C34),contentColor=Color.White) {
                         Column {
-                            if(panel!=RemotePanel.Operation) Row(Modifier.fillMaxWidth().height(48.dp),verticalAlignment=Alignment.CenterVertically) {
-                                IconButton(onClick={panel=RemotePanel.Operation}) {Icon(Icons.Outlined.ChevronLeft,"返回")}
+                            if(panel!=RemotePanel.Operation) Row(Modifier.fillMaxWidth().height(36.dp),verticalAlignment=Alignment.CenterVertically) {
+                                IconButton(onClick={panel=RemotePanel.Operation},modifier=Modifier.size(32.dp)) {Icon(Icons.Outlined.ChevronLeft,"返回")}
                                 Text(panel!!.title,modifier=Modifier.weight(1f),fontWeight=FontWeight.Bold)
-                                IconButton(onClick={panel=null}) {Icon(Icons.Outlined.Close,"关闭面板")}
+                                IconButton(onClick={panel=null},modifier=Modifier.size(32.dp)) {Icon(Icons.Outlined.Close,"关闭面板")}
                             }
                             when(panel) {
-                                RemotePanel.Operation->Column(Modifier.verticalScroll(rememberScrollState()).padding(12.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
+                                RemotePanel.Operation->Column(Modifier.verticalScroll(rememberScrollState()).padding(6.dp),verticalArrangement=Arrangement.spacedBy(6.dp)) {
                                     Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(6.dp)) {
                                         QuickTile("退出远控",Icons.Outlined.Logout,onClick=onDisconnect)
                                         QuickTile("旋转屏幕",Icons.Outlined.ScreenRotation,onClick={c.remotePortrait=!c.remotePortrait})
@@ -130,9 +140,9 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
                                 RemotePanel.Display->Column(Modifier.verticalScroll(rememberScrollState())) {VideoQualityControls(c);DisplaySettingsContent(c,scrollable=false);ReservedFeature("虚拟显示器", "安装虚拟显示驱动后可启用")}
                                 RemotePanel.MappingOptions->Column(Modifier.padding(12.dp).verticalScroll(rememberScrollState())) {
                                     Text("默认按钮大小：${prefs.buttonSize}")
-                                    Slider(value=prefs.buttonSize.toFloat(),onValueChange={c.updateRemotePreferences(prefs.copy(buttonSize=it.toInt()))},valueRange=32f..72f)
+                                    CompactRemoteSlider(value=prefs.buttonSize.toFloat(),onValueChange={c.updateRemotePreferences(prefs.copy(buttonSize=it.toInt()))},valueRange=24f..72f)
                                     Text("默认按钮不透明度")
-                                    Slider(value=prefs.buttonOpacity,onValueChange={c.updateRemotePreferences(prefs.copy(buttonOpacity=it))},valueRange=.2f..1f)
+                                    CompactRemoteSlider(value=prefs.buttonOpacity,onValueChange={c.updateRemotePreferences(prefs.copy(buttonOpacity=it))},valueRange=.2f..1f)
                                     ToggleRow("双指缩放画面",prefs.pinchZoom) {c.updateRemotePreferences(prefs.copy(pinchZoom=it))}
                                     ToggleRow("按键振动反馈",prefs.buttonHaptics) {c.updateRemotePreferences(prefs.copy(buttonHaptics=it))}
                                     Text("按键单独设置的大小与不透明度优先于默认值",style=MaterialTheme.typography.bodySmall)
@@ -189,11 +199,11 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
                     }
                 }
             }
-            if(!pip && !mappingEditing && !mappingProfiles && (toolbar || panel!=null || keyboard)) Column(Modifier.align(Alignment.CenterEnd).width(72.dp).fillMaxHeight().background(Color(0x66000000)),verticalArrangement=Arrangement.SpaceEvenly,horizontalAlignment=Alignment.CenterHorizontally) {
+            if(!pip && !mappingEditing && !mappingProfiles && (toolbar || panel!=null || keyboard)) Column(Modifier.align(Alignment.CenterEnd).then(controlInsets).width(48.dp).fillMaxHeight().background(Color(0x66000000)).testTag("remote-rail"),verticalArrangement=Arrangement.SpaceEvenly,horizontalAlignment=Alignment.CenterHorizontally) {
                 RailAction("操作",Icons.Outlined.Tune,panel==RemotePanel.Operation) {keyboard=false;panel=if(panel==RemotePanel.Operation) null else RemotePanel.Operation}
                 RailAction("键盘",Icons.Outlined.Keyboard,keyboard,enabled) {panel=null;keyboard=!keyboard}
                 RailAction("显示桌面",Icons.Outlined.DesktopWindows,false,enabled) {c.sendShortcut(InputShortcut("desktop","显示桌面",0x44,meta=true))}
-                RailAction("展示所有窗口",Icons.Outlined.Window,false,enabled) {c.sendShortcut(InputShortcut("tasks","展示所有窗口",0x09,meta=true))}
+                RailAction("所有窗口",Icons.Outlined.Window,false,enabled) {c.sendShortcut(InputShortcut("tasks","展示所有窗口",0x09,meta=true))}
             }
         if(!pip && keyboard) Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth(),color=MaterialTheme.colorScheme.surface) {RemoteKeyboard(c,onClose={keyboard=false},onEdit={keyboard=false;panel=null;mappingEditing=true})}
         if(!pip && mappingProfiles) MappingProfiles(c,onClose={mappingProfiles=false;panel=RemotePanel.Operation},onEdit={mappingProfiles=false;returnToProfiles=true;mappingEditing=true})
@@ -205,18 +215,18 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
 }
 
 @Composable private fun RailAction(title:String,icon:ImageVector,selected:Boolean=false,enabled:Boolean=true,onClick:()->Unit) {
-    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(if(selected) Color(0xFF313745) else Color.Transparent).clickable(enabled=enabled,onClick=onClick).padding(vertical=12.dp),horizontalAlignment=Alignment.CenterHorizontally) {
-        Icon(icon,title,tint=if(enabled) Color.White else Color.Gray,modifier=Modifier.size(24.dp));Text(title,color=if(enabled) Color.White else Color.Gray,style=MaterialTheme.typography.labelSmall)
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(if(selected) Color(0xFF313745) else Color.Transparent).clickable(enabled=enabled,onClick=onClick).padding(vertical=6.dp),horizontalAlignment=Alignment.CenterHorizontally) {
+        Icon(icon,title,tint=if(enabled) Color.White else Color.Gray,modifier=Modifier.size(20.dp));Text(title,color=if(enabled) Color.White else Color.Gray,fontSize=9.sp,lineHeight=11.sp,textAlign=androidx.compose.ui.text.style.TextAlign.Center)
     }
 }
 @Composable private fun QuickTile(title:String,icon:ImageVector,selected:Boolean=false,enabled:Boolean=true,onClick:()->Unit) {
-    Column(Modifier.size(64.dp).clip(RoundedCornerShape(12.dp)).background(if(selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant).clickable(enabled=enabled,onClick=onClick).padding(6.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center) {Icon(icon,title,Modifier.size(24.dp));Text(title,style=MaterialTheme.typography.labelSmall)}
+    Column(Modifier.size(width=48.dp,height=44.dp).clip(RoundedCornerShape(6.dp)).background(if(selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant).clickable(enabled=enabled,onClick=onClick).padding(2.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center) {Icon(icon,title,Modifier.size(18.dp));Text(title,style=MaterialTheme.typography.labelSmall)}
 }
-@Composable internal fun RemoteCard(content:@Composable ColumnScope.()->Unit) {Surface(shape=RoundedCornerShape(12.dp),color=MaterialTheme.colorScheme.surfaceVariant) {Column(Modifier.fillMaxWidth().padding(8.dp),content=content)}}
+@Composable internal fun RemoteCard(content:@Composable ColumnScope.()->Unit) {Surface(shape=RoundedCornerShape(6.dp),color=MaterialTheme.colorScheme.surfaceVariant) {Column(Modifier.fillMaxWidth().padding(4.dp),content=content)}}
 @Composable internal fun MenuRow(title:String,detail:String="",icon:ImageVector?=null,enabled:Boolean=true,onClick:()->Unit) {
-    Row(Modifier.fillMaxWidth().clickable(enabled=enabled,onClick=onClick).padding(vertical=14.dp,horizontal=8.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)) {if(icon!=null) Icon(icon,null,Modifier.size(22.dp));Text(title,Modifier.weight(1f),color=if(enabled) MaterialTheme.colorScheme.onSurface else Color.Gray);if(detail.isNotEmpty()) Text(detail,style=MaterialTheme.typography.labelSmall);Icon(Icons.Outlined.ChevronRight,null,Modifier.size(16.dp))}
+    Row(Modifier.fillMaxWidth().clickable(enabled=enabled,onClick=onClick).padding(vertical=8.dp,horizontal=6.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(6.dp)) {if(icon!=null) Icon(icon,null,Modifier.size(18.dp));Text(title,Modifier.weight(1f),color=if(enabled) MaterialTheme.colorScheme.onSurface else Color.Gray);if(detail.isNotEmpty()) Text(detail,style=MaterialTheme.typography.labelSmall);Icon(Icons.Outlined.ChevronRight,null,Modifier.size(14.dp))}
 }
-@Composable internal fun ToggleRow(title:String,value:Boolean,enabled:Boolean=true,onChange:(Boolean)->Unit) {Row(Modifier.fillMaxWidth().padding(horizontal=8.dp,vertical=4.dp),verticalAlignment=Alignment.CenterVertically) {Text(title,Modifier.weight(1f));Switch(checked=value,onCheckedChange=onChange,enabled=enabled)}}
+@Composable internal fun ToggleRow(title:String,value:Boolean,enabled:Boolean=true,onChange:(Boolean)->Unit) {Row(Modifier.fillMaxWidth().padding(horizontal=6.dp,vertical=2.dp),verticalAlignment=Alignment.CenterVertically) {Text(title,Modifier.weight(1f));Checkbox(checked=value,onCheckedChange=onChange,enabled=enabled,modifier=Modifier.size(32.dp))}}
 @Composable internal fun ReservedFeature(title:String,reason:String) {
     Column(Modifier.fillMaxWidth().padding(8.dp)) {
         ToggleRow(title,false,false) {}

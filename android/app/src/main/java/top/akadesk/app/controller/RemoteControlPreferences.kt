@@ -17,7 +17,7 @@ data class RemoteControlPreferences(
     val showPipShortcut: Boolean = true,
     val pointerSpeed: Float = 1f,
     val buttonOpacity: Float = 0.75f,
-    val buttonSize: Int = 48,
+    val buttonSize: Int = 32,
     val pinchZoom: Boolean = true,
     val buttonHaptics: Boolean = false,
 )
@@ -36,7 +36,10 @@ class RemoteControlPreferenceStore(context: Context) {
         showPipShortcut = prefs.getBoolean("showPipShortcut", true),
         pointerSpeed = prefs.getFloat("pointerSpeed", 1f).coerceIn(0.25f, 3f),
         buttonOpacity = prefs.getFloat("buttonOpacity", .75f).coerceIn(.2f, 1f),
-        buttonSize = prefs.getInt("buttonSize", 48).coerceIn(32, 72),
+        buttonSize = prefs.getInt("buttonSize", 32).let {
+            // Replace the old default for existing installations, retaining other custom sizes.
+            if (prefs.getInt("mappingSizeVersion", 0) == 0 && it == 48) 32 else it.coerceIn(24, 72)
+        },
         pinchZoom = prefs.getBoolean("pinchZoom", true),
         buttonHaptics = prefs.getBoolean("buttonHaptics", false),
     )
@@ -47,5 +50,6 @@ class RemoteControlPreferenceStore(context: Context) {
         .putBoolean("showNetwork", value.showNetwork).putBoolean("avoidCutout", value.avoidCutout)
         .putBoolean("autoPip", value.autoPip).putBoolean("showPipShortcut", value.showPipShortcut)
         .putFloat("pointerSpeed", value.pointerSpeed).putFloat("buttonOpacity", value.buttonOpacity)
-        .putInt("buttonSize", value.buttonSize).putBoolean("pinchZoom",value.pinchZoom).putBoolean("buttonHaptics",value.buttonHaptics).commit()
+        .putInt("buttonSize", value.buttonSize).putInt("mappingSizeVersion", 1)
+        .putBoolean("pinchZoom",value.pinchZoom).putBoolean("buttonHaptics",value.buttonHaptics).commit()
 }

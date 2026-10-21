@@ -47,12 +47,12 @@ class MappingWorkspaceInstrumentedTest {
             compose.activity.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
         compose.onNodeWithTag("mapping-edit-edit").performClick()
-        compose.onNode(hasSetTextAction() and hasText("按键名称")).performTextReplacement("未保存")
+        compose.onNodeWithTag("mapping-key-name").performTextReplacement("未保存")
         compose.runOnIdle {assertEquals(saved,store.draft())}
         compose.onNodeWithText("取消",substring=false).performScrollTo().performClick();compose.onNodeWithText("放弃更改").performClick()
         compose.runOnIdle {assertTrue(closed);assertEquals(saved,store.draft());closed=false;showing=true}
         compose.onNodeWithTag("mapping-edit-edit").performClick()
-        compose.onNode(hasSetTextAction() and hasText("按键名称")).performTextReplacement("保存名称")
+        compose.onNodeWithTag("mapping-key-name").performTextReplacement("保存名称")
         compose.onNodeWithText("锁定").performScrollTo().performClick()
         compose.onNodeWithText("保存方案").performScrollTo().performClick()
         compose.runOnIdle {assertTrue(closed);assertEquals("保存名称",store.load().single().label);assertEquals(MappingBehavior.Toggle,store.load().single().behavior);assertEquals(saved.positions,store.draft().positions)}

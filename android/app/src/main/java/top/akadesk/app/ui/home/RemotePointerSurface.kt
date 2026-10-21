@@ -200,7 +200,7 @@ internal fun MappingOverlay(c:ControllerCoordinator,enabled:Boolean,editing:Bool
                 .pointerInput(editing,enabled,key,c.selectedInputProfile,area) {
                     if(editing) detectDragGestures(onDragEnd={c.saveMappingPosition(key.id,position.x,position.y)}) {change,drag->change.consume();position=Offset((position.x+drag.x/availableW).coerceIn(0f,1f),(position.y+drag.y/availableH).coerceIn(0f,1f))}
                     else if(enabled) detectTapGestures(onPress={if(c.remotePreferences.buttonHaptics) haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.KeyboardTap);c.mappingPress(key,true);try {if(!tryAwaitRelease()) c.cancelMapping(key.id)} finally {c.mappingPress(key,false)}})
-                },contentAlignment=Alignment.Center) {Text(key.label,color=Color.White,style=MaterialTheme.typography.labelSmall,maxLines=2)}
+                },contentAlignment=Alignment.Center) {MappingKeyLabel(key.label,key.size ?: c.remotePreferences.buttonSize)}
         }
     }
 }
