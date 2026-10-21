@@ -189,7 +189,8 @@ internal fun MappingOverlay(c:ControllerCoordinator,enabled:Boolean,editing:Bool
             val button=(key.size ?: c.remotePreferences.buttonSize).dp
             val buttonPx=with(density) {button.toPx()}
             val saved=remember(key.id,c.selectedInputProfile) {c.mappingPosition(key.id)}
-            var position by remember(key.id,c.selectedInputProfile) {mutableStateOf(Offset(if(saved.first<0) (if(index%2==0) .04f else .90f) else saved.first,if(saved.second<0) .08f+(index/2)*.12f else saved.second))}
+            val fallback=InputKeys.defaultPosition(index,c.inputShortcuts.size)
+            var position by remember(key.id,c.selectedInputProfile) {mutableStateOf(Offset(if(saved.first<0) fallback.first else saved.first,if(saved.second<0) fallback.second else saved.second))}
             val availableW=(area.width-buttonPx).coerceAtLeast(1f);val availableH=(area.height-buttonPx).coerceAtLeast(1f)
             Box(Modifier.offset {IntOffset((position.x.coerceIn(0f,1f)*availableW).toInt(),(position.y.coerceIn(0f,1f)*availableH).toInt())}.size(button).clip(CircleShape)
                 .background(Color(0xFF303744).copy(alpha=key.opacity ?: c.remotePreferences.buttonOpacity)).border(1.dp,if(editing || key.id in c.activeMappingIds) Color(0xFF477CFF) else Color.LightGray,CircleShape)

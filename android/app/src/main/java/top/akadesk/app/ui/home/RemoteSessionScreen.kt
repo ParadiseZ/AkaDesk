@@ -23,7 +23,7 @@ import kotlinx.coroutines.delay
 import top.akadesk.app.MainActivity
 import top.akadesk.app.controller.*
 
-private enum class RemotePanel(val title:String) { Operation("操作"), Display("显示"), Security("安全"), Peripherals("外设"), More("更多"), Network("网络状态"), HideToolbar("自动隐藏工具栏"), Pip("小窗模式"), Guide("操控指南"), MappingOptions("映射设置"), System("系统快捷操作"), Advanced("高级选项") }
+private enum class RemotePanel(val title:String) { Operation("操作"), Display("显示"), VideoQuality("画质与帧率"), Security("安全"), Peripherals("外设"), More("更多"), Network("网络状态"), HideToolbar("自动隐藏工具栏"), Pip("小窗模式"), Guide("操控指南"), MappingOptions("映射设置"), System("系统快捷操作"), Advanced("高级选项") }
 
 @Composable
 fun RemoteSessionScreen(coordinator:ControllerCoordinator, session:ActiveRemoteSession, onDisconnect:()->Unit) {
@@ -103,7 +103,7 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
                                 IconButton(onClick={panel=null},modifier=Modifier.size(32.dp)) {Icon(Icons.Outlined.Close,"关闭面板")}
                             }
                             when(panel) {
-                                RemotePanel.Operation->Column(Modifier.verticalScroll(rememberScrollState()).padding(6.dp),verticalArrangement=Arrangement.spacedBy(6.dp)) {
+                                RemotePanel.Operation->Column(Modifier.verticalScroll(rememberScrollState()).padding(6.dp),verticalArrangement=Arrangement.spacedBy(8.dp)) {
                                     Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(6.dp)) {
                                         QuickTile("退出远控",Icons.Outlined.Logout,onClick=onDisconnect)
                                         QuickTile("旋转屏幕",Icons.Outlined.ScreenRotation,onClick={c.remotePortrait=!c.remotePortrait})
@@ -116,7 +116,6 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
                                         if(prefs.mappingEnabled) {
                                             MenuRow("切换操控方案",c.selectedInputProfile) {panel=null;mappingProfiles=true}
                                             MenuRow("编辑当前方案") {keyboard=false;panel=null;returnToProfiles=false;mappingEditing=true}
-                                            MenuRow("调整按钮位置") {panel=null;returnToProfiles=false;mappingEditing=true}
                                             MenuRow("其他设置") {panel=RemotePanel.MappingOptions}
                                         }
                                     }
@@ -131,13 +130,15 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
                                     }
                                     RemoteCard {
                                         MenuRow("显示",icon=Icons.Outlined.Monitor) {panel=RemotePanel.Display}
+                                        MenuRow("画质与帧率",icon=Icons.Outlined.HighQuality) {panel=RemotePanel.VideoQuality}
                                         MenuRow("安全",icon=Icons.Outlined.Security) {panel=RemotePanel.Security}
                                         MenuRow("外设",icon=Icons.Outlined.Usb) {panel=RemotePanel.Peripherals}
                                         MenuRow("更多",icon=Icons.Outlined.Apps) {panel=RemotePanel.More}
                                     }
                                     RemoteCard {MenuRow("系统快捷操作",icon=Icons.Outlined.Computer) {panel=RemotePanel.System}}
                                 }
-                                RemotePanel.Display->Column(Modifier.verticalScroll(rememberScrollState())) {VideoQualityControls(c);DisplaySettingsContent(c,scrollable=false);ReservedFeature("虚拟显示器", "安装虚拟显示驱动后可启用")}
+                                RemotePanel.Display->Column(Modifier.verticalScroll(rememberScrollState())) {DisplaySettingsContent(c,scrollable=false);ReservedFeature("虚拟显示器", "安装虚拟显示驱动后可启用")}
+                                RemotePanel.VideoQuality->Column(Modifier.verticalScroll(rememberScrollState())) {VideoQualityControls(c)}
                                 RemotePanel.MappingOptions->Column(Modifier.padding(12.dp).verticalScroll(rememberScrollState())) {
                                     Text("默认按钮大小：${prefs.buttonSize}")
                                     CompactRemoteSlider(value=prefs.buttonSize.toFloat(),onValueChange={c.updateRemotePreferences(prefs.copy(buttonSize=it.toInt()))},valueRange=24f..72f)
@@ -184,7 +185,7 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
                                 }
                                 RemotePanel.Guide->Column(Modifier.padding(20.dp),verticalArrangement=Arrangement.spacedBy(20.dp)) {
                                     Text(listOf("屏幕触控与鼠标指针","鼠标与滚轮","按键映射")[guideStep],style=MaterialTheme.typography.titleLarge)
-                                    Text(listOf("屏幕触控：点按或拖动对应位置。鼠标指针：单指移动，轻点左键，长按拖动；双指上下滑动滚动，捏合缩放画面。", "开启虚拟鼠标后，可按住左键拖动、点按右键和滚轮。左侧右键模式可按住，把触控操作切换为右键。", "在操作中启用按键映射，切换或编辑方案；调整按钮位置后拖动浮动按钮，点完成保存。")[guideStep])
+                                    Text(listOf("屏幕触控：点按或拖动对应位置。鼠标指针：单指移动，轻点左键，长按拖动；双指上下滑动滚动，捏合缩放画面。", "开启虚拟鼠标后，可按住左键拖动、点按右键和滚轮。左侧右键模式可按住，把触控操作切换为右键。", "在操作中启用按键映射，进入“编辑当前方案”修改按键或拖动位置，点击“保存方案”保存。")[guideStep])
                                     Row {if(guideStep>0) TextButton(onClick={guideStep--}) {Text("上一步")}; Button(onClick={if(guideStep<2) guideStep++ else panel=null}) {Text(if(guideStep<2) "下一步 (${guideStep+1}/3)" else "知道了")}}
                                 }
                                 RemotePanel.System->SystemActionsPanel(c)
@@ -220,13 +221,13 @@ private fun RemoteSessionContent(c:ControllerCoordinator,s:ActiveRemoteSession,o
     }
 }
 @Composable private fun QuickTile(title:String,icon:ImageVector,selected:Boolean=false,enabled:Boolean=true,onClick:()->Unit) {
-    Column(Modifier.size(width=48.dp,height=44.dp).clip(RoundedCornerShape(6.dp)).background(if(selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant).clickable(enabled=enabled,onClick=onClick).padding(2.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center) {Icon(icon,title,Modifier.size(18.dp));Text(title,style=MaterialTheme.typography.labelSmall)}
+    Column(Modifier.size(width=60.dp,height=58.dp).clip(RoundedCornerShape(6.dp)).background(if(selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant).clickable(enabled=enabled,onClick=onClick).padding(4.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center) {Icon(icon,title,Modifier.size(24.dp));Spacer(Modifier.height(4.dp));Text(title,fontSize=11.sp,lineHeight=14.sp)}
 }
 @Composable internal fun RemoteCard(content:@Composable ColumnScope.()->Unit) {Surface(shape=RoundedCornerShape(6.dp),color=MaterialTheme.colorScheme.surfaceVariant) {Column(Modifier.fillMaxWidth().padding(4.dp),content=content)}}
 @Composable internal fun MenuRow(title:String,detail:String="",icon:ImageVector?=null,enabled:Boolean=true,onClick:()->Unit) {
-    Row(Modifier.fillMaxWidth().clickable(enabled=enabled,onClick=onClick).padding(vertical=8.dp,horizontal=6.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(6.dp)) {if(icon!=null) Icon(icon,null,Modifier.size(18.dp));Text(title,Modifier.weight(1f),color=if(enabled) MaterialTheme.colorScheme.onSurface else Color.Gray);if(detail.isNotEmpty()) Text(detail,style=MaterialTheme.typography.labelSmall);Icon(Icons.Outlined.ChevronRight,null,Modifier.size(14.dp))}
+    Row(Modifier.fillMaxWidth().heightIn(min=44.dp).clickable(enabled=enabled,onClick=onClick).padding(vertical=12.dp,horizontal=6.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(6.dp)) {if(icon!=null) Icon(icon,null,Modifier.size(18.dp));Text(title,Modifier.weight(1f),color=if(enabled) MaterialTheme.colorScheme.onSurface else Color.Gray);if(detail.isNotEmpty()) Text(detail,style=MaterialTheme.typography.labelSmall);Icon(Icons.Outlined.ChevronRight,null,Modifier.size(14.dp))}
 }
-@Composable internal fun ToggleRow(title:String,value:Boolean,enabled:Boolean=true,onChange:(Boolean)->Unit) {Row(Modifier.fillMaxWidth().padding(horizontal=6.dp,vertical=2.dp),verticalAlignment=Alignment.CenterVertically) {Text(title,Modifier.weight(1f));Checkbox(checked=value,onCheckedChange=onChange,enabled=enabled,modifier=Modifier.size(32.dp))}}
+@Composable internal fun ToggleRow(title:String,value:Boolean,enabled:Boolean=true,onChange:(Boolean)->Unit) {Row(Modifier.fillMaxWidth().heightIn(min=44.dp).padding(horizontal=6.dp,vertical=6.dp),verticalAlignment=Alignment.CenterVertically) {Text(title,Modifier.weight(1f));Checkbox(checked=value,onCheckedChange=onChange,enabled=enabled,modifier=Modifier.size(32.dp))}}
 @Composable internal fun ReservedFeature(title:String,reason:String) {
     Column(Modifier.fillMaxWidth().padding(8.dp)) {
         ToggleRow(title,false,false) {}

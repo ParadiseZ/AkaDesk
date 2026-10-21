@@ -72,7 +72,7 @@ class M7DisplayInstrumentedTest {
             // Exercise the production dropdown and apply button first.
             compose.onNodeWithText("缩放倍率：${original.scalePercent}%").performScrollTo().performClick()
             compose.onNodeWithText("$alternateScale%").performClick()
-            compose.onNodeWithText("应用显示设置").performScrollTo().performClick()
+            compose.onNodeWithText("应用到显示器").performScrollTo().performClick()
             compose.waitUntil(20_000) { !coordinator.displaySettingsPending }
             instrumentation.runOnMainSync {
                 assertNull(coordinator.displaySettingsError)

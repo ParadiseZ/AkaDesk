@@ -30,10 +30,10 @@ fun DisplaySettingsSheet(coordinator: ControllerCoordinator, onDismiss: () -> Un
 fun DisplaySettingsContent(coordinator: ControllerCoordinator, scrollable:Boolean=true) {
         Column(Modifier.padding(16.dp).then(if(scrollable) Modifier.verticalScroll(rememberScrollState()) else Modifier), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("电脑显示设置", style = MaterialTheme.typography.titleLarge)
+                Text("显示器设置", style = MaterialTheme.typography.titleLarge)
                 TextButton(onClick = coordinator::refreshDisplaySettings, enabled = !coordinator.displaySettingsPending) { Text("刷新") }
             }
-            Text("调整当前电脑主屏幕，断开连接时恢复连接前的设置。切换时画面可能短暂闪烁。")
+            Text("设置应用到被控电脑的当前显示器，断开连接后恢复连接前的设置。切换时画面可能短暂闪烁。")
             if (coordinator.displaySettingsPending) LinearProgressIndicator(Modifier.fillMaxWidth())
             coordinator.displaySettings?.let { snapshot ->
                 val current = snapshot.currentMode
@@ -59,7 +59,7 @@ fun DisplaySettingsContent(coordinator: ControllerCoordinator, scrollable:Boolea
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Button(onClick = { coordinator.applyDisplaySettings(selection) },
-                        enabled = !coordinator.displaySettingsPending && selection != current) { Text("应用显示设置") }
+                        enabled = !coordinator.displaySettingsPending && selection != current) { Text("应用到显示器") }
                     TextButton(onClick = { coordinator.applyDisplaySettings(snapshot.historyDisplayMode) },
                         enabled = !coordinator.displaySettingsPending && current != snapshot.historyDisplayMode) { Text("恢复连接前设置") }
                 }

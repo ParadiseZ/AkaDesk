@@ -33,12 +33,12 @@ fun VideoQualityControls(c:ControllerCoordinator) {
                 repeat(30) {
                     if(!confirmed) {delay(500);val status=c.toolRequest("status");if(!status.optBoolean("videoPending")) {require(status.optString("videoError").isEmpty()) {"电脑未能应用画质设置"};c.applyConfirmedVideoStatus(status);confirmed=true}}
                 }
-                require(confirmed) {"未能确认画质设置，请重新打开显示页面查看"}
+                require(confirmed) {"未能确认画质设置，请重新打开画质与帧率页面查看"}
             } catch(e:Exception) {error=e.message} finally {busy=false}
         }
     }
     Column(Modifier.padding(12.dp),verticalArrangement=Arrangement.spacedBy(6.dp)) {
-        Text("画质",style=MaterialTheme.typography.titleMedium)
+        Text("视频画质",style=MaterialTheme.typography.titleMedium)
         Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(4.dp)) {
             listOf("自动","清晰","高清","原画","自定义").forEach {title->FilterChip(selected=preset==title,enabled=!busy,onClick={preset=title;when(title){"自动"->{width=960;height=540;bitrate=2500};"清晰"->{width=960;height=540;bitrate=2000};"高清"->{width=1280;height=720;bitrate=8000};"原画"->{val mode=c.displaySettings?.currentMode;width=(mode?.width ?: 1920).coerceIn(640,1920)/2*2;height=(mode?.height ?: 1080).coerceIn(360,1200)/2*2;bitrate=20000}}},label={Text(title)})}
         }

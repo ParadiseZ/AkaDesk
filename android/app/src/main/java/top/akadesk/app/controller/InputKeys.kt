@@ -45,6 +45,12 @@ data class InputShortcut(
 }
 
 object InputKeys {
+    fun defaultPosition(index:Int,count:Int):Pair<Float,Float> {
+        val columns=if(count>14) 4 else 2
+        val rows=(count+columns-1)/columns
+        val x=if(columns==2) listOf(.04f,.90f) else listOf(.04f,.90f,.12f,.82f)
+        return x[index%columns] to (.10f+(index/columns)*(.80f/(rows-1).coerceAtLeast(1)))
+    }
     val catalog: Map<Int, String> = linkedMapOf(
         0x0d to "Enter", 0x1b to "Esc", 0x09 to "Tab", 0x08 to "Backspace", 0x20 to "Space",
         0x2e to "Delete", 0x2d to "Insert", 0x24 to "Home", 0x23 to "End", 0x21 to "Page Up", 0x22 to "Page Down",
